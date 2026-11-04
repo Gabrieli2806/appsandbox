@@ -4339,6 +4339,11 @@ ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
     else
         swprintf_s(snap_name, 128, L"Snapshot %d", SNAP_AT(idx).count + 1);
 
+    /* The snapshot can freeze (rename) the disk the VM last ran on, and the VM
+       moves to a new branch: drop any compute system still bound to the old
+       disk, as asb_vm_start does when it switches branches. */
+    if (VM_AT(idx).handle) hcs_close_vm(&VM_AT(idx));
+
     asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, VM_AT(idx).name);
     hr = snapshot_take(&SNAP_AT(idx), &VM_AT(idx), snap_name);
     if (FAILED(hr))
@@ -4361,7 +4366,9 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
+    if (hr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY))
+        asb_log(L"Error: Another snapshot was taken on this one. Delete that snapshot first.");
+    else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
@@ -4442,6 +4449,7 @@ ASB_API BOOL asb_snap_get_info(AsbVm vm, int snap_idx, AsbSnapshotInfo *out)
     wcscpy_s(out->name, 128, SNAP_AT(idx).nodes[snap_idx].name);
     wcscpy_s(out->guid, 64, SNAP_AT(idx).nodes[snap_idx].guid);
     out->branch_count = SNAP_AT(idx).nodes[snap_idx].branch_count;
+    out->parent_index = snapshot_parent_index(&SNAP_AT(idx), snap_idx);
     return TRUE;
 }
 
