@@ -1047,6 +1047,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     wchar_t net_section[512];
     wchar_t secureboot_section[512];
     wchar_t nested_section[128];
+    const wchar_t *memory_section;
     wchar_t security_section[512];
     wchar_t guest_state_section[1024];
     wchar_t video_section[2048];
@@ -1252,6 +1253,14 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     if (hcs_nested_virt_supported())
         wcscpy_s(nested_section, 128, L",\"ExposeVirtualizationExtensions\":true");
 
+    /* AllowOvercommit with deferred commit asks for dynamic memory. With
+       nested virtualization and GuestStateOnly isolation HcsStartComputeSystem
+       rejects that with 0x80070032 ERROR_NOT_SUPPORTED, so use a fixed size
+       when nested virtualization is exposed and keep overcommit otherwise. */
+    memory_section = nested_section[0]
+        ? L",\"AllowOvercommit\":false"
+        : L",\"AllowOvercommit\":true,\"EnableDeferredCommit\":true,\"EnableColdDiscardHint\":true";
+
     written = swprintf_s(json_out, json_out_chars,
         L"{"
         L"\"SchemaVersion\":{\"Major\":2,\"Minor\":1},"
@@ -1266,12 +1275,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"},"
             L"\"ComputeTopology\":{"
                 L"\"Memory\":{"
-                    L"\"SizeInMB\":%lu,"
-                    /* AllowOvercommit with deferred commit asks for dynamic memory.
-                       With nested virtualization and GuestStateOnly isolation
-                       HcsStartComputeSystem rejects it with 0x80070032
-                       ERROR_NOT_SUPPORTED. A fixed size starts. */
-                    L"\"AllowOvercommit\":false"
+                    L"\"SizeInMB\":%lu"
+                    L"%s"
                 L"},"
                 L"\"Processor\":{"
                     L"\"Count\":%lu"
@@ -1305,6 +1310,7 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         config->name,
         secureboot_section,
         config->ram_mb,
+        memory_section,
         config->cpu_cores,
         nested_section,
         vhdx_esc,
