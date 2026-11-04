@@ -728,11 +728,24 @@ ext4_writer_t *ext4_writer_open(HANDLE phys,
     w->inodes_per_group  = INODES_PER_GROUP;
     w->num_groups = (w->total_blocks + w->blocks_per_group - 1) / w->blocks_per_group;
 
-    /* Inodes per group: scale UP if est_inodes exceeds current default,
-     * never DOWN. Always a multiple of 8 (kernel requirement). */
-    if (est_inodes > w->num_groups * w->inodes_per_group) {
-        uint32_t per = (est_inodes + w->num_groups - 1) / w->num_groups;
-        per = (per + 7) & ~7u;
+    /* Inodes per group. est_inodes (the squashfs entry count) only says how
+     * many the image itself needs; the guest keeps creating files after
+     * that - linux-headers alone is ~50k small files, then DKMS, apt state,
+     * user data. With a flat 1024/group the total scaled with disk size and
+     * had no headroom: an 18 GB disk ended at ~144k inodes for a ~126k-inode
+     * base image and first boot died with ENOSPC unpacking the kernel
+     * headers while 10 GB of blocks were still free (a 32 GB disk happened
+     * to get 258k and survived). Size like mke2fs does - one inode per
+     * 16 KiB (inode_ratio=16384) - or twice the image's count, whichever is
+     * larger. Whole inode-table blocks (16 x 256 B per 4 KiB) so the table
+     * never ends mid-block. */
+    {
+        uint64_t by_ratio = (uint64_t)w->total_blocks / 4u;          /* 16 KiB per inode */
+        uint64_t by_image = (uint64_t)est_inodes * 2u;
+        uint64_t want = by_ratio > by_image ? by_ratio : by_image;
+        uint32_t per = (uint32_t)((want + w->num_groups - 1) / w->num_groups);
+        per = (per + 15u) & ~15u;
+        if (per < INODES_PER_GROUP) per = INODES_PER_GROUP;
         /* A single 4 KiB inode bitmap block addresses at most BLOCK_SIZE*8
          * inodes; never let inodes_per_group exceed that or write_inode_bitmap
          * overruns its fixed bm[BLOCK_SIZE] stack buffer. */
