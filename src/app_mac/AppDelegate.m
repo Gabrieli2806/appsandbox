@@ -274,6 +274,41 @@ static NSImage *menuBarLogo(void) {
     quit.keyEquivalent = @"q";
     quit.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     [NSApp setMainMenu:mainMenu];
+
+    /* Find or create a "View" menu. */
+    NSMenuItem *viewItem = nil;
+    for (NSMenuItem *it in mainMenu.itemArray) {
+        if ([it.title isEqualToString:@"View"]) { viewItem = it; break; }
+    }
+    if (!viewItem) {
+        viewItem = [[NSMenuItem alloc] initWithTitle:@"View" action:NULL keyEquivalent:@""];
+        viewItem.submenu = [[NSMenu alloc] initWithTitle:@"View"];
+        /* Insert before Window/Help, else append at the end. */
+        NSUInteger insertAt = mainMenu.itemArray.count;
+        for (NSUInteger i = 0; i < mainMenu.itemArray.count; i++) {
+            NSString *t = mainMenu.itemArray[i].title;
+            if ([t isEqualToString:@"Window"] || [t isEqualToString:@"Help"]) {
+                insertAt = i; break;
+            }
+        }
+        [mainMenu insertItem:viewItem atIndex:insertAt];
+    }
+
+    NSMenuItem *borderlessItem = [[NSMenuItem alloc]
+        initWithTitle:@"Toggle Borderless Full Screen"
+               action:@selector(toggleBorderlessFullscreen:)
+        keyEquivalent:[NSString stringWithFormat:@"%C", NSF11FunctionKey]];
+    borderlessItem.target = self;
+    [viewItem.submenu addItem:borderlessItem];
+}
+
+- (void)toggleBorderlessFullscreen:(id)sender {
+    id controller = NSApp.keyWindow.windowController;
+    if (controller && [controller respondsToSelector:_cmd]) {
+        [controller toggleBorderlessFullscreen:sender];
+    } else {
+        [self.mainWindowController toggleBorderlessFullscreen:sender];
+    }
 }
 
 - (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender {

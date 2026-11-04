@@ -6,6 +6,9 @@
 @interface VzDisplayWindow () <NSWindowDelegate>
 @property (nonatomic, strong) VzVm *vm;
 @property (nonatomic, strong) VZVirtualMachineView *vmView;
+@property (nonatomic) BOOL borderlessFullscreen;
+@property (nonatomic) NSWindowStyleMask windowedStyleMask;
+@property (nonatomic) NSRect windowedFrame;
 @end
 
 @implementation VzDisplayWindow
@@ -34,6 +37,23 @@
     window.contentView = _vmView;
     window.delegate = self;
     return self;
+}
+
+- (void)toggleBorderlessFullscreen:(id)sender {
+    (void)sender;
+    NSWindow *window = self.window;
+
+    if (!self.borderlessFullscreen) {
+        self.windowedStyleMask = window.styleMask;
+        self.windowedFrame = window.frame;
+        window.styleMask = NSWindowStyleMaskBorderless;
+        [window setFrame:window.screen.frame display:YES];
+        self.borderlessFullscreen = YES;
+    } else {
+        window.styleMask = self.windowedStyleMask;
+        [window setFrame:self.windowedFrame display:YES];
+        self.borderlessFullscreen = NO;
+    }
 }
 
 - (void)showDisplay {

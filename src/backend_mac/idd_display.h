@@ -37,5 +37,6 @@
 - (instancetype)initWithName:(NSString *)name
                    transport:(AsbIvshmemTransport *)transport vmId:(uint64_t)vmId;
 - (void)showDisplay;
+- (void)toggleBorderlessFullscreen:(id)sender;
 
 @end
