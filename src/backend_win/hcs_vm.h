@@ -83,6 +83,8 @@ typedef struct {
     BOOL        test_mode;       /* TRUE = no Secure Boot (for test-signed drivers) */
     BOOL        building_vhdx;   /* TRUE during iso-patch VHDX creation */
     volatile BOOL updating_tools; /* TRUE while guest components are copied into the stopped disk */
+    volatile BOOL copying_disk;   /* TRUE while the VM is exported or imported (disk copy) */
+    volatile LONG copy_progress;  /* 0..100 during copying_disk */
     BOOL        vhdx_staging;    /* TRUE during file staging phase */
     int         vhdx_progress;   /* 0-100 progress percentage */
     wchar_t     vhdx_step[128];  /* Current step description */

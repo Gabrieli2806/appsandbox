@@ -72,6 +72,10 @@
             <span class="sr-only">Search VMs</span>
             <input type="search" id="vm-search" placeholder="Search VMs" oninput="renderVmTable()">
         </label>
+        <button id="btn-import-vm" class="with-icon win-only" onclick="sendCmd('importVm')" title="Import a VM exported from App Sandbox, a VM folder from another installation, or a .vhdx disk">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 4v11M7 10l5 5 5-5M5 20h14"></path></svg>
+            Import
+        </button>
         <button id="btn-new-sandbox" class="primary with-icon" onclick="openCreateModal()">
             <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>
             New VM

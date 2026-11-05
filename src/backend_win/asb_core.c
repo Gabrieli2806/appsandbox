@@ -3906,6 +3906,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         asb_log(L"\"%s\" is updating its guest components; start it when that finishes.", inst->name);
         return E_ACCESSDENIED;
     }
+    if (inst->copying_disk) {
+        asb_log(L"\"%s\" is being exported or imported; start it when that finishes.", inst->name);
+        return E_ACCESSDENIED;
+    }
     SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
@@ -4098,7 +4102,7 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
     inst = &VM_AT(idx);
-    if (inst->building_vhdx || inst->starting) return E_ACCESSDENIED;
+    if (inst->building_vhdx || inst->starting || inst->copying_disk || inst->updating_tools) return E_ACCESSDENIED;
     if (inst->start_thread) WaitForSingleObject(inst->start_thread, INFINITE);
     if (!get_vm_disk_root(inst->vhdx_path, dir)) return E_INVALIDARG;
     attrs = GetFileAttributesW(dir);
@@ -4238,7 +4242,7 @@ ASB_API void asb_vm_set_display_suppressed(AsbVm vm, BOOL suppressed)
 ASB_API BOOL asb_vm_is_building(AsbVm vm)
 {
     VmInstance *inst = vm_inst(vm);
-    return inst ? inst->building_vhdx : FALSE;
+    return inst ? (inst->building_vhdx || inst->copying_disk || inst->updating_tools) : FALSE;
 }
 
 ASB_API DWORD asb_vm_ram_mb(AsbVm vm)
@@ -4799,6 +4803,340 @@ ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm)
     }
     CloseHandle(t);
     return S_OK;
+}
+
+/* ---- Export / import ---- */
+
+static void json_escape_w(const wchar_t *in, wchar_t *out, size_t cap)
+{
+    size_t o = 0;
+    for (; in && *in && o + 7 < cap; in++) {
+        if (*in == L'"' || *in == L'\\') { out[o++] = L'\\'; out[o++] = *in; }
+        else if (*in < 32) o += (size_t)swprintf_s(out + o, cap - o, L"\\u%04x", (unsigned)*in);
+        else out[o++] = *in;
+    }
+    out[o] = 0;
+}
+
+/* Value of "key": in a small flat JSON document (our own vm.json). */
+static BOOL json_value_w(const wchar_t *json, const wchar_t *key, wchar_t *out, size_t cap)
+{
+    wchar_t pat[64];
+    const wchar_t *p;
+    size_t o = 0;
+    swprintf_s(pat, 64, L"\"%s\":", key);
+    p = wcsstr(json, pat);
+    if (!p) return FALSE;
+    p += wcslen(pat);
+    while (*p == L' ') p++;
+    if (*p == L'"') {
+        p++;
+        while (*p && *p != L'"' && o + 1 < cap) {
+            if (*p == L'\\' && p[1]) p++;
+            out[o++] = *p++;
+        }
+    } else {
+        while (*p && *p != L',' && *p != L'}' && *p != L' ' && o + 1 < cap) out[o++] = *p++;
+    }
+    out[o] = 0;
+    return TRUE;
+}
+
+static BOOL copy_side_file(const wchar_t *from_dir, const wchar_t *to_dir, const wchar_t *name)
+{
+    wchar_t a[MAX_PATH], b[MAX_PATH];
+    swprintf_s(a, MAX_PATH, L"%s\\%s", from_dir, name);
+    swprintf_s(b, MAX_PATH, L"%s\\%s", to_dir, name);
+    if (GetFileAttributesW(a) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    return CopyFileW(a, b, FALSE);
+}
+
+static void parent_dir_of(const wchar_t *path, wchar_t *out, size_t cap)
+{
+    wchar_t *slash;
+    wcscpy_s(out, cap, path);
+    slash = wcsrchr(out, L'\\');
+    if (slash) *slash = 0;
+}
+
+typedef struct {
+    AsbVm   vm;
+    UINT64  id;
+    wchar_t source[MAX_PATH];   /* disk to copy from */
+    wchar_t dest[MAX_PATH];     /* disk to write */
+    wchar_t dest_dir[MAX_PATH];
+    wchar_t side_dir[MAX_PATH]; /* where display/language settings come from */
+    BOOL    is_import;
+} DiskCopyJob;
+
+static void disk_copy_progress(int percent, void *context)
+{
+    DiskCopyJob *job = (DiskCopyJob *)context;
+    int idx = vm_index_of(job->vm);
+    if (idx < 0 || VM_AT(idx).unique_id != job->id) return;
+    if (percent / 10 != VM_AT(idx).copy_progress / 10)
+        asb_log(L"%s \"%s\": %d%%", job->is_import ? L"Importing" : L"Exporting", VM_AT(idx).name, percent);
+    InterlockedExchange(&VM_AT(idx).copy_progress, percent);
+    notify_state(job->vm, FALSE, g_state_ud);
+}
+
+static void write_export_manifest(const VmInstance *v, const wchar_t *dir)
+{
+    wchar_t path[MAX_PATH], name[600], user[300];
+    FILE *f;
+    swprintf_s(path, MAX_PATH, L"%s\\vm.json", dir);
+    if (_wfopen_s(&f, path, L"w,ccs=UTF-8") != 0 || !f) return;
+    json_escape_w(v->name, name, ARRAYSIZE(name));
+    json_escape_w(v->admin_user, user, ARRAYSIZE(user));
+    fwprintf(f, L"{\"format\":1,\"app\":\"AppSandbox\",\"name\":\"%s\",\"osType\":\"%s\","
+                L"\"ramMb\":%lu,\"cpuCores\":%lu,\"hddGb\":%lu,\"gpuMode\":%d,\"networkMode\":%d,"
+                L"\"adminUser\":\"%s\",\"sshEnabled\":%d,\"testMode\":%d}\n",
+             name, v->os_type, v->ram_mb, v->cpu_cores, v->hdd_gb, v->gpu_mode,
+             v->network_mode == NET_EXTERNAL ? NET_NAT : v->network_mode,
+             user, v->ssh_enabled ? 1 : 0, v->test_mode ? 1 : 0);
+    fclose(f);
+}
+
+static DWORD WINAPI disk_copy_thread(LPVOID param)
+{
+    DiskCopyJob *job = (DiskCopyJob *)param;
+    int idx = vm_index_of(job->vm);
+    VmInstance *inst;
+    HRESULT hr;
+
+    if (idx < 0 || VM_AT(idx).unique_id != job->id) { free(job); return 0; }
+    inst = &VM_AT(idx);
+    hr = vhdx_copy(job->dest, job->source, NULL, disk_copy_progress, job);
+
+    idx = vm_index_of(job->vm);
+    if (idx < 0 || VM_AT(idx).unique_id != job->id) { free(job); return 0; }
+    inst = &VM_AT(idx);
+
+    if (SUCCEEDED(hr)) {
+        copy_side_file(job->side_dir, job->dest_dir, L"display_settings.json");
+        copy_side_file(job->side_dir, job->dest_dir, L"language.json");
+        if (job->is_import) {
+            ULONGLONG bytes = 0;
+            if (SUCCEEDED(vhdx_get_virtual_size(job->dest, &bytes)) && bytes)
+                inst->hdd_gb = (DWORD)((bytes + (1ULL << 30) - 1) >> 30);
+            vm_save_state_json(inst->vhdx_path, TRUE);
+            inst->install_complete = TRUE;
+            asb_log(L"Imported \"%s\". Start it when you are ready%s.", inst->name,
+                    _wcsicmp(inst->os_type, L"Windows") == 0
+                        ? L" (its guest components are updated on the first start)" : L"");
+        } else {
+            write_export_manifest(inst, job->dest_dir);
+            asb_log(L"Exported \"%s\" to %s", inst->name, job->dest_dir);
+        }
+    } else {
+        asb_log(L"Error: %s \"%s\" failed (0x%08X).", job->is_import ? L"Importing" : L"Exporting",
+                inst->name, hr);
+        asb_alert(job->is_import
+            ? L"The VM could not be imported. Check free space and that the source disk is readable; then delete the failed entry."
+            : L"The VM could not be exported. Check free space and the destination folder.");
+        if (!job->is_import) remove_dir_recursive(job->dest_dir);
+    }
+    inst->copying_disk = FALSE;
+    InterlockedExchange(&inst->copy_progress, 0);
+    save_vm_list();
+    notify_state(job->vm, FALSE, g_state_ud);
+    free(job);
+    return 0;
+}
+
+static HRESULT start_disk_copy(DiskCopyJob *job, VmInstance *inst)
+{
+    HANDLE t;
+    inst->copying_disk = TRUE;
+    InterlockedExchange(&inst->copy_progress, 0);
+    notify_state(job->vm, FALSE, g_state_ud);
+    t = CreateThread(NULL, 0, disk_copy_thread, job, 0, NULL);
+    if (!t) {
+        inst->copying_disk = FALSE;
+        free(job);
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    CloseHandle(t);
+    return S_OK;
+}
+
+ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *dest_parent)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst;
+    DiskCopyJob *job;
+
+    if (idx < 0 || !dest_parent || !dest_parent[0]) return E_INVALIDARG;
+    inst = &VM_AT(idx);
+    if (inst->is_template) return E_INVALIDARG;
+    if (inst->running || inst->starting || inst->building_vhdx || inst->updating_tools || inst->copying_disk) {
+        asb_alert(L"Shut the VM down before exporting it.");
+        return E_ACCESSDENIED;
+    }
+    if (inst->handle) hcs_close_vm(inst);
+
+    job = (DiskCopyJob *)calloc(1, sizeof(*job));
+    if (!job) return E_OUTOFMEMORY;
+    job->vm = vm;
+    job->id = inst->unique_id;
+    if (swprintf_s(job->dest_dir, MAX_PATH, L"%s\\%s.asbvm", dest_parent, inst->name) < 0) {
+        free(job);
+        return E_INVALIDARG;
+    }
+    if (GetFileAttributesW(job->dest_dir) != INVALID_FILE_ATTRIBUTES) {
+        asb_alert(L"That folder already holds an export of this VM. Choose another folder or remove the old export.");
+        free(job);
+        return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
+    }
+    if (!CreateDirectoryW(job->dest_dir, NULL)) {
+        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_alert(L"The export folder could not be created.");
+        free(job);
+        return hr;
+    }
+    swprintf_s(job->dest, MAX_PATH, L"%s\\disk.vhdx", job->dest_dir);
+    wcscpy_s(job->source, MAX_PATH, inst->vhdx_path);
+    {
+        wchar_t root[MAX_PATH];
+        if (!get_vm_disk_root(inst->vhdx_path, root)) parent_dir_of(inst->vhdx_path, root, MAX_PATH);
+        wcscpy_s(job->side_dir, MAX_PATH, root);
+    }
+    asb_log(L"Exporting \"%s\" to %s...", inst->name, job->dest_dir);
+    return start_disk_copy(job, inst);
+}
+
+ASB_API HRESULT asb_vm_import(const wchar_t *source)
+{
+    wchar_t disk[MAX_PATH] = L"", manifest_path[MAX_PATH] = L"", side[MAX_PATH] = L"";
+    wchar_t base_name[256] = L"", name[256], parent[MAX_PATH], vm_dir[MAX_PATH];
+    wchar_t manifest[4096] = L"", value[512];
+    DWORD attrs;
+    VmInstance *inst;
+    DiskCopyJob *job;
+    const wchar_t *error;
+    int n;
+
+    if (g_config_load_failed || !source || !source[0]) return E_INVALIDARG;
+    if (g_vm_count >= ASB_MAX_VMS) {
+        asb_alert(L"The maximum number of VMs has been reached.");
+        return E_FAIL;
+    }
+
+    /* Accept the export folder, its vm.json, a VM folder, or a .vhdx. */
+    attrs = GetFileAttributesW(source);
+    if (attrs == INVALID_FILE_ATTRIBUTES) { asb_alert(L"The selected file or folder does not exist."); return E_INVALIDARG; }
+    if (attrs & FILE_ATTRIBUTE_DIRECTORY) {
+        wcscpy_s(side, MAX_PATH, source);
+        swprintf_s(disk, MAX_PATH, L"%s\\disk.vhdx", source);
+    } else {
+        const wchar_t *ext = wcsrchr(source, L'.');
+        parent_dir_of(source, side, MAX_PATH);
+        if (ext && _wcsicmp(ext, L".vhdx") == 0) wcscpy_s(disk, MAX_PATH, source);
+        else swprintf_s(disk, MAX_PATH, L"%s\\disk.vhdx", side);
+    }
+    if (GetFileAttributesW(disk) == INVALID_FILE_ATTRIBUTES) {
+        asb_alert(L"No disk.vhdx was found there. Choose an App Sandbox export (vm.json), a VM folder or a .vhdx file.");
+        return E_INVALIDARG;
+    }
+    swprintf_s(manifest_path, MAX_PATH, L"%s\\vm.json", side);
+    {
+        FILE *f;
+        if (_wfopen_s(&f, manifest_path, L"r,ccs=UTF-8") == 0 && f) {
+            size_t got = fread(manifest, sizeof(wchar_t), ARRAYSIZE(manifest) - 1, f);
+            manifest[got] = 0;
+            fclose(f);
+        }
+    }
+
+    /* Name: the manifest's, else the folder (or file) name; made unique. */
+    if (!(manifest[0] && json_value_w(manifest, L"name", base_name, ARRAYSIZE(base_name)) && base_name[0])) {
+        const wchar_t *leaf = wcsrchr(side, L'\\');
+        wcscpy_s(base_name, ARRAYSIZE(base_name), leaf ? leaf + 1 : side);
+        {
+            wchar_t *dot = wcsrchr(base_name, L'.');
+            if (dot && _wcsicmp(dot, L".asbvm") == 0) *dot = 0;
+        }
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY) && _wcsicmp(wcsrchr(source, L'.') ? wcsrchr(source, L'.') : L"", L".vhdx") == 0
+            && _wcsicmp(wcsrchr(source, L'\\') ? wcsrchr(source, L'\\') + 1 : source, L"disk.vhdx") != 0) {
+            const wchar_t *leaf2 = wcsrchr(source, L'\\');
+            wcscpy_s(base_name, ARRAYSIZE(base_name), leaf2 ? leaf2 + 1 : source);
+            *wcsrchr(base_name, L'.') = 0;
+        }
+    }
+    for (n = 1; n < 100; n++) {
+        int i, taken = 0;
+        if (n == 1) wcscpy_s(name, ARRAYSIZE(name), base_name);
+        else swprintf_s(name, ARRAYSIZE(name), L"%s (%d)", base_name, n);
+        for (i = 0; i < g_vm_count; i++) if (_wcsicmp(VM_AT(i).name, name) == 0) taken = 1;
+        if (taken) continue;
+        error = resolve_disk_directory(name, NULL, FALSE, parent, vm_dir);
+        if (!error) break;
+        if (wcsstr(error, L"already exists") == NULL) { asb_alert(error); return E_INVALIDARG; }
+    }
+    if (n >= 100) { asb_alert(L"Could not find a free name for the imported VM."); return E_FAIL; }
+    {
+        wchar_t default_dir[MAX_PATH];
+        asb_default_disk_directory(default_dir, MAX_PATH);
+        CreateDirectoryW(default_dir, NULL);
+        CreateDirectoryW(parent, NULL);
+    }
+    if (!CreateDirectoryW(vm_dir, NULL)) {
+        asb_alert(L"Cannot create the VM disk folder.");
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+
+    inst = &VM_AT(g_vm_count);
+    ZeroMemory(inst, sizeof(VmInstance));
+    do { inst->unique_id = asb_vm_id_new(); }
+    while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
+    if (!inst->unique_id) { RemoveDirectoryW(vm_dir); return E_FAIL; }
+
+    wcscpy_s(inst->name, ARRAYSIZE(inst->name), name);
+    wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), L"Windows");
+    if (manifest[0] && json_value_w(manifest, L"osType", value, ARRAYSIZE(value)) &&
+        (_wcsicmp(value, L"Windows") == 0 || _wcsicmp(value, L"Linux") == 0))
+        wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), value);
+    inst->ram_mb = 8192;
+    inst->cpu_cores = 4;
+    inst->gpu_mode = 1;
+    inst->network_mode = NET_NAT;
+    if (manifest[0]) {
+        if (json_value_w(manifest, L"ramMb", value, ARRAYSIZE(value))) inst->ram_mb = (DWORD)_wtoi(value);
+        if (json_value_w(manifest, L"cpuCores", value, ARRAYSIZE(value))) inst->cpu_cores = (DWORD)_wtoi(value);
+        if (json_value_w(manifest, L"gpuMode", value, ARRAYSIZE(value))) inst->gpu_mode = _wtoi(value);
+        if (json_value_w(manifest, L"networkMode", value, ARRAYSIZE(value))) inst->network_mode = _wtoi(value);
+        if (json_value_w(manifest, L"adminUser", value, ARRAYSIZE(value)))
+            wcscpy_s(inst->admin_user, ARRAYSIZE(inst->admin_user), value);
+        if (json_value_w(manifest, L"sshEnabled", value, ARRAYSIZE(value))) inst->ssh_enabled = _wtoi(value) != 0;
+        if (json_value_w(manifest, L"testMode", value, ARRAYSIZE(value))) inst->test_mode = _wtoi(value) != 0;
+    }
+    if (inst->ram_mb < 2048) inst->ram_mb = 2048;
+    inst->ram_mb -= inst->ram_mb % 2;
+    if (inst->cpu_cores < 1) inst->cpu_cores = 1;
+    if (inst->network_mode < NET_NONE || inst->network_mode > NET_INTERNAL || inst->network_mode == NET_EXTERNAL)
+        inst->network_mode = NET_NAT;
+    if (inst->gpu_mode != 0 && inst->gpu_mode != 1) inst->gpu_mode = 1;
+    swprintf_s(inst->vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vm_dir);
+    inst->install_complete = FALSE;          /* until the copy finishes */
+    {
+        wchar_t sd[MAX_PATH];
+        swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vm_dir);
+        snapshot_init(&SNAP_AT(g_vm_count), sd);
+    }
+    g_vm_count++;
+    save_vm_list();
+
+    job = (DiskCopyJob *)calloc(1, sizeof(*job));
+    if (!job) return E_OUTOFMEMORY;
+    job->vm = vm_handle(inst);
+    job->id = inst->unique_id;
+    job->is_import = TRUE;
+    wcscpy_s(job->source, MAX_PATH, disk);
+    wcscpy_s(job->dest, MAX_PATH, inst->vhdx_path);
+    wcscpy_s(job->dest_dir, MAX_PATH, vm_dir);
+    wcscpy_s(job->side_dir, MAX_PATH, side);
+    asb_log(L"Importing \"%s\" from %s...", name, disk);
+    return start_disk_copy(job, inst);
 }
 
 ASB_API BOOL asb_get_suppress_tray_warn(void)

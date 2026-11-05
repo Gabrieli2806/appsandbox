@@ -966,10 +966,12 @@ function osIcon(osType) {
     return ICONS.monitor;
 }
 
-function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting || vm.updatingTools); }
+function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting || vm.updatingTools || vm.copyingDisk); }
 
 /* Status label + style for a VM (kind: running | busy | stopping | stopped). */
 function vmStatus(vm) {
+    if (vm.copyingDisk)
+        return { label: (vm.installComplete ? 'Exporting ' : 'Importing ') + (vm.copyProgress || 0) + '%', kind: 'busy' };
     if (vm.updatingTools) return { label: 'Updating components', kind: 'busy' };
     if (vm.starting) return { label: 'Starting', kind: 'busy' };
     if (vm.buildingVhdx)
@@ -1088,8 +1090,10 @@ function showVmMenu(vm, anchor) {
     item('Open settings', true, function() { openVmDetail(vm.id); });
     item('Shut down', vm.running && !bld, function() { sendCmd('shutdownVm', { vmId: vm.id }); });
     item('Force stop', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); });
-    if (!hostBridge.isMac)
+    if (!hostBridge.isMac) {
         item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
+        item('Export…', !vm.running && !bld && !vm.isTemplate, function() { sendCmd('exportVm', { vmId: vm.id }); });
+    }
     if (vm.sshEnabled)
         item('Open SSH terminal', sshReady(vm), function() { sendCmd('sshConnect', { vmId: vm.id }); });
     menu.appendChild(document.createElement('hr'));
@@ -1188,9 +1192,11 @@ function buildVmCard(vm) {
 function updateCardProgress(card, vm, prog) {
     prog = prog || card.querySelector('[data-role="progress"]');
     if (!prog) return;
-    var show = vm.buildingVhdx && !vm.vhdxStaging;
+    var copying = !!vm.copyingDisk;
+    var show = (vm.buildingVhdx && !vm.vhdxStaging) || copying;
     prog.hidden = !show;
-    if (show) prog.firstChild.style.width = Math.max(2, Math.min(100, vm.vhdxProgress || 0)) + '%';
+    if (show) prog.firstChild.style.width =
+        Math.max(2, Math.min(100, (copying ? vm.copyProgress : vm.vhdxProgress) || 0)) + '%';
 }
 
 /* Name kept from the table UI: every state change calls it. Rebuilds a card
@@ -1242,6 +1248,7 @@ function renderVmTable() {
         var card = rowCache[vm.id];
         var sig = [
             i === selectedVm, vm.name, vm.running, vm.starting, vm.buildingVhdx, vm.vhdxStaging, vm.updatingTools,
+            vm.copyingDisk,
             vm.shuttingDown, vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort, vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.hasSnapshots,

@@ -398,6 +398,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+    jb_bool(jb, L"copyingDisk", v->copying_disk);
+    jb_int(jb, L"copyProgress", (int)v->copy_progress);
 
     /* Display mode (Windows and Linux guests; the IDD window owns the settings file). */
     if (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0) {
@@ -1420,6 +1422,40 @@ static void handle_webview2_message(const wchar_t *json)
             else if (FAILED(hr))
                 ui_show_alert(L"Guest components can only be updated for Windows VMs.");
         }
+        send_vm_list();
+    } else if (wcscmp(action, L"exportVm") == 0) {
+        /* Ask for a destination folder, then export there in the background. */
+        int idx;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
+            BROWSEINFOW browse;
+            PIDLIST_ABSOLUTE selection;
+            wchar_t path[MAX_PATH] = { 0 };
+            ZeroMemory(&browse, sizeof(browse));
+            browse.hwndOwner = g_hwnd_main;
+            browse.lpszTitle = L"Choose where to save the exported VM (a <name>.asbvm folder is created there)";
+            browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
+            selection = SHBrowseForFolderW(&browse);
+            if (selection) {
+                if (SHGetPathFromIDListW(selection, path))
+                    asb_vm_export(asb_vm_get(idx), path);
+                CoTaskMemFree(selection);
+            }
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"importVm") == 0) {
+        /* An export's vm.json (or a VM folder's disk.vhdx), or any .vhdx. */
+        OPENFILENAMEW ofn;
+        wchar_t file[MAX_PATH] = { 0 };
+        ZeroMemory(&ofn, sizeof(ofn));
+        ofn.lStructSize = sizeof(ofn);
+        ofn.hwndOwner = g_hwnd_main;
+        ofn.lpstrTitle = L"Import a VM: choose its vm.json (App Sandbox export) or a .vhdx disk";
+        ofn.lpstrFilter = L"App Sandbox export or disk (vm.json, *.vhdx)\0vm.json;*.vhdx\0All Files\0*.*\0";
+        ofn.lpstrFile = file;
+        ofn.nMaxFile = MAX_PATH;
+        ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (GetOpenFileNameW(&ofn))
+            asb_vm_import(file);
         send_vm_list();
     } else if (wcscmp(action, L"setAutoUpdateGuestTools") == 0) {
         BOOL enabled = TRUE;

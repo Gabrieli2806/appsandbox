@@ -270,6 +270,19 @@ ASB_API BOOL asb_get_auto_update_guest_tools(void);
 ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm);
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm);
 
+/* Export a stopped VM to dest_parent\<name>.asbvm\: one standalone
+   disk.vhdx (the current state, snapshot chain flattened) plus vm.json with
+   its settings and its display settings. Runs in the background; progress is
+   VmInstance.copying_disk / copy_progress and the log. The TPM state is not
+   exported (it is tied to this PC). */
+ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *dest_parent);
+
+/* Import a VM from an .asbvm export (its folder or its vm.json), or from a
+   VM folder of another App Sandbox installation, or from a single .vhdx.
+   The disk is copied (and flattened) into the default disk folder under a
+   unique name; the VM appears at once and is usable when the copy ends. */
+ASB_API HRESULT asb_vm_import(const wchar_t *source);
+
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);
 
