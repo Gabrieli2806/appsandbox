@@ -33,6 +33,7 @@
 
 #include "vm_display_idd.h"
 #include "vm_video_decode.h"
+#include "vm_display_d3d12.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
 #include "vm_clipboard.h"
@@ -330,6 +331,7 @@ struct VmDisplayIdd {
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11PixelShader       *ps_blur;     /* adaptive backdrop */
+    Dx12Presenter           *dx12;        /* Settings > Renderer = D3D12: presents instead of swap_chain */
     ID3D11Buffer            *cb_blur;
     ID3D11Texture2D         *bg_tex;      /* frame copy with mips for the backdrop */
     /* Backdrop animation: fade in when bars appear; the picture rect eases
@@ -1519,7 +1521,10 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
                d->vm_name, d->frame_width, d->frame_height,
                d->frame_connected ? d->fps_value : 0,
                (d->frame_connected && d->video_active)
-                   ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" - GPU HEVC" : L" - GPU H.264") : L"",
+                   ? (d->video_codec == VM_VIDEO_CODEC_HEVC
+                          ? (d->dx12 ? L" - GPU HEVC - D3D12" : L" - GPU HEVC")
+                          : (d->dx12 ? L" - GPU H.264 - D3D12" : L" - GPU H.264"))
+                   : (d->dx12 ? L" - D3D12" : L""),
                (d->mode_supported && d->frame_connected && d->guest_driver == 0)
                    ? L" - old display driver (1920x1080 only)" : L"");
     SetWindowTextW(d->hwnd, title);
@@ -2603,6 +2608,8 @@ static BOOL d3d_compile_shader(const char *hlsl, const char *entry,
     return TRUE;
 }
 
+static void idd_video_log(void *user, const wchar_t *msg);
+
 static BOOL d3d_init(VmDisplayIdd *d)
 {
     DXGI_SWAP_CHAIN_DESC scd;
@@ -2628,6 +2635,24 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.Windowed                           = TRUE;
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
+    /* Renderer D3D12 (Settings > VM windows): a D3D11 device for decoding
+       and uploads, D3D12 for drawing and presenting. Any failure falls back
+       to the D3D11 swap chain below. */
+    if (asb_get_viewer_renderer() == 12) {
+        hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+                               D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+                               NULL, 0, D3D11_SDK_VERSION, &d->device, &feature_level, &d->ctx);
+        if (SUCCEEDED(hr))
+            d->dx12 = dx12_create(d->render_hwnd, d->device, d->ctx, g_vs_hlsl, g_ps_hlsl,
+                                  g_ps_blur_hlsl, idd_video_log, d);
+        if (!d->dx12) {
+            idd_log_main(d, L"Direct3D 12 renderer unavailable; using Direct3D 11.");
+            if (d->ctx)    { d->ctx->lpVtbl->Release(d->ctx);       d->ctx = NULL; }
+            if (d->device) { d->device->lpVtbl->Release(d->device); d->device = NULL; }
+        }
+    }
+
+    if (!d->dx12) {
     /* Flip model with two buffers: the compositor shows our latest frame
        without an extra copy, and with Present(0) a newer frame replaces a
        queued one instead of waiting behind it (smoother, lower latency).
@@ -2685,6 +2710,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
             return FALSE;
         }
     }
+    } /* !d->dx12 */
 
     /* Create frame texture (dynamic, CPU-writable) */
     ZeroMemory(&td, sizeof(td));
@@ -2788,6 +2814,11 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
     HRESULT hr;
     ID3D11Texture2D *back_buf = NULL;
 
+    if (d->dx12) {
+        GetClientRect(d->render_hwnd, &rc);
+        dx12_resize(d->dx12, (UINT)rc.right, (UINT)rc.bottom);
+        return;
+    }
     if (!d->swap_chain) return;
 
     /* Release old render target */
@@ -3010,18 +3041,17 @@ static float ease_out_cubic(float t)
     return 1.0f - t * t * t;
 }
 
-/* Draw the picture (rect x,y,w,h in client pixels) blended into the
-   blurred backdrop over the whole client area. FALSE = not drawn. */
-static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
-                              UINT cw, UINT ch, const float *rect, float fade)
+/* Constants for the backdrop blend shader (b0, 16 floats) for a picture
+   at rect (x, y, w, h client pixels). Also refreshes the mip-mapped copy.
+   FALSE = backdrop not available. */
+static BOOL d3d_blend_consts(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
+                             UINT cw, UINT ch, const float *rect, float fade, float *c)
 {
-    D3D11_MAPPED_SUBRESOURCE m;
-    D3D11_VIEWPORT full;
-    ID3D11ShaderResourceView *views[2];
     float fa, ca, lod = 0.0f, mw, feather;
     UINT fw = d->frame_width, fh = d->frame_height, lw, lh;
+    BOOL bars_x, bars_y;
 
-    if (!d->ps_blur || !d->cb_blur || !src || !fw || !fh || !cw || !ch) return FALSE;
+    if (!src || !fw || !fh || !cw || !ch) return FALSE;
     if (!d3d_bg_update(d, src)) return FALSE;
 
     fa = (float)fw / (float)fh;
@@ -3032,32 +3062,45 @@ static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
     /* Feather: about 6% of the picture's short side, at least 24 px. */
     feather = (rect[2] < rect[3] ? rect[2] : rect[3]) * 0.06f;
     if (feather < 24.0f) feather = 24.0f;
+    bars_x = rect[0] > 0.5f || rect[0] + rect[2] < (float)cw - 0.5f;
+    bars_y = rect[1] > 0.5f || rect[1] + rect[3] < (float)ch - 0.5f;
 
+    c[0] = ca > fa ? 1.0f : ca / fa;      /* cover */
+    c[1] = ca > fa ? fa / ca : 1.0f;
+    c[2] = lod;
+    c[3] = 0.6f;                          /* dim */
+    c[4] = 1.0f / (float)lw;
+    c[5] = 1.0f / (float)lh;
+    c[6] = fade;
+    c[7] = 0.0f;
+    c[8]  = rect[0] / (float)cw;
+    c[9]  = rect[1] / (float)ch;
+    c[10] = (rect[0] + rect[2]) / (float)cw;
+    c[11] = (rect[1] + rect[3]) / (float)ch;
+    /* No fade along edges that touch the window (no bars there). */
+    c[12] = bars_x ? feather / (float)cw : 1e-6f;
+    c[13] = bars_y ? feather / (float)ch : 1e-6f;
+    c[14] = c[15] = 0.0f;
+    return TRUE;
+}
+
+/* Draw the picture (rect x,y,w,h in client pixels) blended into the
+   blurred backdrop over the whole client area. FALSE = not drawn. */
+static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
+                              UINT cw, UINT ch, const float *rect, float fade)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT full;
+    ID3D11ShaderResourceView *views[2];
+    float consts[16];
+
+    if (!d->ps_blur || !d->cb_blur) return FALSE;
+    if (!d3d_blend_consts(d, src, cw, ch, rect, fade, consts)) return FALSE;
     if (FAILED(d->ctx->lpVtbl->Map(d->ctx, (ID3D11Resource *)d->cb_blur, 0,
                                    D3D11_MAP_WRITE_DISCARD, 0, &m)))
         return FALSE;
-    {
-        float *c = (float *)m.pData;
-        BOOL bars_x = rect[0] > 0.5f || rect[0] + rect[2] < (float)cw - 0.5f;
-        BOOL bars_y = rect[1] > 0.5f || rect[1] + rect[3] < (float)ch - 0.5f;
-        c[0] = ca > fa ? 1.0f : ca / fa;      /* cover */
-        c[1] = ca > fa ? fa / ca : 1.0f;
-        c[2] = lod;
-        c[3] = 0.6f;                          /* dim */
-        c[4] = 1.0f / (float)lw;
-        c[5] = 1.0f / (float)lh;
-        c[6] = fade;
-        c[7] = 0.0f;
-        c[8]  = rect[0] / (float)cw;
-        c[9]  = rect[1] / (float)ch;
-        c[10] = (rect[0] + rect[2]) / (float)cw;
-        c[11] = (rect[1] + rect[3]) / (float)ch;
-        /* No fade along edges that touch the window (no bars there). */
-        c[12] = bars_x ? feather / (float)cw : 1e-6f;
-        c[13] = bars_y ? feather / (float)ch : 1e-6f;
-        c[14] = c[15] = 0.0f;
-        d->ctx->lpVtbl->Unmap(d->ctx, (ID3D11Resource *)d->cb_blur, 0);
-    }
+    memcpy(m.pData, consts, sizeof(consts));
+    d->ctx->lpVtbl->Unmap(d->ctx, (ID3D11Resource *)d->cb_blur, 0);
 
     ZeroMemory(&full, sizeof(full));
     full.Width = (float)cw;
@@ -3086,7 +3129,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
 
-    if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
+    if (!d->device || !d->ctx || (!d->dx12 && (!d->swap_chain || !d->rtv)))
         return;
 
     /* Performance mode: decode every queued access unit (each one depends on
@@ -3150,8 +3193,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
     }
     d->render_count++;
 
-    d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
-    d->ctx->lpVtbl->ClearRenderTargetView(d->ctx, d->rtv, clear_color);
+    if (!d->dx12) {
+        d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
+        d->ctx->lpVtbl->ClearRenderTargetView(d->ctx, d->rtv, clear_color);
+    }
 
     d->ctx->lpVtbl->IASetPrimitiveTopology(d->ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -3198,6 +3243,23 @@ static void d3d_render_frame(VmDisplayIdd *d)
            bar are normal once settled: only real gaps get the backdrop. */
         bars = d->res_choice == RES_ADAPTIVE &&
                ((float)rc.right - shown[2] > 12.0f || (float)rc.bottom - shown[3] > 12.0f);
+        if (d->dx12) {
+            /* Direct3D 12 presents; D3D11 only provides the textures. */
+            float consts[16];
+            BOOL blend = FALSE;
+            if (bars) {
+                float fade;
+                if (!d->bd_start) d->bd_start = now;
+                fade = (float)(now - d->bd_start) / 220.0f;
+                if (fade >= 1.0f) fade = 1.0f; else d->anim_active = TRUE;
+                blend = d3d_blend_consts(d, srv, (UINT)rc.right, (UINT)rc.bottom, shown,
+                                         ease_out_cubic(fade), consts);
+            } else {
+                d->bd_start = 0;
+            }
+            dx12_present(d->dx12, srv, shown, blend, blend ? d->bg_srv : NULL, consts);
+            return;
+        }
         if (bars) {
             float fade;
             if (!d->bd_start) d->bd_start = now;
@@ -3230,6 +3292,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
 static void d3d_cleanup(VmDisplayIdd *d)
 {
     if (d->vdec)       { vm_video_decoder_destroy(d->vdec);              d->vdec = NULL; }
+    if (d->dx12)       { dx12_destroy(d->dx12);                          d->dx12 = NULL; }
     if (d->bg_srv)     { d->bg_srv->lpVtbl->Release(d->bg_srv);         d->bg_srv = NULL; }
     if (d->bg_tex)     { d->bg_tex->lpVtbl->Release(d->bg_tex);         d->bg_tex = NULL; }
     if (d->cb_blur)    { d->cb_blur->lpVtbl->Release(d->cb_blur);       d->cb_blur = NULL; }

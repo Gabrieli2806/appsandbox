@@ -269,6 +269,7 @@ static BOOL g_auto_update_tools = TRUE;
 /* VM window preferences (Settings > VM windows). */
 static BOOL g_viewer_title_stats = TRUE;   /* resolution, FPS, codec in the title */
 static BOOL g_viewer_toolbar = TRUE;       /* floating toolbar at the top edge */
+static int  g_viewer_renderer = 11;        /* 11 = Direct3D 11, 12 = Direct3D 12 */
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -675,7 +676,7 @@ static BOOL save_vm_list(void)
     }
 
     if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_auto_update_tools ||
-        !g_viewer_title_stats || !g_viewer_toolbar) {
+        !g_viewer_title_stats || !g_viewer_toolbar || g_viewer_renderer != 11) {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
@@ -687,6 +688,8 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"ViewerTitleStats=0\n");
         if (!g_viewer_toolbar)
             fwprintf(f, L"ViewerToolbar=0\n");
+        if (g_viewer_renderer != 11)
+            fwprintf(f, L"ViewerRenderer=%d\n", g_viewer_renderer);
         fwprintf(f, L"\n");
     }
 
@@ -851,6 +854,8 @@ static void load_vm_list(void)
                 g_viewer_title_stats = (_wtoi(line + 17) != 0);
             else if (wcsncmp(line, L"ViewerToolbar=", 14) == 0)
                 g_viewer_toolbar = (_wtoi(line + 14) != 0);
+            else if (wcsncmp(line, L"ViewerRenderer=", 15) == 0)
+                g_viewer_renderer = _wtoi(line + 15) == 12 ? 12 : 11;
             continue;
         }
 
@@ -4797,6 +4802,8 @@ ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar)
 
 ASB_API BOOL asb_get_viewer_title_stats(void) { return g_viewer_title_stats; }
 ASB_API BOOL asb_get_viewer_toolbar(void) { return g_viewer_toolbar; }
+ASB_API void asb_set_viewer_renderer(int renderer) { g_viewer_renderer = renderer == 12 ? 12 : 11; }
+ASB_API int  asb_get_viewer_renderer(void) { return g_viewer_renderer; }
 
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm)
 {

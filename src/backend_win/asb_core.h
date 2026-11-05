@@ -273,6 +273,10 @@ ASB_API BOOL asb_get_auto_update_guest_tools(void);
 ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar);
 ASB_API BOOL asb_get_viewer_title_stats(void);
 ASB_API BOOL asb_get_viewer_toolbar(void);
+/* VM window renderer: 11 = Direct3D 11 (default), 12 = Direct3D 12.
+   Applies to VM windows opened afterwards. */
+ASB_API void asb_set_viewer_renderer(int renderer);
+ASB_API int  asb_get_viewer_renderer(void);
 ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm);
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm);
 

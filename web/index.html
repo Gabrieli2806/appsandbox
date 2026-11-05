@@ -249,6 +249,13 @@
             <div class="row-text"><span class="row-label">Floating toolbar</span><span class="muted small">The bar that appears when the pointer touches the top edge of a VM window. Its options stay in the title bar menu.</span></div>
             <button type="button" class="switch" id="set-toolbar" role="switch" aria-checked="true" aria-label="Floating toolbar" onclick="toggleViewerPref('toolbar')"><span></span></button>
         </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Renderer</span><span class="muted small">Graphics API the VM window draws with. Direct3D 12 is newer; Direct3D 11 is the most compatible. Applies to VM windows opened afterwards; if Direct3D 12 cannot start, Direct3D 11 is used.</span></div>
+            <div class="segmented" role="group" aria-label="Renderer" id="set-renderer">
+                <button type="button" data-renderer="11" onclick="setRenderer(11)">Direct3D 11</button>
+                <button type="button" data-renderer="12" onclick="setRenderer(12)">Direct3D 12</button>
+            </div>
+        </div>
     </div>
     <h2 class="group-title">This computer</h2>
     <div class="card rows" id="set-host"></div>

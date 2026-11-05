@@ -331,6 +331,7 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_bool(jb, L"autoUpdateGuestTools", asb_get_auto_update_guest_tools());
     jb_bool(jb, L"viewerTitleStats", asb_get_viewer_title_stats());
     jb_bool(jb, L"viewerToolbar", asb_get_viewer_toolbar());
+    jb_int(jb, L"viewerRenderer", asb_get_viewer_renderer());
     jb_bool(jb, L"hevcDecoder", vm_display_idd_hevc_supported());
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
@@ -1616,6 +1617,11 @@ static void handle_webview2_message(const wchar_t *json)
         json_get_bool(json, L"titleStats", &title);
         json_get_bool(json, L"toolbar", &toolbar);
         asb_set_viewer_prefs(title, toolbar);
+        {
+            int renderer = 0;
+            if (json_get_int(json, L"renderer", &renderer) && (renderer == 11 || renderer == 12))
+                asb_set_viewer_renderer(renderer);
+        }
         asb_save();
         for (i = 0; i < ASB_MAX_VMS; i++)
             if (g_idd_displays[i]) vm_display_idd_prefs_changed(g_idd_displays[i]);
