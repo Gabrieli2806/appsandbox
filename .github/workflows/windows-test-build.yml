@@ -26,11 +26,12 @@ jobs:
 
       - uses: microsoft/setup-msbuild@v2
 
+      # cmd, not pwsh: the driver packages' post-build steps run Windows
+      # PowerShell 5, which cannot load its own modules when it inherits
+      # PowerShell 7's PSModulePath.
       - name: Build Release|x64
-        shell: pwsh
-        run: |
-          msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
-          if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)" }
+        shell: cmd
+        run: msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
 
       - name: Package
         id: package
