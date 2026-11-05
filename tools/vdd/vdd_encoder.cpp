@@ -39,6 +39,10 @@ typedef HRESULT (WINAPI *PFN_MFCreateSample)(IMFSample**);
 typedef HRESULT (WINAPI *PFN_MFCreateMemoryBuffer)(DWORD, IMFMediaBuffer**);
 typedef HRESULT (WINAPI *PFN_MFCreateDXGISurfaceBuffer)(REFIID, IUnknown*, UINT, BOOL, IMFMediaBuffer**);
 typedef HRESULT (WINAPI *PFN_MFCreateDXGIDeviceManager)(UINT*, IMFDXGIDeviceManager**);
+typedef HRESULT (WINAPI *PFN_MFTEnum2)(GUID, UINT32, const MFT_REGISTER_TYPE_INFO*,
+                                       const MFT_REGISTER_TYPE_INFO*, IMFAttributes*,
+                                       IMFActivate***, UINT32*);
+typedef HRESULT (WINAPI *PFN_MFCreateAttributes)(IMFAttributes**, UINT32);
 
 static struct {
     HMODULE                       dll;
@@ -50,6 +54,8 @@ static struct {
     PFN_MFCreateMemoryBuffer      CreateMemoryBuffer;
     PFN_MFCreateDXGISurfaceBuffer CreateDXGISurfaceBuffer;
     PFN_MFCreateDXGIDeviceManager CreateDXGIDeviceManager;
+    PFN_MFTEnum2                  TEnum2;            /* optional (Windows 10 1703+) */
+    PFN_MFCreateAttributes        CreateAttributes;  /* optional */
 } g_mf;
 
 static BOOL VddMfLoad(void)
@@ -74,9 +80,16 @@ static BOOL VddMfLoad(void)
         memset(&g_mf, 0, sizeof(g_mf));
         return FALSE;
     }
+    g_mf.TEnum2 = (PFN_MFTEnum2)GetProcAddress(dll, "MFTEnum2");
+    g_mf.CreateAttributes = (PFN_MFCreateAttributes)GetProcAddress(dll, "MFCreateAttributes");
     g_mf.dll = dll;
     return TRUE;
 }
+
+/* MFT_ENUM_ADAPTER_LUID (mfapi.h, Windows 10 1703+), defined here because the
+   driver build targets an older NTDDI. */
+static const GUID VDD_MFT_ENUM_ADAPTER_LUID =
+    { 0x1d39518c, 0xe220, 0x4da8, { 0xa0, 0x7f, 0xba, 0x17, 0x25, 0x52, 0xd6, 0xb1 } };
 
 #define SAFE_RELEASE(p) do { if (p) { (p)->Release(); (p) = nullptr; } } while (0)
 
@@ -481,9 +494,35 @@ static HRESULT OpenEncoder(VddEncoder* e)
     MFT_REGISTER_TYPE_INFO inInfo = { MFMediaType_Video, MFVideoFormat_NV12 };
     MFT_REGISTER_TYPE_INFO outInfo = { MFMediaType_Video, MFVideoFormat_H264 };
 
-    hr = g_mf.TEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
-                      MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
-                      &inInfo, &outInfo, &list, &count);
+    /* Only encoders on the GPU this device lives on: with two GPUs in the
+       guest (e.g. NVIDIA and Intel) the first hardware encoder can belong to
+       the other one, which cannot read our textures. */
+    hr = E_NOTIMPL;
+    if (g_mf.TEnum2 && g_mf.CreateAttributes) {
+        IDXGIDevice* dxgi = nullptr;
+        IDXGIAdapter* adapter = nullptr;
+        IMFAttributes* filter = nullptr;
+        DXGI_ADAPTER_DESC ad = {};
+        if (SUCCEEDED(e->device->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgi)) &&
+            SUCCEEDED(dxgi->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&ad)) &&
+            SUCCEEDED(g_mf.CreateAttributes(&filter, 1))) {
+            char an[128];
+            WideCharToMultiByte(CP_UTF8, 0, ad.Description, -1, an, sizeof(an), NULL, NULL);
+            EncLog(e, "Encoder: looking for a hardware H.264 encoder on \"%s\"", an);
+            filter->SetBlob(VDD_MFT_ENUM_ADAPTER_LUID, (const UINT8*)&ad.AdapterLuid, sizeof(LUID));
+            hr = g_mf.TEnum2(MFT_CATEGORY_VIDEO_ENCODER,
+                             MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                             &inInfo, &outInfo, filter, &list, &count);
+            if (SUCCEEDED(hr) && count == 0) { if (list) CoTaskMemFree(list); list = nullptr; hr = MF_E_NOT_FOUND; }
+        }
+        SAFE_RELEASE(filter);
+        SAFE_RELEASE(adapter);
+        SAFE_RELEASE(dxgi);
+    }
+    if (FAILED(hr))
+        hr = g_mf.TEnumEx(MFT_CATEGORY_VIDEO_ENCODER,
+                          MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_SORTANDFILTER,
+                          &inInfo, &outInfo, &list, &count);
     if (FAILED(hr) || count == 0) {
         EncLog(e, "Encoder: no hardware H.264 encoder found (hr=0x%08X, count=%u)", hr, count);
         if (list) CoTaskMemFree(list);

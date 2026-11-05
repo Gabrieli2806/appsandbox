@@ -1532,6 +1532,34 @@ static HRESULT hcs_apply_gpu(VmInstance *instance)
 
     ui_log(L"Applying GPU-PV...");
 
+    /* Default mode on a PC with an integrated GPU next to a dedicated one:
+       assign only the dedicated GPU. Partitioning the integrated GPU too
+       gives the guest a second adapter it rarely uses and is a known cause
+       of host display hangs while the partition is created. Falls back to
+       Hyper-V's default assignment if that fails. */
+    if (!instance->gpu_id[0] && instance->gpu_auto_id[0] && gpu_is_available(instance->gpu_auto_id)) {
+        escape_json_path(instance->gpu_auto_id, gpu_id_esc, 1024);
+        swprintf_s(modify_json, 2048,
+            L"{"
+            L"\"ResourcePath\":\"VirtualMachine/ComputeTopology/Gpu\","
+            L"\"RequestType\":\"Update\","
+            L"\"Settings\":{"
+                L"\"AssignmentMode\":\"List\","
+                L"\"AssignmentRequest\":{\"%s\":65535},"
+                L"\"AllowVendorExtension\":true"
+            L"}"
+            L"}", gpu_id_esc);
+        op = pfnCreateOp(NULL, NULL);
+        if (!op) return E_OUTOFMEMORY;
+        hr = pfnModify(instance->handle, op, modify_json, NULL);
+        hr = hcs_exec_and_wait(hr, op);
+        if (SUCCEEDED(hr)) {
+            ui_log(L"GPU-PV applied successfully (dedicated GPU only).");
+            return hr;
+        }
+        ui_log(L"Dedicated-GPU assignment failed (0x%08X); using the default assignment.", hr);
+    }
+
     for (attempt = 0; attempt < 2; attempt++) {
         if (instance->gpu_id[0] &&
             !gpu_is_available(instance->gpu_id)) {

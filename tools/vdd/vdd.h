@@ -384,6 +384,8 @@ typedef struct _VDD_DEVICE_CONTEXT {
     WDFTIMER            hRenderTimer;
     LUID                renderLuid;         /* adapter last requested, 0 = none */
     UINT                renderAttempts;
+    LUID                renderSeenLuid;     /* GPU seen on the previous check */
+    UINT                renderSeenCount;    /* consecutive checks it was there */
     VDD_MODE            pendingMode;
     UINT                lastRefresh;        /* refresh of the last mode request (Hz) */
     volatile LONG       modeStage;          /* 0 idle, 1 update modes, 2 verify */

@@ -1561,6 +1561,19 @@ static BOOL VddApplyRenderAdapter(VDD_DEVICE_CONTEXT* ctx)
     }
     if (luid.LowPart == ctx->renderLuid.LowPart && luid.HighPart == ctx->renderLuid.HighPart)
         return TRUE;
+    /* Switch only once the GPU has been up for a while (seen on three checks
+       in a row, about 10 s): moving composition onto a GPU whose driver is
+       still starting right after boot is a hang risk. */
+    if (luid.LowPart == ctx->renderSeenLuid.LowPart && luid.HighPart == ctx->renderSeenLuid.HighPart) {
+        ctx->renderSeenCount++;
+    } else {
+        ctx->renderSeenLuid = luid;
+        ctx->renderSeenCount = 1;
+    }
+    if (ctx->renderSeenCount < 3) {
+        VddLog("RenderAdapter: \"%s\" found, waiting for it to settle (%u/3)", name, ctx->renderSeenCount);
+        return FALSE;
+    }
     {
         IDARG_IN_ADAPTERSETRENDERADAPTER in = {};
         in.PreferredRenderAdapter = luid;

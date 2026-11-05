@@ -87,6 +87,41 @@ static void update_vm_gpu_name(VmInstance *vm)
         vm->gpu_mode == GPU_DEFAULT ? (gpu ? gpu->name : L"Default GPU") : L"None");
 }
 
+static void asb_log(const wchar_t *fmt, ...);
+
+/* Integrated GPUs by name (Intel UHD/Iris/"Intel(R) Graphics", AMD APU
+   "Radeon(TM) Graphics" without a model number). */
+static BOOL gpu_is_integrated(const wchar_t *name)
+{
+    if (!name) return FALSE;
+    if (wcsstr(name, L"Intel") && !wcsstr(name, L"Arc") &&
+        (wcsstr(name, L"UHD") || wcsstr(name, L"Iris") || wcsstr(name, L"HD Graphics") ||
+         wcsstr(name, L"Intel(R) Graphics")))
+        return TRUE;
+    if (wcsstr(name, L"AMD Radeon(TM) Graphics") || wcscmp(name, L"AMD Radeon Graphics") == 0)
+        return TRUE;
+    return FALSE;
+}
+
+/* Default GPU mode: when the PC has both kinds, partition only the first
+   dedicated GPU (see hcs_apply_gpu). */
+static void pick_auto_gpu(VmInstance *vm)
+{
+    int i, dedicated = -1, integrated = 0;
+    vm->gpu_auto_id[0] = L'\0';
+    if (vm->gpu_mode != GPU_DEFAULT || vm->gpu_id[0]) return;
+    for (i = 0; i < g_gpu_list.count; i++) {
+        if (gpu_is_integrated(g_gpu_list.gpus[i].name)) integrated++;
+        else if (dedicated < 0) dedicated = i;
+    }
+    if (dedicated >= 0 && integrated > 0 && g_gpu_list.gpus[dedicated].interface_path[0]) {
+        wcscpy_s(vm->gpu_auto_id, ARRAYSIZE(vm->gpu_auto_id),
+                 g_gpu_list.gpus[dedicated].interface_path);
+        asb_log(L"Default GPU: using %s only (integrated GPU left to the host).",
+               g_gpu_list.gpus[dedicated].name);
+    }
+}
+
 static BOOL resolve_vm_gpu_selection(VmInstance *vm)
 {
     BOOL changed = FALSE;
@@ -1325,6 +1360,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     }
 
     asb_log(L"Starting VM \"%s\"...", vm->name);
+    pick_auto_gpu(vm);
     hr = hcs_start_vm(vm);
     if (wcscmp(vm->gpu_id, args->config.gpu_id) != 0) save_vm_list();
     if (FAILED(hr)) {
@@ -3870,6 +3906,7 @@ build_failed:
 
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);
+    pick_auto_gpu(inst);
     hr = hcs_start_vm(inst);
     if (SUCCEEDED(hr)) {
         hcs_start_monitor(inst);
@@ -3996,7 +4033,9 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         asb_events_changed();
     } else {
         BOOL selected_gpu = inst->gpu_id[0] != L'\0';
-        HRESULT hr = hcs_start_vm(inst);
+        HRESULT hr;
+        pick_auto_gpu(inst);
+        hr = hcs_start_vm(inst);
         if (selected_gpu && !inst->gpu_id[0]) save_vm_list();
         if (hr == (HRESULT)0x80370110L && inst->handle) {
             hcs_terminate_vm(inst);

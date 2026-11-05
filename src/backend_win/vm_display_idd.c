@@ -646,6 +646,19 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     UpdateWindow(d->log_list_hwnd);
 }
 
+/* Also into the main App Sandbox log (for messages users need to see). */
+static void idd_log_main(VmDisplayIdd *d, const wchar_t *fmt, ...)
+{
+    wchar_t buf[512];
+    va_list ap;
+    if (!d) return;
+    va_start(ap, fmt);
+    vswprintf_s(buf, 512, fmt, ap);
+    va_end(ap);
+    idd_log(d, L"%s", buf);
+    ui_log(L"[%s] %s", d->vm_name, buf);
+}
+
 /* ---- Send input packet to guest ---- */
 
 static BOOL send_input_locked(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
@@ -1039,7 +1052,7 @@ static void idd_send_perf(VmDisplayIdd *d, UINT32 flags)
         ok = send(d->frame_socket, (const char *)&req, (int)sizeof(req), 0) == (int)sizeof(req);
     ReleaseSRWLockExclusive(&d->frame_send_lock);
     if (!(flags & PERF_FLAG_KEYFRAME) || !ok)
-        idd_log(d, L"Stream mode %s requested (%s).",
+        idd_log_main(d, L"Stream mode %s requested (%s).",
                 req.width ? L"performance (GPU video)" : L"quality (raw frames)",
                 ok ? L"sent" : L"not connected");
 }
@@ -2517,7 +2530,7 @@ static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d)
 
 static void idd_video_log(void *user, const wchar_t *msg)
 {
-    idd_log((VmDisplayIdd *)user, L"%s", msg);
+    idd_log_main((VmDisplayIdd *)user, L"%s", msg);
 }
 
 /* Decode the queued access units on the window thread. Returns TRUE when a
@@ -2568,7 +2581,7 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
                 /* Windows N editions lack the H.264 decoder (Media Feature
                    Pack). Fall back to raw frames for this session. */
                 d->vdec_unavailable = TRUE;
-                idd_log(d, L"This PC cannot decode H.264 video (on Windows N install the "
+                idd_log_main(d, L"This PC cannot decode H.264 video (on Windows N install the "
                            L"Media Feature Pack). Using raw frames.");
                 idd_send_perf(d, 0);
                 continue;
@@ -3126,7 +3139,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (!recv_exact(s, rest, (int)sizeof(rest)))
                     break;
                 InterlockedExchange(&d->guest_driver, (LONG)rest[0]);
-                idd_log(d, L"Guest display driver: protocol %u (resolution changes supported%s).",
+                idd_log_main(d, L"Guest display driver: protocol %u (resolution changes supported%s).",
                         rest[0], rest[0] >= VDD_PROTOCOL_VIDEO ? L", performance mode" : L"");
                 if (rest[0] >= VDD_PROTOCOL_VIDEO && d->stream_mode == STREAM_PERFORMANCE)
                     idd_send_perf(d, PERF_FLAG_KEYFRAME);
@@ -3141,12 +3154,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 InterlockedExchange(&d->video_active, rest[0] == 1 ? 1 : 0);
                 InterlockedExchange(&d->video_status_hr, (LONG)rest[2]);
                 if (rest[0] == 1)
-                    idd_log(d, L"Performance mode on: the guest GPU encodes H.264 video.");
+                    idd_log_main(d, L"Performance mode on: the guest GPU encodes H.264 video.");
                 else if ((LONG)rest[2] < 0)
-                    idd_log(d, L"Performance mode unavailable in the guest (0x%08X): no hardware "
+                    idd_log_main(d, L"Performance mode unavailable in the guest (0x%08X): no hardware "
                                L"video encoder on its GPU. Showing raw frames.", rest[2]);
                 else
-                    idd_log(d, L"Quality mode: raw frames.");
+                    idd_log_main(d, L"Quality mode: raw frames.");
                 PostMessageW(d->hwnd, WM_IDD_VIDEO_STATUS, 0, 0);
                 continue;
             }
@@ -3968,7 +3981,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_save_settings(d);
             if (d->guest_driver >= 0 && d->guest_driver < VDD_PROTOCOL_VIDEO &&
                 d->stream_mode == STREAM_PERFORMANCE)
-                idd_log(d, L"Performance mode needs the updated guest display driver: "
+                idd_log_main(d, L"Performance mode needs the updated guest display driver: "
                            L"update the VM's guest components.");
             idd_send_perf(d, PERF_FLAG_KEYFRAME);
             idd_update_title(d, TRUE);

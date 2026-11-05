@@ -63,6 +63,9 @@ typedef struct {
     DWORD       cpu_cores;
     int         gpu_mode;
     wchar_t     gpu_name[256];
+    /* Default GPU mode on a PC with an integrated and a dedicated GPU: the
+       dedicated one (only it is partitioned). Empty = let Hyper-V assign. */
+    wchar_t     gpu_auto_id[512];
     wchar_t     gpu_id[512];
     int         network_mode;
     wchar_t     net_adapter[256];     /* Adapter name for External network */
