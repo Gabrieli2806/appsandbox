@@ -10,6 +10,7 @@
 #include <winioctl.h>
 #include <winternl.h>
 #pragma warning(pop)
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -268,7 +269,10 @@ static BOOL grant_system_file_control(const wchar_t *path)
     if (!CreateWellKnownSid(WinLocalSystemSid, NULL, sid, &sid_size)) return FALSE;
     result = SetNamedSecurityInfoW((wchar_t *)path, SE_FILE_OBJECT,
                                   OWNER_SECURITY_INFORMATION, sid, NULL, NULL, NULL);
-    if (result != ERROR_SUCCESS) return FALSE;
+    if (result != ERROR_SUCCESS) {
+        SetLastError(result);
+        return FALSE;
+    }
     access.grfAccessPermissions = GENERIC_ALL;
     access.grfAccessMode = GRANT_ACCESS;
     access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
@@ -288,15 +292,55 @@ static BOOL grant_system_file_control(const wchar_t *path)
         result = SetNamedSecurityInfoW((wchar_t *)path, SE_FILE_OBJECT,
                                       DACL_SECURITY_INFORMATION, NULL, NULL, acl, NULL);
     if (acl) LocalFree(acl);
+    /* The security APIs return their error; callers read it from GetLastError. */
+    if (result != ERROR_SUCCESS) SetLastError(result);
     return result == ERROR_SUCCESS;
 }
 
 #if defined(_M_X64)
-static BOOL install_system_file(const wchar_t *source, const wchar_t *runtime)
+/* Appends one line to the agent log in the same format as agent.c's agent_log,
+   so NVIDIA provisioning can say which step failed and why. The caller's last
+   error is preserved. */
+static void provision_log(const char *fmt, ...)
 {
-    return files_equal(source, runtime) ||
-        ((GetFileAttributesW(runtime) == INVALID_FILE_ATTRIBUTES || grant_system_file_control(runtime)) &&
-         replace_file(source, runtime));
+    FILE *f;
+    va_list ap;
+    SYSTEMTIME st;
+    DWORD error = GetLastError();
+
+    if (fopen_s(&f, "C:\\Windows\\AppSandbox\\agent.log", "a") != 0 || !f) {
+        SetLastError(error);
+        return;
+    }
+    GetLocalTime(&st);
+    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+        st.wYear, st.wMonth, st.wDay,
+        st.wHour, st.wMinute, st.wSecond);
+    va_start(ap, fmt);
+    vfprintf(f, fmt, ap);
+    va_end(ap);
+    fprintf(f, "\n");
+    fclose(f);
+    SetLastError(error);
+}
+
+/* Installs source as runtime, taking ownership of an existing file first.
+   Logs which step failed and why. */
+static BOOL install_system_file(const char *step, const wchar_t *source, const wchar_t *runtime)
+{
+    if (files_equal(source, runtime)) return TRUE;
+    if (GetFileAttributesW(runtime) != INVALID_FILE_ATTRIBUTES &&
+        !grant_system_file_control(runtime)) {
+        provision_log("NVIDIA runtime: %s: cannot take ownership of %ls (error %lu).",
+                      step, runtime, GetLastError());
+        return FALSE;
+    }
+    if (!replace_file(source, runtime)) {
+        provision_log("NVIDIA runtime: %s: cannot replace %ls with %ls (error %lu).",
+                      step, runtime, source, GetLastError());
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL dll_image_exports(HMODULE module, WORD machine, BYTE **image,
@@ -367,7 +411,11 @@ static BOOL validate_nvidia_opencl_dll(const wchar_t *path, BOOL shim)
         validate_dll_export(path, IMAGE_FILE_MACHINE_AMD64, "appsandbox_opencl") == shim;
 }
 
-static BOOL dll_exports_covered(const wchar_t *source, const wchar_t *replacement, WORD machine)
+/* Counts the exports of source that replacement does not provide; the first
+   such name goes to first_missing. Returns FALSE when either export table
+   cannot be read. */
+static BOOL count_uncovered_exports(const wchar_t *source, const wchar_t *replacement,
+                                    WORD machine, DWORD *missing, char first_missing[128])
 {
     HMODULE original = LoadLibraryExW(source, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
     HMODULE proxy = LoadLibraryExW(replacement, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
@@ -376,20 +424,77 @@ static BOOL dll_exports_covered(const wchar_t *source, const wchar_t *replacemen
     IMAGE_EXPORT_DIRECTORY *exports, *replacement_exports;
     BOOL result = FALSE;
 
+    *missing = 0;
+    first_missing[0] = 0;
     if (!dll_image_exports(original, machine, &base, &size, &exports) ||
         !dll_image_exports(proxy, machine, &replacement_base, &replacement_size,
                            &replacement_exports)) goto done;
     names = (DWORD *)(base + exports->AddressOfNames);
     for (i = 0; i < exports->NumberOfNames; i++) {
-        if (names[i] >= size || !memchr(base + names[i], 0, size - names[i]) ||
-            !dll_image_has_export(replacement_base, replacement_size, replacement_exports,
-                                  (char *)base + names[i])) goto done;
+        if (names[i] >= size || !memchr(base + names[i], 0, size - names[i])) goto done;
+        if (!dll_image_has_export(replacement_base, replacement_size, replacement_exports,
+                                  (char *)base + names[i]) && !(*missing)++)
+            strncpy_s(first_missing, 128, (char *)base + names[i], _TRUNCATE);
     }
     result = TRUE;
 done:
     if (proxy) FreeLibrary(proxy);
     if (original) FreeLibrary(original);
     return result;
+}
+
+/* Checks that path is an x64 DLL exporting every name in the NULL-terminated
+   required list and, when forbidden is set, not exporting it (App Sandbox
+   shims mark themselves with such an export). Logs why it is unusable. */
+static BOOL nvidia_dll_usable(const char *step, const char *role, const wchar_t *path,
+                              const char *const *required, const char *forbidden)
+{
+    HMODULE module = LoadLibraryExW(path, NULL, LOAD_LIBRARY_AS_IMAGE_RESOURCE);
+    BYTE *base = NULL;
+    DWORD size = 0;
+    IMAGE_EXPORT_DIRECTORY *exports = NULL;
+    const char *missing = NULL;
+    BOOL want_exports = required || forbidden, valid, marked = FALSE;
+
+    if (!module) {
+        provision_log("NVIDIA runtime: %s: cannot load %s %ls (error %lu).",
+                      step, role, path, GetLastError());
+        return FALSE;
+    }
+    valid = dll_image_exports(module, IMAGE_FILE_MACHINE_AMD64, &base, &size,
+                              want_exports ? &exports : NULL);
+    if (valid && exports) {
+        for (; required && *required && !missing; required++)
+            if (!dll_image_has_export(base, size, exports, *required)) missing = *required;
+        marked = forbidden && dll_image_has_export(base, size, exports, forbidden);
+    }
+    FreeLibrary(module);
+    if (!valid)
+        provision_log("NVIDIA runtime: %s: %s %ls is not an x64 DLL%s.", step, role, path,
+                      want_exports ? " with a readable export table" : "");
+    else if (missing)
+        provision_log("NVIDIA runtime: %s: %s %ls does not export %s.", step, role, path, missing);
+    else if (marked)
+        provision_log("NVIDIA runtime: %s: %s %ls exports %s, so it is an App Sandbox shim "
+                      "rather than NVIDIA's file.", step, role, path, forbidden);
+    return valid && !missing && !marked;
+}
+
+/* GPU-PV adapters can report different driver packages; a runtime file is
+   installed only when every package carries the same copy. */
+static BOOL nvidia_driver_copies_match(const char *step, wchar_t sources[32][MAX_PATH],
+                                       UINT count)
+{
+    UINT i;
+
+    for (i = 1; i < count; i++) {
+        if (!files_equal(sources[0], sources[i])) {
+            provision_log("NVIDIA runtime: %s: the GPU driver packages carry different "
+                          "files (%ls and %ls).", step, sources[0], sources[i]);
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 static BOOL validate_opengl_dll(const wchar_t *path, WORD machine, BOOL native)
@@ -509,6 +614,7 @@ static HANDLE create_ngx_junction_directory(const wchar_t *path, BOOL *created)
     UNICODE_STRING name;
     OBJECT_ATTRIBUTES attributes = { sizeof(attributes) };
     IO_STATUS_BLOCK status;
+    NTSTATUS create_status;
 
     *created = CreateDirectoryW(path, NULL);
     if (*created) {
@@ -518,13 +624,24 @@ static HANDLE create_ngx_junction_directory(const wchar_t *path, BOOL *created)
         if (directory != INVALID_HANDLE_VALUE) return directory;
     }
     error = GetLastError();
-    if (error != ERROR_ACCESS_DENIED) return INVALID_HANDLE_VALUE;
+    if (error != ERROR_ACCESS_DENIED) {
+        provision_log("NVIDIA runtime: NGX: cannot create or open the junction directory "
+                      "%ls (error %lu).", path, error);
+        return INVALID_HANDLE_VALUE;
+    }
     create = (CreateFileFn)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateFile");
     if (!create || swprintf_s(native, ARRAYSIZE(native), L"\\??\\%s", path) < 0 ||
         !OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
-                          &token)) return INVALID_HANDLE_VALUE;
+                          &token)) {
+        provision_log("NVIDIA runtime: NGX: access to %ls was denied and the restore "
+                      "privilege cannot be used (error %lu).", path, GetLastError());
+        return INVALID_HANDLE_VALUE;
+    }
     if (!LookupPrivilegeValueW(NULL, SE_RESTORE_NAME, &privileges.Privileges[0].Luid)) {
+        error = GetLastError();
         CloseHandle(token);
+        provision_log("NVIDIA runtime: NGX: cannot look up the restore privilege for %ls "
+                      "(error %lu).", path, error);
         return INVALID_HANDLE_VALUE;
     }
     privileges.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
@@ -536,14 +653,23 @@ static HANDLE create_ngx_junction_directory(const wchar_t *path, BOOL *created)
         name.MaximumLength = (USHORT)(name.Length + sizeof(wchar_t));
         attributes.ObjectName = &name;
         attributes.Attributes = OBJ_CASE_INSENSITIVE;
-        if (create(&directory, GENERIC_WRITE | DELETE | SYNCHRONIZE, &attributes, &status,
-            NULL, FILE_ATTRIBUTE_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        create_status = create(&directory, GENERIC_WRITE | DELETE | SYNCHRONIZE, &attributes,
+            &status, NULL, FILE_ATTRIBUTE_DIRECTORY,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             *created ? FILE_OPEN : FILE_CREATE,
             FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT |
-            FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT, NULL, 0) >= 0)
+            FILE_OPEN_FOR_BACKUP_INTENT | FILE_OPEN_REPARSE_POINT, NULL, 0);
+        if (create_status >= 0) {
             *created = TRUE;
-        else
+        } else {
             directory = INVALID_HANDLE_VALUE;
+            provision_log("NVIDIA runtime: NGX: creating the junction directory %ls with the "
+                          "restore privilege failed (NTSTATUS 0x%08lX).",
+                          path, (unsigned long)create_status);
+        }
+    } else {
+        provision_log("NVIDIA runtime: NGX: the restore privilege needed for %ls is not "
+                      "available (error %lu).", path, GetLastError());
     }
     if (previous.PrivilegeCount)
         AdjustTokenPrivileges(token, FALSE, &previous, 0, NULL, NULL);
@@ -558,44 +684,78 @@ static BOOL nvidia_ngx_junction(const wchar_t *sys, const wchar_t *package)
     const wchar_t *leaf;
     NvidiaNgxJunction reparse = { 0 };
     HANDLE directory;
-    DWORD attributes, bytes;
+    DWORD attributes, bytes, error;
     size_t target_length, native_length;
     BOOL created = FALSE, result;
 
     if (swprintf_s(host_prefix, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\", sys) < 0 ||
-        swprintf_s(driver_prefix, MAX_PATH, L"%s\\DriverStore\\FileRepository\\", sys) < 0)
+        swprintf_s(driver_prefix, MAX_PATH, L"%s\\DriverStore\\FileRepository\\", sys) < 0) {
+        provision_log("NVIDIA runtime: NGX: driver store path under %ls is too long.", sys);
         return FALSE;
+    }
     if (!_wcsnicmp(package, host_prefix, wcslen(host_prefix)))
         leaf = package + wcslen(host_prefix);
     else if (!_wcsnicmp(package, driver_prefix, wcslen(driver_prefix)))
         leaf = package + wcslen(driver_prefix);
-    else return FALSE;
+    else {
+        provision_log("NVIDIA runtime: NGX: driver package %ls is not in the driver store.",
+                      package);
+        return FALSE;
+    }
     if (!leaf[0] || !wcscmp(leaf, L".") || !wcscmp(leaf, L"..") || wcspbrk(leaf, L"\\/:") ||
         swprintf_s(target, MAX_PATH, L"%s%s", host_prefix, leaf) < 0 ||
         swprintf_s(link, MAX_PATH, L"%s%s", driver_prefix, leaf) < 0 ||
-        swprintf_s(native, ARRAYSIZE(native), L"\\??\\%s", target) < 0)
+        swprintf_s(native, ARRAYSIZE(native), L"\\??\\%s", target) < 0) {
+        provision_log("NVIDIA runtime: NGX: unusable driver package path %ls.", package);
         return FALSE;
+    }
     attributes = GetFileAttributesW(link);
     if (attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        /* A real package directory is used as it is when it matches the host. */
         wchar_t host_file[MAX_PATH];
-        if (!(attributes & FILE_ATTRIBUTE_DIRECTORY) ||
-            swprintf_s(file, MAX_PATH, L"%s\\_nvngx.dll", link) < 0 ||
-            swprintf_s(host_file, MAX_PATH, L"%s\\_nvngx.dll", target) < 0 ||
-            !validate_dll_export(file, IMAGE_FILE_MACHINE_AMD64, NULL)) return FALSE;
-        return GetFileAttributesW(host_file) == INVALID_FILE_ATTRIBUTES || files_equal(file, host_file);
+        if (!(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+            provision_log("NVIDIA runtime: NGX: %ls exists and is not a directory.", link);
+            return FALSE;
+        }
+        if (swprintf_s(file, MAX_PATH, L"%s\\_nvngx.dll", link) < 0 ||
+            swprintf_s(host_file, MAX_PATH, L"%s\\_nvngx.dll", target) < 0) {
+            provision_log("NVIDIA runtime: NGX: _nvngx.dll path under %ls is too long.", link);
+            return FALSE;
+        }
+        if (!nvidia_dll_usable("NGX", "driver file", file, NULL, NULL)) return FALSE;
+        if (GetFileAttributesW(host_file) != INVALID_FILE_ATTRIBUTES &&
+            !files_equal(file, host_file)) {
+            provision_log("NVIDIA runtime: NGX: %ls differs from the host driver's %ls.",
+                          file, host_file);
+            return FALSE;
+        }
+        return TRUE;
     }
-    if (swprintf_s(file, MAX_PATH, L"%s\\_nvngx.dll", target) < 0 ||
-        !validate_dll_export(file, IMAGE_FILE_MACHINE_AMD64, NULL)) return FALSE;
+    if (swprintf_s(file, MAX_PATH, L"%s\\_nvngx.dll", target) < 0) {
+        provision_log("NVIDIA runtime: NGX: _nvngx.dll path under %ls is too long.", target);
+        return FALSE;
+    }
+    if (!nvidia_dll_usable("NGX", "driver file", file, NULL, NULL)) return FALSE;
     native_length = wcslen(native) * sizeof(wchar_t);
     target_length = wcslen(target) * sizeof(wchar_t);
     if (attributes != INVALID_FILE_ATTRIBUTES) {
         directory = CreateFileW(link, 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-        if (directory == INVALID_HANDLE_VALUE) return FALSE;
+        if (directory == INVALID_HANDLE_VALUE) {
+            provision_log("NVIDIA runtime: NGX: cannot open the existing link %ls (error %lu).",
+                          link, GetLastError());
+            return FALSE;
+        }
         result = DeviceIoControl(directory, FSCTL_GET_REPARSE_POINT, NULL, 0,
                                   &reparse, sizeof(reparse), &bytes, NULL);
+        error = GetLastError();
         CloseHandle(directory);
-        return result && bytes >= (DWORD)FIELD_OFFSET(NvidiaNgxJunction, paths) &&
+        if (!result) {
+            provision_log("NVIDIA runtime: NGX: cannot read the existing link %ls (error %lu).",
+                          link, error);
+            return FALSE;
+        }
+        result = bytes >= (DWORD)FIELD_OFFSET(NvidiaNgxJunction, paths) &&
             reparse.tag == IO_REPARSE_TAG_MOUNT_POINT &&
             reparse.substitute_offset % sizeof(wchar_t) == 0 &&
             reparse.substitute_length == native_length &&
@@ -603,6 +763,10 @@ static BOOL nvidia_ngx_junction(const wchar_t *sys, const wchar_t *package)
                 bytes - (DWORD)FIELD_OFFSET(NvidiaNgxJunction, paths) &&
             !_wcsnicmp(reparse.paths + reparse.substitute_offset / sizeof(wchar_t),
                        native, native_length / sizeof(wchar_t));
+        if (!result)
+            provision_log("NVIDIA runtime: NGX: %ls is a link that does not point to %ls.",
+                          link, target);
+        return result;
     }
     directory = create_ngx_junction_directory(link, &created);
     if (directory == INVALID_HANDLE_VALUE) {
@@ -620,6 +784,8 @@ static BOOL nvidia_ngx_junction(const wchar_t *sys, const wchar_t *package)
                               reparse.data_length + 8, NULL, 0, &bytes, NULL);
     if (!result) {
         FILE_DISPOSITION_INFO disposition = { TRUE };
+        provision_log("NVIDIA runtime: NGX: cannot make %ls a junction to %ls (error %lu).",
+                      link, target, GetLastError());
         SetFileInformationByHandle(directory, FileDispositionInfo, &disposition, sizeof(disposition));
     }
     CloseHandle(directory);
@@ -629,101 +795,175 @@ static BOOL nvidia_ngx_junction(const wchar_t *sys, const wchar_t *package)
 static BOOL provision_nvapi(const wchar_t *native_dir, const wchar_t *sys,
                             wchar_t sources[32][MAX_PATH], UINT count)
 {
+    static const char *const shim_exports[] = {
+        "appsandbox_nvapi", "nvapi_QueryInterface", NULL
+    };
+    static const char *const driver_exports[] = { "nvapi_QueryInterface", NULL };
     wchar_t payload[MAX_PATH], backup[MAX_PATH], runtime[MAX_PATH];
-    UINT i;
 
-    if (!count || swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0 ||
-        swprintf_s(runtime, MAX_PATH, L"%s\\nvapi64.dll", sys) < 0 ||
-        swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvapi64.dll", sys) < 0)
+    if (!count) {
+        provision_log("NVIDIA runtime: NVAPI: the GPU driver packages have no nvapi64.dll.");
         return FALSE;
-    if (!validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "appsandbox_nvapi") ||
-        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "nvapi_QueryInterface") ||
-        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "nvapi_QueryInterface") ||
-        validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "appsandbox_nvapi")) return FALSE;
-    for (i = 1; i < count; i++)
-        if (!files_equal(sources[0], sources[i])) return FALSE;
-    return replace_file(sources[0], backup) && install_system_file(payload, runtime);
+    }
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0 ||
+        swprintf_s(runtime, MAX_PATH, L"%s\\nvapi64.dll", sys) < 0 ||
+        swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvapi64.dll", sys) < 0) {
+        provision_log("NVIDIA runtime: NVAPI: shim or System32 path is too long.");
+        return FALSE;
+    }
+    if (!nvidia_dll_usable("NVAPI", "shim", payload, shim_exports, NULL) ||
+        !nvidia_dll_usable("NVAPI", "driver file", sources[0], driver_exports,
+                           "appsandbox_nvapi") ||
+        !nvidia_driver_copies_match("NVAPI", sources, count)) return FALSE;
+    if (!replace_file(sources[0], backup)) {
+        provision_log("NVIDIA runtime: NVAPI: cannot copy the driver's %ls to %ls (error %lu).",
+                      sources[0], backup, GetLastError());
+        return FALSE;
+    }
+    return install_system_file("NVAPI", payload, runtime);
 }
 
-static BOOL provision_nvidia_library(const wchar_t *sys, const wchar_t *filename,
-                                    const char *required_export)
+static BOOL provision_nvidia_library(const wchar_t *sys, const char *step,
+                                    const wchar_t *filename, const char *required_export)
 {
+    const char *required[2];
     wchar_t sources[32][MAX_PATH], runtime[MAX_PATH];
-    UINT count = find_nvidia_driver_files(sources, sys, filename), i;
+    UINT count = find_nvidia_driver_files(sources, sys, filename);
 
     if (!count) return TRUE;
-    if (!validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, required_export) ||
-        swprintf_s(runtime, MAX_PATH, L"%s\\%s", sys, filename) < 0) return FALSE;
-    for (i = 1; i < count; i++)
-        if (!files_equal(sources[0], sources[i])) return FALSE;
-    return install_system_file(sources[0], runtime);
+    required[0] = required_export;
+    required[1] = NULL;
+    if (!nvidia_dll_usable(step, "driver file", sources[0], required, NULL)) return FALSE;
+    if (swprintf_s(runtime, MAX_PATH, L"%s\\%s", sys, filename) < 0) {
+        provision_log("NVIDIA runtime: %s: System32 path for %ls is too long.", step, filename);
+        return FALSE;
+    }
+    if (!nvidia_driver_copies_match(step, sources, count)) return FALSE;
+    return install_system_file(step, sources[0], runtime);
 }
 
 static BOOL provision_cuda(const wchar_t *native_dir, const wchar_t *sys)
 {
+    static const char *const shim_exports[] = {
+        "appsandbox_cuda", "cuInit", "cuGetProcAddress", "cuDeviceGetLuid", NULL
+    };
+    static const char *const driver_exports[] = {
+        "cuInit", "cuGetProcAddress", "cuDeviceGetLuid", NULL
+    };
     wchar_t sources[32][MAX_PATH], payload[MAX_PATH], runtime[MAX_PATH], backup[MAX_PATH];
-    UINT count, i;
+    char first_missing[128];
+    DWORD missing;
+    UINT count;
 
     if (!native_dir || !native_dir[0]) return TRUE;
-    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-cuda-shim.dll", native_dir) < 0)
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-cuda-shim.dll", native_dir) < 0) {
+        provision_log("NVIDIA runtime: CUDA: shim path under %ls is too long.", native_dir);
         return FALSE;
+    }
     if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return TRUE;
     count = find_nvidia_driver_files(sources, sys, L"nvcuda_loader64.dll");
     if (!count) return TRUE;
-    if (!validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda") ||
-        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuInit") ||
-        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuGetProcAddress") ||
-        !validate_dll_export(payload, IMAGE_FILE_MACHINE_AMD64, "cuDeviceGetLuid") ||
-        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuInit") ||
-        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuGetProcAddress") ||
-        !validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "cuDeviceGetLuid") ||
-        validate_dll_export(sources[0], IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda") ||
-        swprintf_s(runtime, MAX_PATH, L"%s\\nvcuda.dll", sys) < 0 ||
-        swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvcuda.dll", sys) < 0) return FALSE;
-    for (i = 1; i < count; i++)
-        if (!files_equal(sources[0], sources[i])) return FALSE;
-    if (!dll_exports_covered(sources[0], payload, IMAGE_FILE_MACHINE_AMD64)) {
-        if (validate_dll_export(runtime, IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda"))
-            install_system_file(sources[0], runtime);
+    if (!nvidia_dll_usable("CUDA", "shim", payload, shim_exports, NULL) ||
+        !nvidia_dll_usable("CUDA", "driver file", sources[0], driver_exports,
+                           "appsandbox_cuda")) return FALSE;
+    if (swprintf_s(runtime, MAX_PATH, L"%s\\nvcuda.dll", sys) < 0 ||
+        swprintf_s(backup, MAX_PATH, L"%s\\appsandbox-nvcuda.dll", sys) < 0) {
+        provision_log("NVIDIA runtime: CUDA: System32 path %ls is too long.", sys);
         return FALSE;
     }
-    return replace_file(sources[0], backup) && install_system_file(payload, runtime);
+    if (!nvidia_driver_copies_match("CUDA", sources, count)) return FALSE;
+    if (!count_uncovered_exports(sources[0], payload, IMAGE_FILE_MACHINE_AMD64,
+                                 &missing, first_missing) || missing) {
+        /* A shim older than the driver would hide new entry points: the
+           driver's own loader serves nvcuda.dll until the shim catches up. */
+        BOOL ours = validate_dll_export(runtime, IMAGE_FILE_MACHINE_AMD64, "appsandbox_cuda");
+        BOOL restored = ours && install_system_file("CUDA", sources[0], runtime);
+        const char *outcome = !ours ? "left nvcuda.dll as it was" :
+            restored ? "restored the driver's own nvcuda.dll" :
+            "restoring the driver's own nvcuda.dll failed";
+        if (missing)
+            provision_log("NVIDIA runtime: CUDA shim does not cover %lu exports of the new "
+                          "nvcuda_loader64.dll %ls (first missing: %s); %s.",
+                          missing, sources[0], first_missing, outcome);
+        else
+            provision_log("NVIDIA runtime: CUDA: cannot compare the exports of %ls and %ls; %s.",
+                          sources[0], payload, outcome);
+        return FALSE;
+    }
+    if (!replace_file(sources[0], backup)) {
+        provision_log("NVIDIA runtime: CUDA: cannot copy the driver's %ls to %ls (error %lu).",
+                      sources[0], backup, GetLastError());
+        return FALSE;
+    }
+    return install_system_file("CUDA", payload, runtime);
 }
 
 static BOOL provision_nvidia_opencl(const wchar_t *native_dir, const wchar_t *sys)
 {
+    static const char *const shim_exports[] = {
+        "clGetExtensionFunctionAddress", "clGetPlatformInfo", "appsandbox_opencl", NULL
+    };
+    static const char *const driver_exports[] = {
+        "clGetExtensionFunctionAddress", "clGetPlatformInfo", NULL
+    };
     wchar_t runtimes[32][MAX_PATH], payload[MAX_PATH], backup[MAX_PATH], *slash;
+    char first_missing[128];
+    DWORD missing;
     UINT count, i;
     BOOL result = TRUE;
 
     if (!native_dir || !native_dir[0]) return TRUE;
-    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-opencl-shim.dll", native_dir) < 0)
+    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-opencl-shim.dll", native_dir) < 0) {
+        provision_log("NVIDIA runtime: OpenCL: shim path under %ls is too long.", native_dir);
         return FALSE;
+    }
     if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return TRUE;
     count = find_nvidia_driver_files(runtimes, sys, L"nvopencl64.dll");
     if (!count) return TRUE;
-    if (!validate_nvidia_opencl_dll(payload, TRUE)) return FALSE;
+    if (!nvidia_dll_usable("OpenCL", "shim", payload, shim_exports, NULL)) return FALSE;
+    /* Each driver package is handled on its own; a failing one does not stop the rest. */
     for (i = 0; i < count; i++) {
         const wchar_t *original;
         BOOL installed = validate_dll_export(runtimes[i], IMAGE_FILE_MACHINE_AMD64,
                                              "appsandbox_opencl");
-        if (wcscpy_s(backup, MAX_PATH, runtimes[i]) || !(slash = wcsrchr(backup, L'\\')))
-            return FALSE;
-        *slash = 0;
-        if (wcscat_s(backup, MAX_PATH, L"\\appsandbox-nvopencl64.dll")) return FALSE;
+        slash = NULL;
+        if (!wcscpy_s(backup, MAX_PATH, runtimes[i])) slash = wcsrchr(backup, L'\\');
+        if (slash) *slash = 0;
+        if (!slash || wcscat_s(backup, MAX_PATH, L"\\appsandbox-nvopencl64.dll")) {
+            provision_log("NVIDIA runtime: OpenCL: cannot build the backup path beside %ls.",
+                          runtimes[i]);
+            result = FALSE;
+            continue;
+        }
         original = installed ? backup : runtimes[i];
-        if (!validate_nvidia_opencl_dll(original, FALSE)) {
+        if (!nvidia_dll_usable("OpenCL", installed ? "saved driver file" : "driver file",
+                               original, driver_exports, "appsandbox_opencl")) {
             result = FALSE;
             continue;
         }
-        if (!dll_exports_covered(original, payload, IMAGE_FILE_MACHINE_AMD64)) {
-            if (installed) install_system_file(backup, runtimes[i]);
+        if (!count_uncovered_exports(original, payload, IMAGE_FILE_MACHINE_AMD64,
+                                     &missing, first_missing) || missing) {
+            BOOL restored = installed && install_system_file("OpenCL", backup, runtimes[i]);
+            const char *outcome = !installed ? "kept the driver's own nvopencl64.dll" :
+                restored ? "restored the driver's own nvopencl64.dll" :
+                "restoring the driver's own nvopencl64.dll failed";
+            if (missing)
+                provision_log("NVIDIA runtime: OpenCL shim does not cover %lu exports of %ls "
+                              "(first missing: %s); %s.",
+                              missing, original, first_missing, outcome);
+            else
+                provision_log("NVIDIA runtime: OpenCL: cannot compare the exports of %ls and "
+                              "%ls; %s.", original, payload, outcome);
             result = FALSE;
             continue;
         }
-        if ((!installed && !replace_file(runtimes[i], backup)) ||
-            !install_system_file(payload, runtimes[i]))
+        if (!installed && !replace_file(runtimes[i], backup)) {
+            provision_log("NVIDIA runtime: OpenCL: cannot copy the driver's %ls to %ls "
+                          "(error %lu).", runtimes[i], backup, GetLastError());
             result = FALSE;
+            continue;
+        }
+        if (!install_system_file("OpenCL", payload, runtimes[i])) result = FALSE;
     }
     return result;
 }
@@ -1076,29 +1316,47 @@ BOOL nvidia_runtime_provision(const wchar_t *native_dir)
 {
 #if defined(_M_X64)
     wchar_t sys[MAX_PATH], payload[MAX_PATH], packages[32][MAX_PATH];
-    UINT count, i, length;
-    BOOL result = TRUE;
+    UINT count, i, length, failed = 0;
 
     length = GetSystemDirectoryW(sys, MAX_PATH);
-    if (!length || length >= MAX_PATH) return FALSE;
-    if (!provision_nvidia_library(sys, L"nvofapi64.dll", "NvOFAPICreateInstanceCuda")) result = FALSE;
-    if (!provision_nvidia_library(sys, L"nvoptix.dll", "optixQueryFunctionTable")) result = FALSE;
-    if (!provision_cuda(native_dir, sys)) result = FALSE;
-    if (!provision_nvidia_opencl(native_dir, sys)) result = FALSE;
-    if (!native_dir || !native_dir[0]) return result;
-    if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll", native_dir) < 0)
+    if (!length || length >= MAX_PATH) {
+        provision_log("NVIDIA runtime: GetSystemDirectory failed (error %lu).", GetLastError());
         return FALSE;
-    if (GetFileAttributesW(payload) == INVALID_FILE_ATTRIBUTES) return result;
-    count = find_nvidia_driver_files(packages, sys, L"nvapi64.dll");
-    if (count && !provision_nvapi(native_dir, sys, packages, count)) result = FALSE;
-    count = find_nvidia_driver_files(packages, sys, L"_nvngx.dll");
-    for (i = 0; i < count; i++) {
-        wchar_t *slash = wcsrchr(packages[i], L'\\');
-        if (!slash) return FALSE;
-        *slash = 0;
-        if (!nvidia_ngx_junction(sys, packages[i])) result = FALSE;
     }
-    return result;
+    /* Every step runs even when an earlier one failed; each failure is logged
+       and the result says whether all of them succeeded. */
+    if (!provision_nvidia_library(sys, "Optical Flow", L"nvofapi64.dll",
+                                  "NvOFAPICreateInstanceCuda")) failed++;
+    if (!provision_nvidia_library(sys, "OptiX", L"nvoptix.dll", "optixQueryFunctionTable"))
+        failed++;
+    if (!provision_cuda(native_dir, sys)) failed++;
+    if (!provision_nvidia_opencl(native_dir, sys)) failed++;
+    if (native_dir && native_dir[0]) {
+        if (swprintf_s(payload, MAX_PATH, L"%s\\appsandbox-nvidia-dlss-shim.dll",
+                       native_dir) < 0) {
+            provision_log("NVIDIA runtime: DLSS: shim path under %ls is too long.", native_dir);
+            failed++;
+        } else if (GetFileAttributesW(payload) != INVALID_FILE_ATTRIBUTES) {
+            count = find_nvidia_driver_files(packages, sys, L"nvapi64.dll");
+            if (count && !provision_nvapi(native_dir, sys, packages, count)) failed++;
+            count = find_nvidia_driver_files(packages, sys, L"_nvngx.dll");
+            for (i = 0; i < count; i++) {
+                wchar_t *slash = wcsrchr(packages[i], L'\\');
+                if (!slash) {
+                    provision_log("NVIDIA runtime: NGX: unexpected driver file path %ls.",
+                                  packages[i]);
+                    failed++;
+                    continue;
+                }
+                *slash = 0;
+                if (!nvidia_ngx_junction(sys, packages[i])) failed++;
+            }
+        }
+    }
+    if (failed)
+        provision_log("NVIDIA runtime: %u step(s) failed; the other steps were still applied.",
+                      failed);
+    return !failed;
 #else
     (void)native_dir;
     return TRUE;

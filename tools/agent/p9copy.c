@@ -559,7 +559,111 @@ static BOOL should_refresh_file(P9Session *s, const char *name)
     return FALSE;
 }
 
-/* Copy a single file from the 9P share to local disk. */
+/* ---- Temporary copies ---- */
+
+/* A file is written to "<destination>.asbtmp" in the destination's directory
+   and replaces the destination only once complete, so DWM or WUDFHost never
+   load a half-written GPU user-mode driver. */
+#define P9_TEMP_SUFFIX L".asbtmp"
+
+static BOOL temporary_path(const wchar_t *path, wchar_t temporary[MAX_PATH])
+{
+    if (wcslen(path) + wcslen(P9_TEMP_SUFFIX) >= MAX_PATH) return FALSE;
+    wcscpy_s(temporary, MAX_PATH, path);
+    wcscat_s(temporary, MAX_PATH, P9_TEMP_SUFFIX);
+    return TRUE;
+}
+
+/* TRUE when MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) has queued a rename of
+   path for the next restart (Session Manager's PendingFileRenameOperations). */
+static BOOL rename_pending_at_restart(const wchar_t *path)
+{
+    wchar_t full[MAX_PATH], nt_path[MAX_PATH + 4], *list = NULL;
+    DWORD type, size = 0, length;
+    size_t count, at = 0;
+    HKEY key;
+    BOOL pending = FALSE;
+
+    length = GetFullPathNameW(path, MAX_PATH, full, NULL);
+    if (!length || length >= MAX_PATH) return FALSE;
+    wcscpy_s(nt_path, MAX_PATH + 4, L"\\??\\");
+    wcscat_s(nt_path, MAX_PATH + 4, full);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                      0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return FALSE;
+    if (RegQueryValueExW(key, L"PendingFileRenameOperations", NULL, &type, NULL,
+                         &size) == ERROR_SUCCESS && type == REG_MULTI_SZ && size)
+        list = (wchar_t *)calloc(size / sizeof(wchar_t) + 2, sizeof(wchar_t));
+    if (list && RegQueryValueExW(key, L"PendingFileRenameOperations", NULL, &type,
+                                 (BYTE *)list, &size) == ERROR_SUCCESS) {
+        /* Entries are pairs: source, then destination (empty for a delete).
+           The extra zeroed characters terminate every string. */
+        count = size / sizeof(wchar_t);
+        while (at < count && !pending) {
+            const wchar_t *source = list + at, *destination;
+            at += wcslen(source) + 1;
+            if (at >= count) break;
+            destination = list + at;
+            at += wcslen(destination) + 1;
+            pending = source[0] && destination[0] && !_wcsicmp(source, nt_path);
+        }
+    }
+    free(list);
+    RegCloseKey(key);
+    return pending;
+}
+
+/* TRUE when temporary already holds size bytes waiting for a rename queued
+   for the next restart, so the file does not need to be fetched again. */
+static BOOL replacement_pending(const wchar_t *temporary, UINT64 size)
+{
+    WIN32_FILE_ATTRIBUTE_DATA attr;
+    if (!GetFileAttributesExW(temporary, GetFileExInfoStandard, &attr)) return FALSE;
+    return (((UINT64)attr.nFileSizeHigh << 32) | attr.nFileSizeLow) == size &&
+           rename_pending_at_restart(temporary);
+}
+
+/* Deletes "*.asbtmp" files an interrupted copy left in dir, except those a
+   rename queued for the next restart still needs. */
+static void remove_stale_temporaries(const wchar_t *dir)
+{
+    WIN32_FIND_DATAW data;
+    wchar_t pattern[MAX_PATH], path[MAX_PATH];
+    HANDLE find;
+    size_t suffix = wcslen(P9_TEMP_SUFFIX), dir_length = wcslen(dir), length;
+
+    if (dir_length + 2 + suffix >= MAX_PATH) return;
+    swprintf_s(pattern, MAX_PATH, L"%s\\*" P9_TEMP_SUFFIX, dir);
+    find = FindFirstFileW(pattern, &data);
+    if (find == INVALID_HANDLE_VALUE) return;
+    do {
+        length = wcslen(data.cFileName);
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || length <= suffix ||
+            _wcsicmp(data.cFileName + length - suffix, P9_TEMP_SUFFIX) ||
+            dir_length + 1 + length >= MAX_PATH)
+            continue;
+        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, data.cFileName);
+        if (rename_pending_at_restart(path))
+            continue;
+        if (DeleteFileW(path))
+            P9LOG("9P removed stale temporary file: %ls", path);
+        else
+            P9LOG("9P cannot remove stale temporary file: %ls (error %lu)",
+                  path, GetLastError());
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+}
+
+/* Errors MoveFileEx reports when the destination is open or mapped. */
+static BOOL destination_in_use(DWORD error)
+{
+    return error == ERROR_ACCESS_DENIED || error == ERROR_SHARING_VIOLATION ||
+           error == ERROR_LOCK_VIOLATION || error == ERROR_USER_MAPPED_FILE;
+}
+
+/* Copy a single file from the 9P share to local disk, through a temporary
+   copy beside the destination. */
 static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
                       const wchar_t *local_path, UINT64 file_size)
 {
@@ -568,9 +672,9 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     UINT64 offset = 0;
     HANDLE hfile;
     BOOL ok = TRUE;
-    BOOL created;
+    BOOL remove_temporary = TRUE;
     const char *names[1];
-    wchar_t target[MAX_PATH] = { 0 }, temporary[MAX_PATH] = { 0 };
+    wchar_t target[MAX_PATH] = { 0 }, temporary[MAX_PATH];
 
     if (skip_excluded_file(s, name)) return TRUE;
     if (s->options.resolve_target && !s->options.resolve_target(local_path, target)) return FALSE;
@@ -592,6 +696,15 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
         }
     }
 
+    if (!temporary_path(local_path, temporary)) {
+        P9LOG("9P path too long for a temporary copy: %ls", local_path);
+        return FALSE;
+    }
+    if (replacement_pending(temporary, file_size)) {
+        P9LOG("9P skip (replacement pending restart): %s", name);
+        return TRUE;
+    }
+
     names[0] = name;
     if (!p9_walk(s, parent_fid, fid, names, 1, NULL))
         return FALSE;
@@ -604,34 +717,14 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     if (iounit == 0 || iounit > s->msize - 24)
         iounit = s->msize - 24;
 
-    if (target[0]) {
-        wchar_t folder[MAX_PATH], *slash;
-        if (wcscpy_s(folder, MAX_PATH, local_path) || !(slash = wcsrchr(folder, L'\\'))) {
-            p9_clunk(s, fid);
-            return FALSE;
-        }
-        *slash = 0;
-        if (!GetTempFileNameW(folder, L"asb", 0, temporary)) {
-            p9_clunk(s, fid);
-            return FALSE;
-        }
-    }
-    hfile = CreateFileW(temporary[0] ? temporary : local_path, GENERIC_WRITE, 0, NULL,
-                        s->options.keep_existing && !temporary[0] ? CREATE_NEW : CREATE_ALWAYS,
+    hfile = CreateFileW(temporary, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
                         FILE_ATTRIBUTE_NORMAL, NULL);
     if (hfile == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         p9_clunk(s, fid);
-        if (temporary[0]) DeleteFileW(temporary);
-        if (s->options.keep_existing && !temporary[0] &&
-            (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
-            P9LOG("9P skip (destination created during copy): %s", name);
-            return TRUE;
-        }
-        P9LOG("9P cannot create file: %ls (error %lu)", local_path, err);
+        P9LOG("9P cannot create file: %ls (error %lu)", temporary, err);
         return FALSE;
     }
-    created = s->options.keep_existing || GetLastError() != ERROR_ALREADY_EXISTS;
 
     while (offset < file_size) {
         BYTE *data;
@@ -659,15 +752,49 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
         offset += nread;
     }
 
+    /* The data must be on disk before the rename can expose it. */
+    if (ok && !FlushFileBuffers(hfile)) {
+        P9LOG("9P flush failed for %s (error %lu)", name, GetLastError());
+        ok = FALSE;
+    }
     CloseHandle(hfile);
     p9_clunk(s, fid);
 
-    if (temporary[0]) {
-        if (ok) ok = s->options.commit_file(temporary, local_path);
-        DeleteFileW(temporary);
-    } else if (!ok && created && !DeleteFileW(local_path))
-        P9LOG("9P cannot remove incomplete file: %ls (error %lu)",
-              local_path, GetLastError());
+    if (ok && target[0]) {
+        ok = s->options.commit_file(temporary, local_path);
+    } else if (ok) {
+        if (MoveFileExW(temporary, local_path,
+                        s->options.keep_existing ? 0 : MOVEFILE_REPLACE_EXISTING)) {
+            remove_temporary = FALSE;
+        } else {
+            DWORD err = GetLastError();
+            if (s->options.keep_existing &&
+                (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
+                P9LOG("9P skip (destination created during copy): %s", name);
+                DeleteFileW(temporary);
+                return TRUE;
+            }
+            if (!s->options.keep_existing && destination_in_use(err)) {
+                /* A loaded DLL cannot be replaced: Windows renames the
+                   temporary copy over it during the next restart. */
+                if (MoveFileExW(temporary, local_path,
+                                MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
+                    P9LOG("9P %ls is in use (error %lu); it will be replaced at the next restart.",
+                          local_path, err);
+                    remove_temporary = FALSE;
+                } else {
+                    P9LOG("9P cannot replace %ls (in use, error %lu) or queue it for the next "
+                          "restart (error %lu)", local_path, err, GetLastError());
+                    ok = FALSE;
+                }
+            } else {
+                P9LOG("9P cannot replace %ls (error %lu)", local_path, err);
+                ok = FALSE;
+            }
+        }
+    }
+    if (remove_temporary && !DeleteFileW(temporary))
+        P9LOG("9P cannot remove temporary file: %ls (error %lu)", temporary, GetLastError());
 
     if (ok) {
         s->files_copied++;
@@ -686,6 +813,7 @@ static BOOL copy_dir_contents(P9Session *s, UINT32 dir_fid, const wchar_t *local
     BYTE *dirbuf = NULL;
 
     ensure_dir(local_dir);
+    remove_stale_temporaries(local_dir);
 
     dirbuf = (BYTE *)malloc(s->msize);
     if (!dirbuf) {
@@ -798,6 +926,7 @@ static BOOL copy_filtered_files(P9Session *s, UINT32 root_fid,
     int failed = 0;
 
     ensure_dir(local_dir);
+    remove_stale_temporaries(local_dir);
 
     strncpy_s(buf, sizeof(buf), filter, _TRUNCATE);
     tok = strtok_s(buf, ";", &ctx);
