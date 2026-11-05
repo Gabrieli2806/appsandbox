@@ -80,6 +80,12 @@ static int g_command_depth;
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_DISK_SPACE         (WM_APP + 19)
+#define WM_CORE_READY         (WM_APP + 20)  /* wp: 1 core started, 0 prerequisites missing */
+
+/* Starting the core (prerequisite check, HCS/HCN, GPU enumeration through
+   WMI, certificates, loading and re-attaching VMs) takes seconds, so it runs
+   on a worker thread and the window stays responsive meanwhile. */
+static volatile LONG g_core_starting;
 
 /* Tray */
 #define TRAY_CMD_SHOW          1
@@ -1469,6 +1475,29 @@ static BOOL json_vm_index(const wchar_t *json, int *idx)
     return *idx >= 0;
 }
 
+static DWORD WINAPI core_start_thread(LPVOID param)
+{
+    BOOL ok;
+    (void)param;
+    ok = prereq_check_all();
+    if (ok) asb_init();
+    if (!g_hwnd_main || !PostMessageW(g_hwnd_main, WM_CORE_READY, ok ? 1 : 0, 0))
+        InterlockedExchange(&g_core_starting, 0);
+    return 0;
+}
+
+/* Start the core in the background (once). The UI shows a loading state
+   until WM_CORE_READY. */
+static void start_core_async(void)
+{
+    HANDLE t;
+    if (g_prereq_ok || InterlockedCompareExchange(&g_core_starting, 1, 0) != 0) return;
+    webview2_post(L"{\"type\":\"coreLoading\"}");
+    t = CreateThread(NULL, 0, core_start_thread, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else core_start_thread(NULL);   /* no thread: do it inline */
+}
+
 static void handle_webview2_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
@@ -1476,19 +1505,20 @@ static void handle_webview2_message(const wchar_t *json)
     if (!json_get_string(json, L"action", action, 64))
         return;
 
+    /* While the core starts, only page bookkeeping is accepted; the UI
+       shows a loading state and its buttons are disabled. */
+    if (g_core_starting && wcscmp(action, L"uiReady") != 0 && wcscmp(action, L"getState") != 0)
+        return;
+
     if (wcscmp(action, L"uiReady") == 0) {
         /* JS has loaded and registered its message listener; deliver any
          * messages queued before WebView2 was ready (e.g. early ui_log lines). */
         webview2_flush_queue();
-        if (!prereq_check_all()) {
-            webview2_post(L"{\"type\":\"prereqRequired\"}");
+        if (g_prereq_ok) {            /* page reloaded after start-up */
+            send_full_state();
             return;
         }
-        g_prereq_ok = TRUE;
-        asb_init();
-        if (!asb_api_start(g_hInstance, g_hwnd_main))
-            ui_show_alert(L"The local API could not start. See headless.log for details.");
-        send_full_state();
+        start_core_async();
     } else if (wcscmp(action, L"createVm") == 0) {
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
@@ -2243,6 +2273,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CORE_CHANGED:
         InterlockedExchange(&g_refresh_pending, 0);
+        /* The worker is still loading the VM list; WM_CORE_READY sends it. */
+        if (g_core_starting) return 0;
         if (g_command_depth || asb_api_busy()) return 0;
         reconcile_displays();
         send_vm_list();
@@ -2390,12 +2422,8 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL reboot_required = (BOOL)lp;
         if (ok && !reboot_required) {
             /* Feature enabled, no reboot needed - initialize now */
-            g_prereq_ok = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
-            asb_init();
-            if (!asb_api_start(g_hInstance, g_hwnd_main))
-                ui_show_alert(L"The local API could not start. See headless.log for details.");
-            send_full_state();
+            start_core_async();
         } else if (ok && reboot_required) {
             g_prereq_reboot_pending = TRUE;
             webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":true}");
@@ -2404,6 +2432,19 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
     }
+
+    case WM_CORE_READY:
+        InterlockedExchange(&g_core_starting, 0);
+        if (!wp) {
+            webview2_post(L"{\"type\":\"prereqRequired\"}");
+            return 0;
+        }
+        g_prereq_ok = TRUE;
+        if (!asb_api_start(g_hInstance, g_hwnd_main))
+            ui_show_alert(L"The local API could not start. See headless.log for details.");
+        send_full_state();
+        webview2_post(L"{\"type\":\"coreReady\"}");
+        return 0;
 
     case WM_SHOW_ALERT:
     {

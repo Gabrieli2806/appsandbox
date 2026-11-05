@@ -3,6 +3,7 @@
 
 /* ---- State ---- */
 let vms = [];
+let coreStarting = true;   /* see setCoreStarting */
 let selectedVm = -1;
 let selectedSnap = new Map();
 let editVmState = null;
@@ -158,11 +159,13 @@ window.onHostMessage = function(msg) {
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
         case 'alert':         showModal('Error', msg.message, 'OK'); break;
-        case 'prereqRequired': onPrereqRequired(); break;
+        case 'prereqRequired': setCoreStarting(false); onPrereqRequired(); break;
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
         case 'vmIcon':         onVmIcon(msg); break;
+        case 'coreLoading':    setCoreStarting(true); break;
+        case 'coreReady':      setCoreStarting(false); break;
     }
 };
 
@@ -176,7 +179,23 @@ if (hostBridge.isWebView2) {
 
 /* ---- Initial state ---- */
 
+/* The core starts in the background (prerequisites, GPUs, VM list); until
+   it is ready the list shows a loading state and "New VM" waits. */
+function setCoreStarting(on) {
+    coreStarting = !!on;
+    ['btn-new-sandbox', 'btn-import-vm'].forEach(function(id) {
+        var b = document.getElementById(id);
+        if (b) b.disabled = coreStarting;
+    });
+    renderVmTable();
+}
+
 function onFullState(msg) {
+    coreStarting = false;
+    ['btn-new-sandbox', 'btn-import-vm'].forEach(function(id) {
+        var nb = document.getElementById(id);
+        if (nb) nb.disabled = false;
+    });
     updateVmList(msg.vms || []);
     renderVmTable();
     revalidateVmName();
@@ -1230,9 +1249,11 @@ function renderVmTable() {
     var grid = document.getElementById('vm-grid');
     var running = vms.filter(function(v) { return v.running; }).length;
     document.getElementById('nav-vm-count').textContent = vms.length;
-    document.getElementById('vm-summary').textContent = vms.length
-        ? running + ' running · ' + (vms.length - running) + ' stopped'
-        : 'No virtual machines yet';
+    document.getElementById('vm-summary').textContent = coreStarting && !vms.length
+        ? 'Starting…'
+        : vms.length
+            ? running + ' running · ' + (vms.length - running) + ' stopped'
+            : 'No virtual machines yet';
     document.querySelectorAll('#vm-filters .chip').forEach(function(c) {
         var on = c.getAttribute('data-filter') === vmFilter;
         c.classList.toggle('active', on);
@@ -1253,7 +1274,14 @@ function renderVmTable() {
         if (!c.classList.contains('vm-card')) grid.removeChild(c);
     });
 
-    if (vms.length === 0) {
+    if (vms.length === 0 && coreStarting) {
+        var loading = el('div', 'empty-state loading-state');
+        loading.setAttribute('role', 'status');
+        loading.appendChild(el('span', 'spinner'));
+        loading.appendChild(el('h2', '', 'Starting App Sandbox…'));
+        loading.appendChild(el('p', 'muted', 'Checking Windows features and your GPUs, and finding your virtual machines.'));
+        grid.appendChild(loading);
+    } else if (vms.length === 0) {
         var empty = el('div', 'empty-state');
         empty.appendChild(el('h2', '', 'Create your first virtual machine'));
         empty.appendChild(el('p', 'muted', 'Windows 11, Ubuntu or macOS, set up automatically from an installer image.'));
