@@ -15,7 +15,12 @@ Windows features:
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
-- Fixed 1080P60 display
+- Display up to 4K at 60/120/144 Hz, fixed sizes or **adaptive** (follows the window, with a blurred backdrop while it catches up)
+- **Performance mode** (default): the VM's GPU encodes the screen as H.264 or HEVC (NVENC on NVIDIA, Media Foundation otherwise) and the viewer decodes it on your GPU, like Moonlight — smooth at high resolutions and frame rates. **Quality mode** sends exact, uncompressed pixels. Codec and bit rate are per VM.
+- **Game controllers**: Xbox (XInput) controllers on the host appear in the guest as Xbox 360 controllers (needs ViGEmBus in the guest)
+- Floating toolbar, FPS/resolution in the title bar (both optional), borderless fullscreen
+- Desktop and Start-menu shortcuts that start a VM straight into its window
+- Import/export of VMs; one-click (or automatic) update of the guest components
 - Host to client hot-key support
 - Provision and boot with / without internet
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
@@ -109,11 +114,51 @@ rebuild instructions.
 # Tips:
 The default username is `user` and the default password is `test123`
 
+[Windows] Display options: the VM's **Display** tab, or right-click the VM window's title bar → Display (resolution, refresh rate, Quality/Performance mode, codec). In Performance mode the title shows `GPU H.264` or `GPU HEVC`; HEVC needs "HEVC Video Extensions" from the Microsoft Store on the host.
+
+[Windows] Game controllers: install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) once inside the Windows VM; controllers are sent while the VM window has focus.
+
+[Windows] Logs: the Activity panel / `appsandbox.log` on the host; inside a Windows guest `C:\Windows\AppSandbox\agent.log` and `C:\ProgramData\AppSandboxVDD.log` (display driver, encoder).
+
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 
 [Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
+
+## Building from source
+
+Windows: Visual Studio 2022 with the Windows SDK and the **WDK** (driver projects). From a
+*Developer Command Prompt* (cmd, not PowerShell 7):
+
+```
+msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
+```
+
+The app, `resources\` (guest helpers) and `drivers\` (test-signed guest drivers) land in
+`bin\Release\`. Run `AppSandbox.exe` as administrator. Version numbers come from
+`Directory.Build.props`. The GitHub workflow in `.github/workflows/windows-test-build.yml`
+builds the same way and publishes test pre-releases from `release/**` branches.
+
+macOS: open `AppSandbox.xcodeproj` (see `tools/sign/SIGNING_MAC.md` for signing).
+
+Changes to guest-side code (helpers in `tools/agent`, the display driver in `tools/vdd`)
+reach existing Windows VMs through **Update guest components** (VM stopped) or the automatic
+update before start; new VMs get them at creation.
+
+## Repository layout and contributor/AI guide
+
+[`AGENTS.md`](AGENTS.md) maps the repository, the host↔guest protocols, the
+compatibility rules (old guests and hosts must keep working), how guest components are
+delivered, and the roadmap (including an MCP server built on the headless API). Read it
+before changing code, whether you are a person or an AI agent.
+
+## Packaging
+
+The release is a zip with `AppSandbox.exe`, `appsandbox_core.dll`, `web\`, `resources\` and
+`drivers\`. An MSIX package is possible for the app itself, but App Sandbox needs
+administrator rights (HCS, http.sys) and installs guest drivers inside VMs, so an MSIX build
+must run as a full-trust desktop app that elevates; see `AGENTS.md`.
 
 ## Sharing fixes and features
 
