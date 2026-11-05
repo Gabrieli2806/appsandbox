@@ -658,7 +658,7 @@ static HRESULT FeedFrame(VddEncoder* e, BOOL forceKey)
         /* Wait briefly for the encoder to ask for input; when it is still
            busy with the previous frame, skip this one (the stream stays
            valid, the host just sees one frame less). */
-        if (e->needInput <= 0 && WaitForSingleObject(e->hNeedInput, 4) != WAIT_OBJECT_0)
+        if (e->needInput <= 0 && WaitForSingleObject(e->hNeedInput, 4) != 0 /* WAIT_OBJECT_0 */)
             return S_FALSE;
         if (e->failed) return E_FAIL;
         if (e->needInput <= 0) return S_FALSE;
@@ -762,7 +762,7 @@ void VddEncoderDestroy(VddEncoder* e)
         }
     }
     if (e->hThread) {
-        if (WaitForSingleObject(e->hThread, 3000) != WAIT_OBJECT_0)
+        if (WaitForSingleObject(e->hThread, 3000) != 0 /* WAIT_OBJECT_0 */)
             EncLog(e, "Encoder: event thread did not stop");
         CloseHandle(e->hThread);
     }
