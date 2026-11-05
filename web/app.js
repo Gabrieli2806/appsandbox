@@ -1431,6 +1431,23 @@ function renderDisplayTab(vm) {
     var res = vm.displayResolution || '1920x1080';
     var hz = vm.displayHz || 60;
     var adaptive = res === 'adaptive';
+
+    var note = document.getElementById('vmd-display-note');
+    var drv = typeof vm.displayDriver === 'number' ? vm.displayDriver : -1;
+    if (drv === 0) {
+        note.className = 'notice warn';
+        note.innerHTML = '<strong>This VM has the older display driver.</strong> It was created with an earlier App Sandbox ' +
+            '(or from a template made with one), so it stays at 1920 × 1080 at 60 Hz. ' +
+            'Create a new VM with this version, without a template, to change resolution and refresh rate.';
+    } else if (drv >= 2) {
+        note.className = 'notice ok';
+        note.textContent = 'The display driver in this VM supports these settings. Changes apply in a few seconds.';
+    } else {
+        note.className = 'notice';
+        note.textContent = vm.running
+            ? 'Open the VM window to apply changes and check the VM\u2019s display driver.'
+            : 'Saved now; applied when the VM window opens.';
+    }
     if (!adaptive) lastFixedResolution[vm.id] = res;
 
     document.querySelectorAll('#view-vm [data-mode]').forEach(function(b) {

@@ -115,6 +115,11 @@ typedef struct AudioFrameHeader {
 /* Mode request sent to the guest VDD on the frame channel (host -> guest).
    Must match VDD_WIRE_MODE_REQUEST in tools/vdd/vdd.h. */
 #define MODE_REQUEST_MAGIC  0x524D5341  /* "ASMR" little-endian */
+#define VDD_HELLO_QUERY_MAGIC 0x51485341 /* "ASHQ": ask the guest driver what it supports */
+#define VDD_HELLO_MAGIC     0x48565341  /* "ASVH": its answer (drivers that take mode requests) */
+/* Frames received with no answer to the query before the guest counts as an
+   older driver. Idle guests resend a frame every ~100 ms, so this is ~2 s. */
+#define HELLO_FRAME_GRACE   20
 #pragma pack(push, 1)
 typedef struct ModeRequest {
     UINT32 magic;
@@ -264,6 +269,10 @@ struct VmDisplayIdd {
     int            res_choice;
     UINT           refresh_hz;
     BOOL           mode_supported;
+    /* Guest driver generation on the current frame connection: -1 unknown,
+       0 older (no hello before the first frame), >= 2 from its hello. */
+    volatile LONG  guest_driver;
+    UINT           frames_since_connect;
     UINT           req_width, req_height, req_refresh;  /* last mode requested */
 
     /* Frame rate shown in the title (frames received from the guest). */
@@ -867,6 +876,12 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
     return TRUE;
 }
 
+int vm_display_idd_guest_driver(VmDisplayIdd *display)
+{
+    if (!display || !display->open || !display->frame_connected) return -1;
+    return (int)display->guest_driver;
+}
+
 /* Save every per-VM display setting from the live display state. */
 static void idd_save_settings(VmDisplayIdd *d)
 {
@@ -921,6 +936,10 @@ static void idd_apply_display_mode(VmDisplayIdd *d, BOOL force)
     BOOL vdd_ok = FALSE, input_ok;
 
     if (!d || !d->mode_supported) return;
+    if (d->guest_driver == 0) {
+        idd_log(d, L"Display mode not changed: this VM's display driver is too old.");
+        return;
+    }
     if (!idd_target_mode(d, &w, &h, &hz)) return;
     if (!force && w == d->req_width && h == d->req_height && hz == d->req_refresh)
         return;
@@ -1013,10 +1032,12 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
     d->fps_last_recv = recv;
     d->fps_tick = now;
 
-    swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS",
+    swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS%s",
                d->audio_muted ? L"\U0001F507 " : L"",
                d->vm_name, d->frame_width, d->frame_height,
-               d->frame_connected ? d->fps_value : 0);
+               d->frame_connected ? d->fps_value : 0,
+               (d->mode_supported && d->frame_connected && d->guest_driver == 0)
+                   ? L" - old display driver (1920x1080 only)" : L"");
     SetWindowTextW(d->hwnd, title);
 }
 
@@ -2312,6 +2333,14 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        InterlockedExchange(&d->guest_driver, -1);
+        d->frames_since_connect = 0;
+        /* Ask the guest driver whether it takes resolution changes (Windows
+           guests only; older drivers never read this and just keep sending). */
+        if (d->mode_supported) {
+            ModeRequest q = { VDD_HELLO_QUERY_MAGIC, 0, 0, 0 };
+            send(s, (const char *)&q, (int)sizeof(q), 0);
+        }
         AcquireSRWLockExclusive(&d->frame_send_lock);
         d->frame_socket = s;
         ReleaseSRWLockExclusive(&d->frame_send_lock);
@@ -2380,9 +2409,27 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 continue;  /* back to message loop */
             }
 
+            if (magic == VDD_HELLO_MAGIC) {
+                UINT32 rest[3];
+                if (!recv_exact(s, rest, (int)sizeof(rest)))
+                    break;
+                InterlockedExchange(&d->guest_driver, (LONG)rest[0]);
+                idd_log(d, L"Guest display driver: protocol %u (resolution changes supported).", rest[0]);
+                if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
+                continue;
+            }
+
             if (magic != FRAME_MAGIC) {
                 idd_log(d, L"Bad magic 0x%08X, reconnecting.", magic);
                 break;
+            }
+
+            /* Frames but no answer to the hello query: an older driver. */
+            if (d->mode_supported && ++d->frames_since_connect >= HELLO_FRAME_GRACE &&
+                InterlockedCompareExchange(&d->guest_driver, 0, -1) == -1) {
+                idd_log(d, L"Guest display driver is older than this App Sandbox: it stays at "
+                           L"1920x1080 and ignores resolution changes. Create a new VM to get the new driver.");
+                if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
             }
 
             /* Read rest of frame header (already read magic) */
@@ -3408,6 +3455,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0);
     d->frame_socket = INVALID_SOCKET;
     InitializeSRWLock(&d->frame_send_lock);
+    d->guest_driver = -1;
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

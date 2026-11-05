@@ -402,9 +402,14 @@ static void build_vm_json(JsonBuilder *jb, int i)
     if (_wcsicmp(v->os_type, L"Windows") == 0) {
         wchar_t res[32];
         UINT hz = 60;
+        int k, driver = -1;
         vm_display_idd_saved_mode(v->vhdx_path, res, ARRAYSIZE(res), &hz);
         jb_string(jb, L"displayResolution", res);
         jb_int(jb, L"displayHz", (int)hz);
+        for (k = 0; k < ASB_MAX_VMS; k++)
+            if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
+                driver = vm_display_idd_guest_driver(g_idd_displays[k]);
+        jb_int(jb, L"displayDriver", driver);
     }
 
     /* Snapshot tree */

@@ -676,6 +676,15 @@ static BOOL VddPollHostRequests(VDD_SWAP_PROC* proc)
             if (n <= 0) return FALSE;
             got += n;
         }
+        if (req.magic == VDD_HELLO_QUERY_MAGIC) {
+            /* Host asks what this driver supports. */
+            VDD_WIRE_HELLO hello = {};
+            hello.magic = VDD_HELLO_MAGIC;
+            hello.version = VDD_PROTOCOL_VERSION;
+            VddLog("HostRequest: hello query, answering protocol %u", hello.version);
+            if (VddSendAll(c, (const char*)&hello, sizeof(hello)) != 0) return FALSE;
+            continue;
+        }
         if (req.magic != VDD_MODE_REQUEST_MAGIC) {
             VddLog("HostRequest: bad magic 0x%08X, dropping connection", req.magic);
             return FALSE;

@@ -95,6 +95,20 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
  * applies the mode in the interactive session (set_display command). */
 #define VDD_MODE_REQUEST_MAGIC 0x524D5341  /* "ASMR" little-endian */
 
+/* Wire protocol: hello. The host asks with an ASHQ message (same 16-byte
+ * shape as a mode request) and this driver answers ASVH. Older drivers never
+ * read the channel, so a host that gets frames but no answer knows the guest
+ * cannot change resolution; older hosts never ask, so they never see ASVH. */
+#define VDD_HELLO_QUERY_MAGIC 0x51485341  /* "ASHQ" little-endian */
+#define VDD_HELLO_MAGIC     0x48565341  /* "ASVH" little-endian */
+#define VDD_PROTOCOL_VERSION 2
+
+typedef struct _VDD_WIRE_HELLO {
+    UINT32  magic;              /* VDD_HELLO_MAGIC */
+    UINT32  version;            /* VDD_PROTOCOL_VERSION */
+    UINT32  reserved[2];
+} VDD_WIRE_HELLO;
+
 typedef struct _VDD_WIRE_MODE_REQUEST {
     UINT32  magic;              /* VDD_MODE_REQUEST_MAGIC */
     UINT32  width;

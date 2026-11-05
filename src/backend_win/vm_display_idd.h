@@ -35,4 +35,10 @@ void vm_display_idd_saved_mode(const wchar_t *vhdx_path, wchar_t *res, size_t re
 BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
                              const wchar_t *res, UINT hz);
 
+/* What the guest's display driver supports, as seen on the open window's
+   frame channel: -1 = not known yet (window closed or no frame yet),
+   0 = older driver (fixed 1920x1080, mode changes do nothing),
+   >= 2 = driver that accepts resolution / refresh changes. */
+int vm_display_idd_guest_driver(VmDisplayIdd *display);
+
 #endif /* VM_DISPLAY_IDD_H */
