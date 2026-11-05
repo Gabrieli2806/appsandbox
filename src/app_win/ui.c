@@ -38,6 +38,8 @@
 /* ---- UI-specific globals ---- */
 
 static HWND g_hwnd_main = NULL;
+/* Registered message from a second launch: show the management window. */
+static UINT g_show_main_msg;
 static HINSTANCE g_hInstance = NULL;
 
 /* Minimum window size */
@@ -1546,6 +1548,7 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     asb_set_hinstance(hInstance);
 
     g_core_subscription = asb_events_subscribe(ui_core_event, NULL);
+    g_show_main_msg = RegisterWindowMessageW(UI_SHOW_MAIN_MESSAGE);
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
@@ -1554,14 +1557,14 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     wc.hInstance     = hInstance;
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
-    wc.lpszClassName = L"AppSandbox_Main";
+    wc.lpszClassName = UI_MAIN_WINDOW_CLASS;
     wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
 
     if (!RegisterClassExW(&wc))
         return NULL;
 
     hwnd = CreateWindowExW(
-        0, L"AppSandbox_Main", L"App Sandbox",
+        0, UI_MAIN_WINDOW_CLASS, L"App Sandbox",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
         CW_USEDEFAULT, CW_USEDEFAULT, 1575, 900,
         NULL, NULL, hInstance, NULL);
@@ -1582,6 +1585,15 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
+    if (g_show_main_msg && msg == g_show_main_msg) {
+        /* Another launch found this instance running (for example after the
+           window was closed to the tray while VMs keep running). */
+        if (IsIconic(hwnd) || !IsWindowVisible(hwnd))
+            ShowWindow(hwnd, SW_RESTORE);
+        SetForegroundWindow(hwnd);
+        return 1;
+    }
+
     switch (msg) {
 
     case WM_CREATE:
@@ -1595,6 +1607,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         L"App Sandbox", MB_ICONERROR);
         }
         tray_add(hwnd);
+        /* Let a second launch reach this window even when integrity levels
+           differ (UIPI would otherwise drop the message). */
+        if (g_show_main_msg)
+            ChangeWindowMessageFilterEx(hwnd, g_show_main_msg, MSGFLT_ALLOW, NULL);
         return 0;
 
     case WM_SIZE:

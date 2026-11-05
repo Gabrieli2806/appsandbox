@@ -16,6 +16,12 @@
    Returns the window handle, or NULL on failure. */
 HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow);
 
+/* Window class of the management window, and the registered message a second
+   launch sends to it so the running instance shows itself instead of the new
+   process failing with "already running". */
+#define UI_MAIN_WINDOW_CLASS L"AppSandbox_Main"
+#define UI_SHOW_MAIN_MESSAGE L"AppSandbox.ShowMainWindow"
+
 /* Write a line to appsandbox.log and forward it to the registered
    AsbLogCallback (if any). Thread-safe: can be called from any thread.
    Implemented in asb_core.c (DLL). */
