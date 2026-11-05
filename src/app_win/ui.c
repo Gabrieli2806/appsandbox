@@ -399,8 +399,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
 
-    /* Display mode (Windows guests; the IDD window owns the settings file). */
-    if (_wcsicmp(v->os_type, L"Windows") == 0) {
+    /* Display mode (Windows and Linux guests; the IDD window owns the settings file). */
+    if (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0) {
         wchar_t res[32];
         UINT hz = 60;
         int k, driver = -1;
@@ -1402,7 +1402,7 @@ static void handle_webview2_message(const wchar_t *json)
             json_get_string(json, L"resolution", res, ARRAYSIZE(res)) &&
             json_get_int(json, L"hz", &hz) &&
             (v = asb_vm_instance(asb_vm_get(idx))) != NULL &&
-            _wcsicmp(v->os_type, L"Windows") == 0) {
+            (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0)) {
             for (i = 0; i < ASB_MAX_VMS; i++)
                 if (g_display_vm_ids[i] == v->unique_id && g_idd_displays[i] &&
                     vm_display_idd_is_open(g_idd_displays[i]))

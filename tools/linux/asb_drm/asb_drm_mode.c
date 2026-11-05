@@ -67,6 +67,13 @@ static void asb_crtc_disable_vblank(struct drm_crtc *crtc)
 static void asb_crtc_atomic_enable(struct drm_crtc *crtc,
                                    struct drm_atomic_state *state)
 {
+	struct asb_device *asb = crtc_to_asb(crtc);
+	int hz = drm_mode_vrefresh(&crtc->state->adjusted_mode);
+
+	/* Pace vblank (and so the compositor's frame rate) to the mode that is
+	 * being set, e.g. 120 or 144 Hz, not only the module-param default. */
+	if (hz >= 24 && hz <= 240)
+		asb->vblank_period = ns_to_ktime(NSEC_PER_SEC / hz);
 	drm_crtc_vblank_on(crtc);
 }
 

@@ -174,28 +174,37 @@ static int asb_connector_get_modes(struct drm_connector *connector)
 		count++;
 	}
 
-	/* Common fallbacks. Mutter typically ignores these unless the user
-	 * explicitly switches resolution, but they're cheap to publish. */
+	/* The same presets the host offers (and the Windows guest driver), at
+	 * 60/120/144 Hz, plus the custom size the host asked for, if any. */
 	{
-		static const struct { int w, h, hz; } fallbacks[] = {
-			{ 2560, 1440, 60 },
-			{ 1920, 1200, 60 },
-			{ 1680, 1050, 60 },
-			{ 1280,  720, 60 },
-			{ 1024,  768, 60 },
+		static const struct { int w, h; } presets[] = {
+			{ 1280,  720 }, { 1366,  768 }, { 1600,  900 }, { 1920, 1080 },
+			{ 1920, 1200 }, { 2560, 1080 }, { 2560, 1440 }, { 3440, 1440 },
+			{ 3840, 2160 }, { 1680, 1050 }, { 1024,  768 },
 		};
-		size_t i;
+		static const int rates[] = { 60, 120, 144 };
+		size_t i, r;
 
-		for (i = 0; i < ARRAY_SIZE(fallbacks); i++) {
-			if (fallbacks[i].w == (int)asb->width &&
-			    fallbacks[i].h == (int)asb->height)
-				continue;
-			m = drm_cvt_mode(connector->dev,
-			                 fallbacks[i].w, fallbacks[i].h,
-			                 fallbacks[i].hz,
-			                 false, false, false);
+		for (r = 0; r < ARRAY_SIZE(rates); r++) {
+			for (i = 0; i < ARRAY_SIZE(presets); i++) {
+				if (presets[i].w == (int)asb->width &&
+				    presets[i].h == (int)asb->height &&
+				    rates[r] == (int)asb->refresh)
+					continue;           /* already added as preferred */
+				m = drm_cvt_mode(connector->dev, presets[i].w, presets[i].h,
+				                 rates[r], false, false, false);
+				if (m) {
+					m->type |= DRM_MODE_TYPE_DRIVER;
+					drm_mode_probed_add(connector, m);
+					count++;
+				}
+			}
+		}
+		if (asb->custom_width && asb->custom_height && asb->custom_refresh) {
+			m = drm_cvt_mode(connector->dev, asb->custom_width, asb->custom_height,
+			                 asb->custom_refresh, false, false, false);
 			if (m) {
-				m->type |= DRM_MODE_TYPE_DRIVER;
+				m->type |= DRM_MODE_TYPE_DRIVER | DRM_MODE_TYPE_USERDEF;
 				drm_mode_probed_add(connector, m);
 				count++;
 			}
@@ -235,7 +244,8 @@ int asb_connector_init(struct asb_device *asb)
 		return ret;
 	drm_connector_helper_add(&asb->connector, &asb_connector_helper_funcs);
 
-	/* "Connected" forever — we're virtual, no hot-plug events. */
+	/* "Connected" forever — virtual. Mode list changes (custom_mode) are
+	 * announced with a hotplug event so the compositor re-probes. */
 	asb->connector.status = connector_status_connected;
 	asb->connector.interlace_allowed = false;
 	asb->connector.doublescan_allowed = false;

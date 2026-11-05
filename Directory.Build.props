@@ -24,6 +24,24 @@
   </PropertyGroup>
 
   <!--
+    Where Ubuntu VMs download the Linux guest sources from (they are compiled
+    inside the guest). Unset = upstream jamesstringer90/appsandbox, branch main.
+    A CI build passes its own repository and commit, e.g.
+      msbuild ... /p:AsbSourceRepo=owner/appsandbox /p:AsbSourceRef=<commit sha>
+    so the guest builds exactly the sources this app was built from.
+  -->
+  <ItemDefinitionGroup Condition="'$(AsbSourceRepo)' != ''">
+    <ClCompile>
+      <PreprocessorDefinitions>ASB_SOURCE_REPO=$(AsbSourceRepo);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(AsbSourceRef)' != ''">
+    <ClCompile>
+      <PreprocessorDefinitions>ASB_SOURCE_REF=$(AsbSourceRef);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <!--
     The WDK's build-time INF verifier (DPVerifierTask) can't load x86\InfVerif.dll outside the
     Visual Studio build environment, so command-line / CI builds error on it (HRESULT 0x8007007E).
     Skip it there ONLY - VS GUI builds still run it, and the INF is re-verified by Microsoft on

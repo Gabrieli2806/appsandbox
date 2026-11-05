@@ -31,6 +31,12 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <poll.h>
+#include <pwd.h>
+#include <grp.h>
+#include <dirent.h>
 #include <linux/vm_sockets.h>
 
 #include <xf86drm.h>
@@ -40,8 +46,26 @@
 #define VSOCK_PORT      2
 #define FRAME_MAGIC     0x52465341u   /* 'ASFR' little-endian */
 #define CURSOR_MAGIC    0x52435341u   /* 'ASCR' little-endian */
-#define TARGET_FPS      60
-#define FRAME_INTERVAL_NS (1000000000L / TARGET_FPS)
+/* Capture pace follows the active mode's refresh rate (60/120/144 Hz). A
+   frame is only sent when the compositor flipped to a new buffer, plus a
+   keepalive full frame now and then, so an idle desktop costs almost
+   nothing. */
+#define DEFAULT_FPS     60
+#define KEEPALIVE_NS    250000000L
+
+/* Host -> guest messages on this channel (16 bytes each), see
+   tools/vdd/vdd.h: ASHQ asks what the display supports (answered with
+   ASVH), ASMR asks for a resolution/refresh. */
+#define HELLO_QUERY_MAGIC  0x51485341u  /* 'ASHQ' */
+#define HELLO_MAGIC        0x48565341u  /* 'ASVH' */
+#define MODE_REQUEST_MAGIC 0x524D5341u  /* 'ASMR' */
+#define PROTOCOL_VERSION   2
+
+/* Written for appsandbox-input, which maps absolute mouse positions to the
+   current frame size. */
+#define FRAME_SIZE_FILE "/run/appsandbox/frame-size"
+#define SETMODE_SCRIPT  "/run/appsandbox/setmode.py"
+#define CUSTOM_MODE_PARAM "/sys/module/asb_drm/parameters/custom_mode"
 
 #define CURSOR_TYPE_MASKED_COLOR  1
 #define CURSOR_TYPE_ALPHA         2
@@ -126,6 +150,7 @@ static ssize_t send_all(int fd, const void *buf, size_t len)
 
 struct capture_ctx {
     int fd;
+    uint32_t crtc_id;
     uint32_t fb_id_last;
     uint32_t width;
     uint32_t height;
@@ -185,6 +210,8 @@ static int drm_acquire_fb(struct capture_ctx *c)
                 continue;
             }
         }
+
+        c->crtc_id = p->crtc_id;
 
         /* Same fb as last frame? Reuse the existing mapping. */
         if (p->fb_id == c->fb_id_last && c->mem) {
@@ -487,6 +514,200 @@ static int cursor_tick(int client_fd, int drm_fd, struct cursor_state *cur)
     return rc;
 }
 
+/* ---- Display mode changes requested by the host ----
+ *
+ * The host asks with ASMR {w,h,hz}. A size that is not a preset is added
+ * to asb_drm's mode list through its custom_mode parameter (the driver
+ * sends a hotplug event so the compositor re-probes; nothing is unplugged).
+ * Then the compositor is asked to switch: GNOME's org.gnome.Mutter.DisplayConfig
+ * on the logged-in user's session bus, from a small Python helper run as
+ * that user (python3-gi ships with Ubuntu Desktop). */
+static const char *g_setmode_py =
+"import sys, time\n"
+"from gi.repository import Gio, GLib\n"
+"W, H, HZ = (int(a) for a in sys.argv[1:4])\n"
+"bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)\n"
+"NAME = 'org.gnome.Mutter.DisplayConfig'\n"
+"def call(method, args, reply):\n"
+"    return bus.call_sync(NAME, '/org/gnome/Mutter/DisplayConfig', NAME, method, args,\n"
+"                         GLib.VariantType(reply) if reply else None,\n"
+"                         Gio.DBusCallFlags.NONE, 5000, None)\n"
+"deadline = time.time() + 10\n"
+"while True:\n"
+"    serial, monitors, logical, props = call('GetCurrentState', None,\n"
+"        '(ua((ssss)a(siiddada{sv})a{sv})a(iiduba(ssss)a{sv})a{sv})').unpack()\n"
+"    target = None\n"
+"    for spec, modes, mprops in monitors:\n"
+"        if spec[1] != 'ASB' and 'AppSandbox' not in spec[2]:\n"
+"            continue\n"
+"        best = None\n"
+"        for mid, w, h, rate, pscale, scales, mp in modes:\n"
+"            if w == W and h == H and (best is None or abs(rate - HZ) < best[0]):\n"
+"                best = (abs(rate - HZ), mid, pscale, scales)\n"
+"        if best:\n"
+"            target = (spec[0], best)\n"
+"    if target or time.time() > deadline:\n"
+"        break\n"
+"    time.sleep(0.25)\n"
+"if not target:\n"
+"    print('error:mode_unavailable'); sys.exit(1)\n"
+"conn, (_, mid, pscale, scales) = target\n"
+"scale = pscale\n"
+"for x, y, sc, tr, prim, mons, lp in logical:\n"
+"    if any(m[0] == conn for m in mons) and any(abs(s - sc) < 1e-6 for s in scales):\n"
+"        scale = sc\n"
+"cfg = [(0, 0, scale, 0, True, [(conn, mid, {})])]\n"
+"call('ApplyMonitorsConfig', GLib.Variant('(uua(iiduba(ssa{sv}))a{sv})', (serial, 1, cfg, {})), None)\n"
+"print('ok:' + mid)\n";
+
+static pid_t g_setmode_pid = -1;
+
+static void write_text_file(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+    fputs(text, f);
+    fclose(f);
+}
+
+static int is_preset(uint32_t w, uint32_t h)
+{
+    static const uint32_t presets[][2] = {
+        { 1280, 720 }, { 1366, 768 }, { 1600, 900 }, { 1920, 1080 }, { 1920, 1200 },
+        { 2560, 1080 }, { 2560, 1440 }, { 3440, 1440 }, { 3840, 2160 }, { 1680, 1050 }, { 1024, 768 },
+    };
+    for (size_t i = 0; i < sizeof(presets) / sizeof(presets[0]); i++)
+        if (presets[i][0] == w && presets[i][1] == h) return 1;
+    return 0;
+}
+
+/* The logged-in desktop user: the first /run/user/<uid>/bus with uid >= 1000. */
+static int session_user(uid_t *uid)
+{
+    DIR *d = opendir("/run/user");
+    struct dirent *e;
+    int found = 0;
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL) {
+        char bus[128];
+        struct stat st;
+        unsigned long v = strtoul(e->d_name, NULL, 10);
+        if (v < 1000) continue;
+        snprintf(bus, sizeof(bus), "/run/user/%lu/bus", v);
+        if (stat(bus, &st) == 0) { *uid = (uid_t)v; found = 1; break; }
+    }
+    closedir(d);
+    return found;
+}
+
+static void reap_setmode(void)
+{
+    if (g_setmode_pid > 0 && waitpid(g_setmode_pid, NULL, WNOHANG) == g_setmode_pid)
+        g_setmode_pid = -1;
+}
+
+static void apply_mode(uint32_t w, uint32_t h, uint32_t hz)
+{
+    char buf[64];
+    uid_t uid;
+    struct passwd *pw;
+    pid_t pid;
+
+    if (w < 640 || h < 480 || w > 7680 || h > 4320 || hz < 30 || hz > 240) {
+        agent_log("mode request %ux%u@%u rejected", w, h, hz);
+        return;
+    }
+    w &= ~7u;
+    h &= ~1u;
+    if (!is_preset(w, h)) {
+        snprintf(buf, sizeof(buf), "%ux%u@%u", w, h, hz);
+        write_text_file(CUSTOM_MODE_PARAM, buf);
+    }
+    if (!session_user(&uid) || !(pw = getpwuid(uid))) {
+        agent_log("mode request %ux%u@%u: no desktop session yet", w, h, hz);
+        return;
+    }
+    /* Only the newest request matters (window drags send several). */
+    if (g_setmode_pid > 0) {
+        kill(g_setmode_pid, SIGTERM);
+        waitpid(g_setmode_pid, NULL, 0);
+        g_setmode_pid = -1;
+    }
+    pid = fork();
+    if (pid == 0) {
+        char rt[64], dbus[96], ws[16], hs[16], zs[16];
+        snprintf(rt, sizeof(rt), "/run/user/%u", (unsigned)uid);
+        snprintf(dbus, sizeof(dbus), "unix:path=/run/user/%u/bus", (unsigned)uid);
+        snprintf(ws, sizeof(ws), "%u", w);
+        snprintf(hs, sizeof(hs), "%u", h);
+        snprintf(zs, sizeof(zs), "%u", hz);
+        if (setgid(pw->pw_gid) < 0 || initgroups(pw->pw_name, pw->pw_gid) < 0 ||
+            setuid(pw->pw_uid) < 0)
+            _exit(127);
+        setenv("HOME", pw->pw_dir, 1);
+        setenv("XDG_RUNTIME_DIR", rt, 1);
+        setenv("DBUS_SESSION_BUS_ADDRESS", dbus, 1);
+        execlp("python3", "python3", SETMODE_SCRIPT, ws, hs, zs, (char *)NULL);
+        _exit(127);
+    }
+    if (pid > 0) {
+        g_setmode_pid = pid;
+        agent_log("mode request %ux%u@%u: applying for %s", w, h, hz, pw->pw_name);
+    }
+}
+
+/* Read host requests waiting on the channel without blocking. Returns -1
+   when the connection is gone. */
+static int poll_host_requests(int fd)
+{
+    for (int guard = 0; guard < 8; guard++) {
+        struct pollfd pfd = { .fd = fd, .events = POLLIN };
+        uint32_t req[4];
+        size_t got = 0;
+        if (poll(&pfd, 1, 0) <= 0) return 0;
+        if (pfd.revents & (POLLHUP | POLLERR)) return -1;
+        while (got < sizeof(req)) {
+            ssize_t n = recv(fd, (char *)req + got, sizeof(req) - got, 0);
+            if (n < 0 && errno == EINTR) continue;
+            if (n <= 0) return -1;
+            got += (size_t)n;
+        }
+        if (req[0] == HELLO_QUERY_MAGIC) {
+            uint32_t hello[4] = { HELLO_MAGIC, PROTOCOL_VERSION, 0, 0 };
+            if (send_all(fd, hello, sizeof(hello)) < 0) return -1;
+            agent_log("hello query answered (protocol %u)", PROTOCOL_VERSION);
+        } else if (req[0] == MODE_REQUEST_MAGIC) {
+            apply_mode(req[1], req[2], req[3]);
+        } else {
+            agent_log("unknown host message 0x%08x", req[0]);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+/* Refresh rate of the mode on the CRTC being captured. */
+static uint32_t crtc_refresh(struct capture_ctx *c)
+{
+    uint32_t hz = DEFAULT_FPS;
+    if (c->crtc_id) {
+        drmModeCrtc *crtc = drmModeGetCrtc(c->fd, c->crtc_id);
+        if (crtc) {
+            if (crtc->mode_valid && crtc->mode.vrefresh >= 24 && crtc->mode.vrefresh <= 240)
+                hz = crtc->mode.vrefresh;
+            drmModeFreeCrtc(crtc);
+        }
+    }
+    return hz;
+}
+
+static int64_t now_ns(void)
+{
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000LL + t.tv_nsec;
+}
+
 /* ---- Main capture loop ---- */
 
 static int send_frame(int client_fd, struct capture_ctx *c, uint64_t seq)
@@ -657,8 +878,16 @@ have_card:
     clock_gettime(CLOCK_MONOTONIC, &next);
     uint64_t seq = 0;
     int last_status = 0;
+    uint32_t sent_fb = 0, sent_w = 0, sent_h = 0, pace_hz = DEFAULT_FPS;
+    int64_t last_send = 0, last_hz_check = 0;
 
     while (!g_stop) {
+        reap_setmode();
+        if (poll_host_requests(client_fd) < 0) {
+            agent_log("client disconnected (requests)");
+            break;
+        }
+
         int rc = drm_acquire_fb(&ctx);
         if (rc < 0) {
             if (last_status != -1) {
@@ -670,9 +899,29 @@ have_card:
                 agent_log("capturing %ux%u stride=%u", ctx.width, ctx.height, ctx.stride);
                 last_status = 1;
             }
-            if (send_frame(client_fd, &ctx, ++seq) < 0) {
-                agent_log("client disconnected");
-                break;
+            int64_t t = now_ns();
+            /* New buffer from the compositor, a new size, or the keepalive. */
+            if (ctx.fb_id_last != sent_fb || ctx.width != sent_w || ctx.height != sent_h ||
+                t - last_send >= KEEPALIVE_NS) {
+                if (send_frame(client_fd, &ctx, ++seq) < 0) {
+                    agent_log("client disconnected");
+                    break;
+                }
+                if (ctx.width != sent_w || ctx.height != sent_h) {
+                    char sz[32];
+                    snprintf(sz, sizeof(sz), "%u %u\n", ctx.width, ctx.height);
+                    write_text_file(FRAME_SIZE_FILE, sz);
+                }
+                sent_fb = ctx.fb_id_last;
+                sent_w = ctx.width;
+                sent_h = ctx.height;
+                last_send = t;
+            }
+            if (t - last_hz_check >= 1000000000LL) {
+                uint32_t hz = crtc_refresh(&ctx);
+                if (hz != pace_hz) agent_log("pacing to %u Hz", hz);
+                pace_hz = hz;
+                last_hz_check = t;
             }
         }
 
@@ -683,8 +932,8 @@ have_card:
             break;
         }
 
-        /* Pace to TARGET_FPS using absolute wakeup. */
-        next.tv_nsec += FRAME_INTERVAL_NS;
+        /* Pace to the mode's refresh rate using absolute wakeup. */
+        next.tv_nsec += 1000000000L / (long)(pace_hz ? pace_hz : DEFAULT_FPS);
         while (next.tv_nsec >= 1000000000L) {
             next.tv_nsec -= 1000000000L;
             next.tv_sec  += 1;
@@ -711,6 +960,10 @@ int main(void)
         sigaction(SIGINT,  &sa, NULL);
         sigaction(SIGTERM, &sa, NULL);
     }
+
+    mkdir("/run/appsandbox", 0755);
+    write_text_file(SETMODE_SCRIPT, g_setmode_py);
+    chmod(SETMODE_SCRIPT, 0644);
 
     int srv = vsock_listen(VSOCK_PORT);
     if (srv < 0) return 1;

@@ -321,8 +321,32 @@ static void emit_syn(int fd) { emit(fd, EV_SYN, SYN_REPORT, 0); }
 
 /* ---- Event translation ---- */
 
+/* appsandbox-display writes the size of the frames it sends to the host
+ * here whenever it changes (resolution changes). Re-read it at most every
+ * 250 ms so absolute moves keep matching the picture the host shows. */
+static void refresh_frame_size(void)
+{
+    static struct timespec last;
+    struct timespec now;
+    FILE *f;
+    int w = 0, h = 0;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    if (last.tv_sec && (now.tv_sec - last.tv_sec) * 1000 +
+                       (now.tv_nsec - last.tv_nsec) / 1000000 < 250)
+        return;
+    last = now;
+    f = fopen("/run/appsandbox/frame-size", "r");
+    if (!f) return;
+    if (fscanf(f, "%d %d", &w, &h) == 2 && w >= 64 && h >= 64 && w <= 16384 && h <= 16384) {
+        g_frame_w = w;
+        g_frame_h = h;
+    }
+    fclose(f);
+}
+
 static void do_mouse_move(int ui_fd, uint32_t x, uint32_t y, int after_relative)
 {
+    refresh_frame_size();
     /* Host gives us pixel coordinates in the current frame. Map to
      * 0..ABS_RANGE so the compositor scales correctly regardless of
      * the actual screen size. */

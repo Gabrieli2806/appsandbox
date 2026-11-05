@@ -16,6 +16,24 @@
 #include "d3dlayers.h"
 #include "snapshot.h"
 #include "guest_tools.h"
+
+/* Repository and ref the Ubuntu guest sources come from (see
+   Directory.Build.props). Given as bare tokens by the build, e.g.
+   ASB_SOURCE_REPO=owner/appsandbox, and turned into wide strings here. */
+#define ASB_STR_(x)    #x
+#define ASB_WIDEN_(s)  L ## s
+#define ASB_WIDEN(s)   ASB_WIDEN_(s)
+#define ASB_WSTR(x)    ASB_WIDEN(ASB_STR_(x))
+#ifdef ASB_SOURCE_REPO
+#define ASB_SOURCE_REPO_W ASB_WSTR(ASB_SOURCE_REPO)
+#else
+#define ASB_SOURCE_REPO_W L"jamesstringer90/appsandbox"
+#endif
+#ifdef ASB_SOURCE_REF
+#define ASB_SOURCE_REF_W ASB_WSTR(ASB_SOURCE_REF)
+#else
+#define ASB_SOURCE_REF_W L"main"
+#endif
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
@@ -2686,10 +2704,11 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
            asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
            50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
            wsl-mesa.tar.zst directly into <staging>/extras/. */
-        asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub...");
+        asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub (%s @ %s)...",
+                ASB_SOURCE_REPO_W, ASB_SOURCE_REF_W);
         swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --branch \"main\" --out-dir \"%s\"",
-            extras);
+            L"--prefetch-repo --repo \"%s\" --branch \"%s\" --out-dir \"%s\"",
+            ASB_SOURCE_REPO_W, ASB_SOURCE_REF_W, extras);
         if (spawn_iso_patch_prefetch(args_buf) != 0)
             asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
 

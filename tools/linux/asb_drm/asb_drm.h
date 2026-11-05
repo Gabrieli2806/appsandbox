@@ -68,6 +68,12 @@ struct asb_device {
 	 * drm_connector_attach_edid_property() → drm_connector_update_edid_property(). */
 	u8                      edid[ASB_EDID_LEN];
 
+	/* Mode the host asked for that is not a preset (adaptive window
+	 * sizing). 0 = none. Set through the custom_mode module parameter. */
+	unsigned int            custom_width;
+	unsigned int            custom_height;
+	unsigned int            custom_refresh;
+
 	/* vblank pacing. A single hrtimer fires at `refresh` Hz and signals
 	 * vblank to the CRTC. We're a virtual device so we have no real
 	 * scanout to sync to; hrtimer cadence is the only timing we expose. */
@@ -75,6 +81,9 @@ struct asb_device {
 	ktime_t                 vblank_period;
 	bool                    vblank_enabled;
 };
+
+/* The single device this module creates (NULL until probed). */
+extern struct asb_device *asb_current_device;
 
 static inline struct asb_device *to_asb(struct drm_device *drm)
 {

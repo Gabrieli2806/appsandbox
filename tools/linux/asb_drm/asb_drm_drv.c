@@ -18,6 +18,8 @@
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/platform_device.h>
+#include <linux/mutex.h>
+#include <linux/sysfs.h>
 #include <linux/version.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -47,6 +49,56 @@ module_param_named(height,  height_param,  uint, 0444);
 MODULE_PARM_DESC(height,  "Initial display height (default 1080)");
 module_param_named(refresh, refresh_param, uint, 0444);
 MODULE_PARM_DESC(refresh, "Refresh rate in Hz     (default 60)");
+
+struct asb_device *asb_current_device;
+
+/* custom_mode: "WxH@HZ", written at runtime by the display daemon when the
+ * host asks for a size that is not a preset (adaptive window sizing). The
+ * connector adds it to its mode list and a hotplug event makes the
+ * compositor re-probe, so no unplug is needed; the daemon then asks the
+ * compositor to switch. "" or "0x0@0" clears it. */
+static DEFINE_MUTEX(asb_custom_lock);
+static unsigned int custom_w, custom_h, custom_hz;
+
+static int asb_custom_mode_set(const char *val, const struct kernel_param *kp)
+{
+	unsigned int w = 0, h = 0, hz = 0;
+	struct asb_device *asb;
+
+	if (val && val[0] && val[0] != '\n') {
+		if (sscanf(val, "%ux%u@%u", &w, &h, &hz) != 3)
+			return -EINVAL;
+		if (w || h || hz) {
+			if (w < 640 || h < 480 || w > ASB_MAX_WIDTH || h > ASB_MAX_HEIGHT ||
+			    hz < 24 || hz > 240)
+				return -ERANGE;
+		}
+	}
+	mutex_lock(&asb_custom_lock);
+	custom_w = w; custom_h = h; custom_hz = hz;
+	asb = asb_current_device;
+	if (asb) {
+		asb->custom_width = w;
+		asb->custom_height = h;
+		asb->custom_refresh = hz;
+	}
+	mutex_unlock(&asb_custom_lock);
+	if (asb)
+		drm_kms_helper_hotplug_event(&asb->drm);
+	return 0;
+}
+
+static int asb_custom_mode_get(char *buf, const struct kernel_param *kp)
+{
+	return sysfs_emit(buf, "%ux%u@%u\n", custom_w, custom_h, custom_hz);
+}
+
+static const struct kernel_param_ops asb_custom_mode_ops = {
+	.set = asb_custom_mode_set,
+	.get = asb_custom_mode_get,
+};
+module_param_cb(custom_mode, &asb_custom_mode_ops, NULL, 0644);
+MODULE_PARM_DESC(custom_mode, "Extra mode WxH@HZ offered to the compositor (runtime)");
 
 /* --------------------------------------------------------------------------
  * drm_driver
@@ -151,6 +203,11 @@ static int asb_probe(struct platform_device *pdev)
 	asb->width   = clamp(width_param,   64u, (unsigned)ASB_MAX_WIDTH);
 	asb->height  = clamp(height_param,  64u, (unsigned)ASB_MAX_HEIGHT);
 	asb->refresh = clamp(refresh_param, 24u, 240u);
+	mutex_lock(&asb_custom_lock);
+	asb->custom_width = custom_w;
+	asb->custom_height = custom_h;
+	asb->custom_refresh = custom_hz;
+	mutex_unlock(&asb_custom_lock);
 
 	ret = asb_mode_config_setup(asb);
 	if (ret) {
@@ -192,6 +249,10 @@ static int asb_probe(struct platform_device *pdev)
 		return ret;
 	}
 
+	mutex_lock(&asb_custom_lock);
+	asb_current_device = asb;
+	mutex_unlock(&asb_custom_lock);
+
 	dev_info(&pdev->dev, "AppSandbox virtual display ready: %ux%u@%uHz\n",
 	         asb->width, asb->height, asb->refresh);
 	return 0;
@@ -201,6 +262,10 @@ static void asb_remove(struct platform_device *pdev)
 {
 	struct drm_device *drm = platform_get_drvdata(pdev);
 	struct asb_device *asb = to_asb(drm);
+
+	mutex_lock(&asb_custom_lock);
+	asb_current_device = NULL;
+	mutex_unlock(&asb_custom_lock);
 
 	drm_dev_unplug(drm);
 	asb_mode_fini(asb);

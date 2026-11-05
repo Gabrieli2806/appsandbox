@@ -189,7 +189,7 @@ static int u_cp_tree(const wchar_t *src_dir, const wchar_t *dst_dir)
  * Main flow
  * ==================================================================== */
 
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
+int do_prefetch_repo(const wchar_t *repo, const wchar_t *branch, const wchar_t *out_dir)
 {
     log_msg(L"prefetch-repo: branch=%s out=%s", branch, out_dir);
 
@@ -211,8 +211,10 @@ int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir)
     swprintf_s(tgz, MAX_PATH, L"%s\\repo.tar.gz", tmp);
     {
         wchar_t path[1024];
-        swprintf_s(path, 1024,
-            L"/jamesstringer90/appsandbox/tar.gz/refs/heads/%s", branch);
+        /* codeload takes a branch name or a commit SHA after tar.gz/. The
+           top-level directory is "<repo name>-<ref>" either way. */
+        swprintf_s(path, 1024, L"/%s/tar.gz/%s",
+                   (repo && repo[0]) ? repo : L"jamesstringer90/appsandbox", branch);
         log_msg(L"prefetch-repo: GET https://codeload.github.com%s", path);
         if (http_download_secure(L"codeload.github.com", 443, path, tgz) != 0) {
             log_err(L"prefetch-repo: download failed");

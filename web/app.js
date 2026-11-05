@@ -1320,7 +1320,7 @@ function fillRows(container, rows) {
 }
 
 function displaySupported(vm) {
-    return !hostBridge.isMac && vm.osType === 'Windows' && !vm.isTemplate;
+    return !hostBridge.isMac && (vm.osType === 'Windows' || vm.osType === 'Linux') && !vm.isTemplate;
 }
 
 function renderVmDetail() {
@@ -1479,8 +1479,13 @@ function renderDisplayTab(vm) {
     var note = document.getElementById('vmd-display-note');
     var drv = typeof vm.displayDriver === 'number' ? vm.displayDriver : -1;
     var auto = !lastHostInfo || lastHostInfo.autoUpdateGuestTools !== false;
-    document.getElementById('vmd-display-update').hidden = !(drv === 0 && !vm.running && !isBusy(vm));
-    if (drv === 0) {
+    var linux = vm.osType === 'Linux';
+    document.getElementById('vmd-display-update').hidden = linux || !(drv === 0 && !vm.running && !isBusy(vm));
+    if (drv === 0 && linux) {
+        note.className = 'notice warn';
+        note.innerHTML = '<strong>This Ubuntu VM has the older display components,</strong> so it stays at 1920 × 1080 at 60 Hz. ' +
+            'Ubuntu VMs build their components when they are created: create a new Ubuntu VM with this version to change resolution and refresh rate.';
+    } else if (drv === 0) {
         note.className = 'notice warn';
         note.innerHTML = '<strong>This VM has the older display driver,</strong> so it stays at 1920 × 1080 at 60 Hz. ' +
             (vm.running

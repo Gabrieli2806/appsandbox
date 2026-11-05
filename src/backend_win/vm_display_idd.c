@@ -277,6 +277,7 @@ struct VmDisplayIdd {
     int            res_choice;
     UINT           refresh_hz;
     BOOL           mode_supported;
+    BOOL           guest_linux;      /* Linux guest: the display daemon applies modes itself */
     /* Guest driver generation on the current frame connection: -1 unknown,
        0 older (no hello before the first frame), >= 2 from its hello. */
     volatile LONG  guest_driver;
@@ -979,9 +980,15 @@ static void idd_apply_display_mode(VmDisplayIdd *d, BOOL force)
         vdd_ok = send(d->frame_socket, (const char *)&req, (int)sizeof(req), 0) == (int)sizeof(req);
     ReleaseSRWLockExclusive(&d->frame_send_lock);
 
-    AcquireSRWLockExclusive(&d->input_lock);
-    input_ok = send_input_locked(d, INPUT_SET_DISPLAY, w, h, hz);
-    ReleaseSRWLockExclusive(&d->input_lock);
+    /* Windows guests switch in the session through the input helper; on
+       Linux the display daemon that received the request does it. */
+    if (d->guest_linux) {
+        input_ok = TRUE;
+    } else {
+        AcquireSRWLockExclusive(&d->input_lock);
+        input_ok = send_input_locked(d, INPUT_SET_DISPLAY, w, h, hz);
+        ReleaseSRWLockExclusive(&d->input_lock);
+    }
 
     if (vdd_ok && input_ok) {
         d->req_width = w;
@@ -2836,8 +2843,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             /* Frames but no answer to the hello query: an older driver. */
             if (d->mode_supported && ++d->frames_since_connect >= HELLO_FRAME_GRACE &&
                 InterlockedCompareExchange(&d->guest_driver, 0, -1) == -1) {
-                idd_log(d, L"Guest display driver is older than this App Sandbox: it stays at "
-                           L"1920x1080 and ignores resolution changes. Create a new VM to get the new driver.");
+                idd_log(d, L"Guest display is older than this App Sandbox: it stays at "
+                           L"1920x1080 and ignores resolution changes.%s",
+                        d->guest_linux ? L" Create a new Ubuntu VM to get the new display components."
+                                       : L" Update the VM's guest components (or create a new VM).");
                 if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
             }
 
@@ -3905,7 +3914,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
                                                               &d->res_choice, &d->refresh_hz);
     d->clip_share_host_to_guest = h2g;
     d->clip_share_guest_to_host = g2h;
-    d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0);
+    d->guest_linux = (_wcsicmp(vm->os_type, L"Linux") == 0);
+    d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0) || d->guest_linux;
     d->frame_socket = INVALID_SOCKET;
     InitializeSRWLock(&d->frame_send_lock);
     d->guest_driver = -1;

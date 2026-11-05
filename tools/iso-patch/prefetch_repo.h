@@ -27,6 +27,7 @@
  *     wsl-mesa.tar.zst     (from tools/linux/wsl-mesa/prebuilt/...)
  *
  * Returns 0 on success; non-zero on any failure. */
-int do_prefetch_repo(const wchar_t *branch, const wchar_t *out_dir);
+/* repo: "owner/name" on GitHub; branch: a branch name or a commit SHA. */
+int do_prefetch_repo(const wchar_t *repo, const wchar_t *branch, const wchar_t *out_dir);
 
 #endif
