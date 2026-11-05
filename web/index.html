@@ -4,6 +4,17 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>App Sandbox</title>
+<script>
+/* Apply the saved theme before first paint (no flash of the wrong theme). */
+(function() {
+    try {
+        var t = localStorage.getItem('ui_theme') || 'dark';
+        var a = localStorage.getItem('ui_accent');
+        if (t !== 'system') document.documentElement.setAttribute('data-theme', t);
+        if (a) document.documentElement.style.setProperty('--accent', a);
+    } catch (e) {}
+})();
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <!-- spellcheck="false" inherits to all descendants; the per-field
@@ -11,43 +22,184 @@
      rewriting VM names, usernames, paths, and snapshot names as you type. -->
 <body spellcheck="false" autocorrect="off" autocapitalize="off">
 
-<!-- Virtual Machines -->
-<section id="vm-section">
-    <div class="section-header">
-        <h2>Sandboxes</h2>
-        <button id="btn-new-sandbox" class="primary" onclick="openCreateModal()">+ New Sandbox</button>
+<div class="app">
+
+<!-- Sidebar -->
+<nav class="sidebar" aria-label="Main">
+    <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg>
+        </span>
+        <span class="brand-name">App Sandbox</span>
     </div>
-    <div class="vm-table-wrap">
-        <table id="vm-table">
-            <thead><tr>
-                <th>Name</th>
-                <th>OS</th>
-                <th>Status</th>
-                <th>Agent</th>
-                <th>CPU</th>
-                <th>RAM (MB)</th>
-                <th>HDD (GB)</th>
-                <th>GPU</th>
-                <th>Network</th>
-                <th class="win-only">Snapshot</th>
-                <th class="icon-col">&#x25B6;&#xFE0F;</th>
-                <th class="icon-col" title="IDD Display">&#x1F4FA;</th>
-                <th class="icon-col" title="SSH">&gt;_</th>
-                <th class="icon-col">&#x23FB;</th>
-                <th class="icon-col">&#x2715;&#xFE0F;</th>
-                <th class="icon-col">&#x1F5D1;&#xFE0F;</th>
-                <th class="icon-col">&#x270F;&#xFE0F;</th>
-            </tr></thead>
-            <tbody id="vm-tbody"></tbody>
-        </table>
+    <div class="nav-list">
+        <button type="button" class="nav-item" data-view="vms" onclick="showView('vms')">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="7" height="7" rx="1.5"></rect><rect x="14" y="3" width="7" height="7" rx="1.5"></rect><rect x="3" y="14" width="7" height="7" rx="1.5"></rect><rect x="14" y="14" width="7" height="7" rx="1.5"></rect></svg>
+            <span>Virtual machines</span>
+            <span class="nav-count" id="nav-vm-count">0</span>
+        </button>
+        <button type="button" class="nav-item" data-view="settings" onclick="showView('settings')">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M12 2v3M12 19v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M2 12h3M19 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1"></path></svg>
+            <span>Settings</span>
+        </button>
+    </div>
+    <section class="host-card" aria-label="This computer">
+        <div class="host-card-title">In use by running VMs</div>
+        <div class="meter">
+            <div class="meter-row"><span>CPU</span><span id="res-cpu">&ndash;</span></div>
+            <div class="meter-bar"><div class="meter-fill" id="res-cpu-bar"></div></div>
+        </div>
+        <div class="meter">
+            <div class="meter-row"><span>RAM</span><span id="res-ram">&ndash;</span></div>
+            <div class="meter-bar"><div class="meter-fill" id="res-ram-bar"></div></div>
+        </div>
+        <div class="meter-row"><span>Free disk</span><span id="res-disk">&ndash;</span></div>
+        <div class="meter-row win-only"><span>GPU</span><span id="res-gpu" class="truncate">&ndash;</span></div>
+    </section>
+</nav>
+
+<main class="content">
+
+<!-- Library -->
+<section id="view-vms" class="view">
+    <header class="view-header">
+        <div class="view-title">
+            <h1>Virtual machines</h1>
+            <p id="vm-summary" class="muted"></p>
+        </div>
+        <label class="search">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"></circle><path d="M20 20l-3.5-3.5"></path></svg>
+            <span class="sr-only">Search VMs</span>
+            <input type="search" id="vm-search" placeholder="Search VMs" oninput="renderVmTable()">
+        </label>
+        <button id="btn-new-sandbox" class="primary with-icon" onclick="openCreateModal()">
+            <svg aria-hidden="true" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M12 5v14M5 12h14"></path></svg>
+            New VM
+        </button>
+    </header>
+    <div class="chips" role="group" aria-label="Filter" id="vm-filters">
+        <button type="button" class="chip" data-filter="all" onclick="setVmFilter('all')">All</button>
+        <button type="button" class="chip" data-filter="running" onclick="setVmFilter('running')">Running</button>
+        <button type="button" class="chip" data-filter="stopped" onclick="setVmFilter('stopped')">Stopped</button>
+    </div>
+    <div id="vm-grid" class="vm-grid"></div>
+</section>
+
+<!-- One VM -->
+<section id="view-vm" class="view" hidden>
+    <header class="detail-header">
+        <button type="button" class="icon-square" onclick="showView('vms')" aria-label="Back to virtual machines">
+            <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 6l-6 6 6 6"></path></svg>
+        </button>
+        <div class="detail-title">
+            <div class="detail-title-row"><h1 id="vmd-name"></h1><span id="vmd-status" class="badge"></span></div>
+            <p id="vmd-sub" class="muted"></p>
+        </div>
+        <div id="vmd-actions" class="action-row"></div>
+    </header>
+    <div class="detail-body">
+        <nav class="tabs" aria-label="VM sections" id="vmd-tabs">
+            <button type="button" class="tab" data-tab="overview" onclick="showVmTab('overview')">Overview</button>
+            <button type="button" class="tab" data-tab="hardware" onclick="showVmTab('hardware')">Hardware</button>
+            <button type="button" class="tab win-only" data-tab="display" onclick="showVmTab('display')">Display</button>
+            <button type="button" class="tab win-only" data-tab="snapshots" onclick="showVmTab('snapshots')">Snapshots</button>
+        </nav>
+        <div class="tab-panels">
+            <div class="tab-panel" data-panel="overview">
+                <h2 class="panel-title">Overview</h2>
+                <div class="card rows" id="vmd-overview"></div>
+            </div>
+            <div class="tab-panel" data-panel="hardware" hidden>
+                <h2 class="panel-title">Hardware</h2>
+                <p class="muted">Can be changed while the VM is stopped.</p>
+                <div class="card rows" id="vmd-hardware"></div>
+                <div><button type="button" id="vmd-edit-hw" class="primary" onclick="openEditVmModal(vmIndexById(detailVmId))">Edit hardware</button></div>
+            </div>
+            <div class="tab-panel" data-panel="display" hidden>
+                <h2 class="panel-title">Display</h2>
+                <p class="muted">Applied live while the VM window is open, and saved for next time. Needs a VM created with this version of App Sandbox.</p>
+                <div class="card">
+                    <div class="card-head">
+                        <h3>Resolution</h3>
+                        <p class="muted">Adaptive: the VM takes the size of its window, any shape (portrait too).</p>
+                    </div>
+                    <div class="segmented" role="group" aria-label="Resolution mode">
+                        <button type="button" data-mode="adaptive" onclick="setDisplayChoice('adaptive', null)">Adaptive</button>
+                        <button type="button" data-mode="fixed" onclick="setDisplayChoice('fixed', null)">Fixed</button>
+                    </div>
+                    <div class="preset-grid" id="vmd-presets"></div>
+                </div>
+                <div class="card">
+                    <div class="card-head">
+                        <h3>Refresh rate</h3>
+                        <p class="muted">More Hz allows more FPS in games; each frame costs CPU time to copy.</p>
+                    </div>
+                    <div class="segmented" role="group" aria-label="Refresh rate" id="vmd-rates"></div>
+                </div>
+                <p class="muted small">More display options (FPS counter, borderless fullscreen with F11, clipboard, audio) are in the VM window: right-click its title bar.</p>
+            </div>
+            <div class="tab-panel" data-panel="snapshots" hidden>
+                <h2 class="panel-title">Snapshots</h2>
+                <p class="muted">Save and restore the disk; the VM must be stopped.</p>
+                <div class="card rows" id="vmd-snapshots"></div>
+                <div><button type="button" id="vmd-open-snaps" class="primary snap-open" onclick="openSnapshotModal(vmIndexById(detailVmId))">Manage snapshots</button></div>
+            </div>
+        </div>
     </div>
 </section>
 
-<!-- Log -->
-<section id="log-section">
-    <h2 class="collapsible" onclick="toggleSection('log-section')"><span class="collapse-arrow" id="log-section-arrow">&#x25BC;</span> Log</h2>
+<!-- Settings -->
+<section id="view-settings" class="view" hidden>
+    <header class="view-header">
+        <div class="view-title">
+            <h1>Settings</h1>
+            <p class="muted">For the whole app. Each VM also has its own settings.</p>
+        </div>
+    </header>
+    <h2 class="group-title">Appearance</h2>
+    <div class="card rows">
+        <div class="row">
+            <div class="row-text"><span class="row-label">Theme</span><span class="muted small">System follows Windows&rsquo; light or dark mode.</span></div>
+            <div class="segmented" role="group" aria-label="Theme" id="set-theme">
+                <button type="button" data-theme-choice="dark" onclick="setTheme('dark')">Dark</button>
+                <button type="button" data-theme-choice="light" onclick="setTheme('light')">Light</button>
+                <button type="button" data-theme-choice="system" onclick="setTheme('system')">System</button>
+            </div>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Accent color</span><span class="muted small">Main buttons and selection.</span></div>
+            <div class="swatches" role="group" aria-label="Accent color" id="set-accent"></div>
+        </div>
+    </div>
+    <h2 class="group-title win-only">Behavior</h2>
+    <div class="card rows win-only">
+        <div class="row">
+            <div class="row-text"><span class="row-label">When closing the window with VMs running</span><span class="muted small">VMs keep running in the tray. Open App Sandbox again to bring the window back.</span></div>
+            <label class="sr-only" for="set-close">When closing the window</label>
+            <select id="set-close" onchange="setCloseBehavior(this.value)">
+                <option value="ask">Ask every time</option>
+                <option value="tray">Minimize to the tray</option>
+            </select>
+        </div>
+    </div>
+    <h2 class="group-title">This computer</h2>
+    <div class="card rows" id="set-host"></div>
+</section>
+
+<!-- Activity log -->
+<section id="log-section" class="activity">
+    <button type="button" class="activity-toggle" onclick="toggleSection('log-section')" aria-controls="log-panel">
+        <span class="collapse-arrow" id="log-section-arrow" aria-hidden="true">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 9l6 6 6-6"></path></svg>
+        </span>
+        Activity
+    </button>
+    <span id="log-last" class="log-last"></span>
     <div id="log-panel"></div>
 </section>
+
+</main>
+</div>
 
 <!-- Prerequisite modal -->
 <div class="modal-overlay" id="prereq-overlay">

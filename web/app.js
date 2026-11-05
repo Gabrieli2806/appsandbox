@@ -212,6 +212,8 @@ function updateHostInfo(info) {
         JSON.stringify(info.gpus) !== JSON.stringify(lastHostInfo && lastHostInfo.gpus))
         populateGpus(info.gpus);
     lastHostInfo = info;
+    updateHostMeters(info);
+    renderSettingsView();
     var diskDirectory = document.getElementById('disk-directory');
     if (diskDirectoryBeforeEdit === null && info.defaultDiskDirectory &&
         (!diskDirectory.value || diskDirectory.value === previousDefault))
@@ -940,260 +942,637 @@ document.addEventListener('keydown', function(e) {
     }
 });
 
-/* ---- VM Table ---- */
+/* ---- VM library (cards) ---- */
 
-/* Update the status <td> in place. Preserves the spinner element across
-   updates so its CSS animation doesn't restart on every staging-file tick. */
-function updateStatusCell(td, vm) {
-    var needsSpinner = false;
-    var label = '';
-    var className = '';
+let vmFilter = 'all';
+let detailVmId = null;
+let detailTab = 'overview';
+let openMenu = null;
 
-    if (vm.starting) {
-        needsSpinner = true;
-        label = 'Starting';
-        className = 'status-building';
-    } else if (vm.buildingVhdx) {
-        needsSpinner = true;
-        label = vm.vhdxStaging ? 'Staging files... ' : 'Building Disk (' + (vm.vhdxProgress || 0) + '%) ';
-        className = 'status-building';
-    } else if (vm.running && vm.shuttingDown) {
-        className = 'status-shutting-down';
-        label = 'Shutting Down';
-    } else if (vm.running && vm.isTemplate) {
-        needsSpinner = true;
-        label = 'Building Template ';
-        className = 'status-building';
-    } else if (vm.running && !vm.installComplete && !vm.isTemplate) {
-        needsSpinner = true;
-        var defaultLabel;
-        if (vm.osType === 'macOS')      defaultLabel = 'Installing macOS ';
-        else if (vm.osType === 'Linux') defaultLabel = 'Installing Linux ';
-        else                            defaultLabel = 'Installing Windows ';
-        label = (vm.installStatus && vm.installStatus.length > 0)
-            ? (vm.installStatus + ' ')
-            : defaultLabel;
-        className = 'status-building';
-    } else if (vm.running) {
-        className = 'status-running';
-        label = 'Running';
-    } else {
-        className = 'status-stopped';
-        label = 'Stopped';
+const ICONS = {
+    monitor: '<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="12" rx="2"></rect><path d="M8 20h8M12 16v4"></path></svg>',
+    windows: '<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linejoin="round"><path d="M3 5.5l7.5-1v7H3zM12.5 4.2L21 3v8.5h-8.5zM3 12.5h7.5v7L3 18.5zM12.5 12.5H21V21l-8.5-1.2z"></path></svg>',
+    linux: '<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M4 17l6-6-6-6M12 19h8"></path></svg>',
+    apple: '<svg aria-hidden="true" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M16 3c-1.5.2-3 1.3-3.4 3M12 7.5c-1.4-.9-2.6-1-3.8-.6C5.6 7.8 4.5 11 5.4 14.6 6.3 18.4 8.5 21 10 21c1 0 1.3-.5 2-.5s1 .5 2 .5c1.6 0 3.4-2.6 4.2-5-1.8-.8-2.8-2.5-2.4-4.4.3-1.3 1.2-2.2 2.3-2.7-1.3-1.7-3.6-2.1-5.1-1.4z"></path></svg>',
+    edit: '<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"></path><circle cx="16" cy="6" r="2"></circle><circle cx="10" cy="12" r="2"></circle><circle cx="18" cy="18" r="2"></circle></svg>',
+    more: '<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="1.8"></circle><circle cx="12" cy="12" r="1.8"></circle><circle cx="19" cy="12" r="1.8"></circle></svg>',
+    ssh: '<svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"></rect><path d="M7 9l3 3-3 3M12 15h5"></path></svg>'
+};
+
+function osIcon(osType) {
+    if (osType === 'Windows') return ICONS.windows;
+    if (osType === 'Linux') return ICONS.linux;
+    if (osType === 'macOS') return ICONS.apple;
+    return ICONS.monitor;
+}
+
+function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting); }
+
+/* Status label + style for a VM (kind: running | busy | stopping | stopped). */
+function vmStatus(vm) {
+    if (vm.starting) return { label: 'Starting', kind: 'busy' };
+    if (vm.buildingVhdx)
+        return { label: vm.vhdxStaging ? 'Staging files' : 'Building disk ' + (vm.vhdxProgress || 0) + '%', kind: 'busy' };
+    if (vm.running && vm.shuttingDown) return { label: 'Shutting down', kind: 'stopping' };
+    if (vm.running && vm.isTemplate) return { label: 'Building template', kind: 'busy' };
+    if (vm.running && !vm.installComplete && !vm.isTemplate) {
+        var def = vm.osType === 'macOS' ? 'Installing macOS' : vm.osType === 'Linux' ? 'Installing Linux' : 'Installing Windows';
+        return { label: (vm.installStatus && vm.installStatus.length > 0) ? vm.installStatus : def, kind: 'busy' };
     }
+    if (vm.running) return { label: 'Running', kind: 'running' };
+    return { label: vm.isTemplate ? 'Template' : 'Stopped', kind: 'stopped' };
+}
 
-    td.className = className;
-
-    var existingSpinner = td.querySelector('.spinner');
-
-    if (needsSpinner) {
-        /* Drop any existing children except the spinner, then insert the new text
-           before it. The spinner stays in the document the whole time, so its
-           CSS animation clock isn't reset. */
-        if (existingSpinner) {
-            var child = td.firstChild;
-            while (child) {
-                var next = child.nextSibling;
-                if (child !== existingSpinner) td.removeChild(child);
-                child = next;
-            }
-            td.insertBefore(document.createTextNode(label), existingSpinner);
-        } else {
-            td.textContent = '';
-            td.appendChild(document.createTextNode(label));
-            var spin = document.createElement('span');
-            spin.className = 'spinner';
-            td.appendChild(spin);
-        }
+/* Fill a badge element; keeps an existing spinner so its animation runs on. */
+function setBadge(el, vm) {
+    var st = vmStatus(vm);
+    el.className = 'badge' + (st.kind === 'stopped' ? '' : ' ' + st.kind);
+    var spinner = el.querySelector('.spinner');
+    if (st.kind === 'busy') {
+        if (!spinner) { spinner = document.createElement('span'); spinner.className = 'spinner'; }
+        el.textContent = '';
+        el.appendChild(spinner);
+        el.appendChild(document.createTextNode(st.label));
     } else {
-        /* No spinner needed — wipe and set plain text. Any existing spinner is
-           removed along with the old text. */
-        td.textContent = label;
+        el.textContent = st.label;
     }
 }
 
-/* Build the list of <td> cells for a row. The status cell is passed in and
-   updated in place (rather than recreated) so the spinner animation survives. */
-function buildRowCells(vm, i, statusTd) {
-    updateStatusCell(statusTd, vm);
+function gpuLabel(vm) {
+    if (hostBridge.isMac && vm.osType === 'Windows') return 'Software rendering';
+    return vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'No GPU');
+}
 
-    var agentTd = document.createElement('td');
-    var agentOff = !vm.running || vm.isTemplate;
-    var dotClass = 'agent-dot' + (vm.agentOnline ? ' online' : '') + (agentOff ? ' disabled' : '');
-    agentTd.innerHTML = '<span class="' + dotClass + '"></span>';
-    agentTd.title = vm.isTemplate
-        ? 'Templates do not run the in-VM agent'
-        : (!vm.running
-            ? 'VM is not running'
-            : (vm.agentOnline
-                ? 'In-VM agent is connected — host can manage the guest'
-                : 'In-VM agent is not connected'));
+function ramLabel(mb) {
+    return mb >= 1024 ? (Math.round(mb / 102.4) / 10) + ' GB' : mb + ' MB';
+}
 
-    var bld = vm.buildingVhdx || vm.starting;
-
-    var sshActive = vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !bld;
-    var sshCell = makeIconCell('ssh', '>_', sshActive, function() { sendCmd('sshConnect', {vmId: vm.id}); }, !vm.sshEnabled ? 'hidden' : '');
-    if (vm.sshEnabled) {
-        var sshBtn = sshCell.querySelector('.icon-btn');
-        if (vm.sshState === 1) sshBtn.title = 'Installing OpenSSH in the guest...';
-        else if (vm.sshState === 4) sshBtn.title = 'Open an SSH terminal (localhost:' + vm.sshPort + '; AppSandbox key deployed — key auth works)';
-        else if (vm.sshState === 2) sshBtn.title = 'Open an SSH terminal to the VM (localhost:' + vm.sshPort + ', tunneled over HvSocket)';
-        else if (vm.sshState === 3) sshBtn.title = 'SSH install failed';
-        else sshBtn.title = 'SSH: waiting for the in-VM agent to come online';
-    }
-
-    var cells = [
-        makeCell(vm.name),
-        makeCell(vm.osType),
-        statusTd,
-        agentTd,
-        makeCell(vm.cpuCores, 'Number of virtual CPU cores assigned to this VM'),
-        makeCell(vm.ramMb + ' MB', 'Memory allocated to this VM, in megabytes'),
-        makeCell(vm.hddGb + ' GB', 'Virtual disk size, in gigabytes'),
-        makeCell(vm.gpuName || (vm.gpuMode === 1 ? 'Default GPU' : 'None'),
-            hostBridge.isMac && vm.osType === 'Windows'
-                ? 'Windows software rendering (WARP) on the CPU'
-                : 'GPU passed through to the VM via GPU-PV, or None'),
-        makeCell(netNames[vm.networkMode] || 'None',
-            hostBridge.isMac ? 'NAT (shared networking)'
-                : 'Networking mode: NAT (shared), External (bridged), Internal (host-only), or None'),
+function vmSpecs(vm) {
+    return [
+        vm.cpuCores + ' vCPU',
+        ramLabel(vm.ramMb),
+        vm.hddGb + ' GB disk',
+        hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None') + (vm.networkMode === 0 ? '' : ' network')
     ];
-    if (!hostBridge.isMac) cells.push(makeSnapCell(vm, i));
-    cells.push(
-        makeIconCell('start', '\u25B6\uFE0F', !vm.running && !bld, function() { onStartVm(vmIndexById(vm.id)); }, '', 'Start the VM (boots from the selected snapshot/branch)'),
-        makeIconCell('connect-idd', '\uD83D\uDCFA', vm.running && !bld, function() { sendCmd('connectIddVm', {vmId: vm.id}); }, '', 'Open the VM display window (IDD virtual monitor)'),
-        sshCell,
-        makeIconCell('shutdown', '\u23FB', vm.running && !bld, function() { sendCmd('shutdownVm', {vmId: vm.id}); }, '', 'Request a graceful shutdown from the guest OS'),
-        makeIconCell('stop', '\u2715\uFE0F', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); }, '', 'Force power off the VM immediately (may lose unsaved guest data)'),
-        makeIconCell('delete', '\uD83D\uDDD1\uFE0F', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, vm.running ? 'running' : '', 'Delete this VM and its virtual disks'),
-        makeIconCell('edit', '\u270F\uFE0F', !vm.running && !bld, function() { openEditVmModal(vmIndexById(vm.id)); }, '', 'Edit VM configuration — VM must be stopped'),
-    );
-    return cells;
 }
 
+function setVmFilter(f) {
+    vmFilter = f;
+    renderVmTable();
+}
+
+function vmMatchesFilter(vm) {
+    var q = (document.getElementById('vm-search').value || '').trim().toLowerCase();
+    if (q && vm.name.toLowerCase().indexOf(q) < 0 && (vm.osType || '').toLowerCase().indexOf(q) < 0) return false;
+    if (vmFilter === 'running') return !!vm.running || isBusy(vm);
+    if (vmFilter === 'stopped') return !vm.running && !isBusy(vm);
+    return true;
+}
+
+function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined && text !== null) e.textContent = text;
+    return e;
+}
+
+function iconButton(cls, svg, label, handler, disabled) {
+    var b = el('button', 'icon-square ' + cls);
+    b.type = 'button';
+    b.innerHTML = svg;
+    b.setAttribute('aria-label', label);
+    b.title = label;
+    if (disabled) b.disabled = true;
+    else b.onclick = function(e) { e.stopPropagation(); handler(e); };
+    return b;
+}
+
+function sshTitle(vm) {
+    if (vm.sshState === 1) return 'Installing OpenSSH in the guest...';
+    if (vm.sshState === 4) return 'Open an SSH terminal (localhost:' + vm.sshPort + ', key deployed)';
+    if (vm.sshState === 2) return 'Open an SSH terminal (localhost:' + vm.sshPort + ')';
+    if (vm.sshState === 3) return 'SSH install failed';
+    return 'SSH: waiting for the in-VM agent';
+}
+
+function sshReady(vm) {
+    return vm.sshEnabled && (vm.sshState === 2 || vm.sshState === 4) && vm.running && !isBusy(vm);
+}
+
+/* Main action for a VM: Connect when running, Start when stopped. */
+function primaryAction(vm) {
+    var bld = isBusy(vm);
+    if (vm.running) {
+        return { label: 'Connect', disabled: bld || vm.isTemplate,
+                 run: function() { sendCmd('connectIddVm', { vmId: vm.id }); } };
+    }
+    return { label: 'Start', disabled: bld,
+             run: function() { onStartVm(vmIndexById(vm.id)); } };
+}
+
+/* The ... menu: secondary and destructive actions. */
+function showVmMenu(vm, anchor) {
+    closeVmMenu();
+    var bld = isBusy(vm);
+    var menu = el('div', 'menu-pop');
+    menu.setAttribute('role', 'menu');
+    function item(label, enabled, fn, cls) {
+        var b = el('button', cls || '', label);
+        b.type = 'button';
+        b.setAttribute('role', 'menuitem');
+        if (!enabled) b.disabled = true;
+        else b.onclick = function() { closeVmMenu(); fn(); };
+        menu.appendChild(b);
+    }
+    item('Open settings', true, function() { openVmDetail(vm.id); });
+    item('Shut down', vm.running && !bld, function() { sendCmd('shutdownVm', { vmId: vm.id }); });
+    item('Force stop', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); });
+    if (!hostBridge.isMac)
+        item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
+    if (vm.sshEnabled)
+        item('Open SSH terminal', sshReady(vm), function() { sendCmd('sshConnect', { vmId: vm.id }); });
+    menu.appendChild(document.createElement('hr'));
+    item('Delete VM…', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, 'danger-item');
+
+    document.body.appendChild(menu);
+    var r = anchor.getBoundingClientRect();
+    var left = Math.min(r.right - menu.offsetWidth, window.innerWidth - menu.offsetWidth - 8);
+    var top = r.bottom + 6;
+    if (top + menu.offsetHeight > window.innerHeight - 8) top = r.top - menu.offsetHeight - 6;
+    menu.style.left = Math.max(8, left) + 'px';
+    menu.style.top = Math.max(8, top) + 'px';
+    openMenu = { menu: menu, anchor: anchor };
+    var first = menu.querySelector('button:not(:disabled)');
+    if (first) first.focus();
+}
+
+function closeVmMenu() {
+    if (!openMenu) return;
+    var anchor = openMenu.anchor;
+    if (openMenu.menu.parentNode) openMenu.menu.parentNode.removeChild(openMenu.menu);
+    openMenu = null;
+    if (anchor && anchor.isConnected && document.activeElement === document.body) anchor.focus();
+}
+
+document.addEventListener('mousedown', function(e) {
+    if (openMenu && !openMenu.menu.contains(e.target) && e.target !== openMenu.anchor) closeVmMenu();
+});
+document.addEventListener('keydown', function(e) {
+    if (openMenu && e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeVmMenu(); }
+}, true);
+window.addEventListener('resize', closeVmMenu);
+
+function buildVmCard(vm) {
+    var card = el('article', 'vm-card' + (vm.running ? ' running' : ''));
+
+    var main = el('div', 'vm-card-main');
+    main.setAttribute('role', 'button');
+    main.tabIndex = 0;
+    main.setAttribute('aria-label', 'Open ' + vm.name + ' settings');
+    main.onclick = function() { openVmDetail(vm.id); };
+    main.onkeydown = function(e) {
+        if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openVmDetail(vm.id); }
+    };
+
+    var top = el('div', 'vm-card-top');
+    var tile = el('div', 'os-tile');
+    tile.innerHTML = osIcon(vm.osType);
+    var names = el('div', 'vm-card-names');
+    names.appendChild(el('h2', '', vm.name));
+    names.appendChild(el('span', '', vm.osType + ' · ' + gpuLabel(vm)));
+    var badge = el('span', 'badge');
+    badge.setAttribute('data-role', 'status');
+    setBadge(badge, vm);
+    top.appendChild(tile);
+    top.appendChild(names);
+    top.appendChild(badge);
+    main.appendChild(top);
+
+    var specs = el('ul', 'spec-list');
+    vmSpecs(vm).forEach(function(s) { specs.appendChild(el('li', '', s)); });
+    if (!hostBridge.isMac && vm.hasSnapshots)
+        specs.appendChild(el('li', '', 'Disk: ' + snapshotPath(vm, selectedSnap.get(vm.id) || 'current')));
+    main.appendChild(specs);
+
+    var prog = el('div', 'vm-card-progress');
+    prog.setAttribute('data-role', 'progress');
+    prog.appendChild(el('div'));
+    main.appendChild(prog);
+    updateCardProgress(card, vm, prog);
+
+    card.appendChild(main);
+
+    var actions = el('div', 'vm-card-actions');
+    var pa = primaryAction(vm);
+    var pb = el('button', 'primary grow', pa.label);
+    pb.type = 'button';
+    if (pa.disabled) pb.disabled = true;
+    else pb.onclick = pa.run;
+    actions.appendChild(pb);
+    if (vm.sshEnabled)
+        actions.appendChild(iconButton('ssh', ICONS.ssh, sshTitle(vm),
+            function() { sendCmd('sshConnect', { vmId: vm.id }); }, !sshReady(vm)));
+    actions.appendChild(iconButton('edit', ICONS.edit, 'Edit hardware (VM must be stopped)',
+        function() { openEditVmModal(vmIndexById(vm.id)); }, vm.running || isBusy(vm)));
+    var more = iconButton('more-btn', ICONS.more, 'More actions', function(e) {
+        if (openMenu && openMenu.anchor === more) closeVmMenu();
+        else showVmMenu(vm, more);
+    }, false);
+    more.setAttribute('aria-haspopup', 'menu');
+    actions.appendChild(more);
+    card.appendChild(actions);
+    return card;
+}
+
+function updateCardProgress(card, vm, prog) {
+    prog = prog || card.querySelector('[data-role="progress"]');
+    if (!prog) return;
+    var show = vm.buildingVhdx && !vm.vhdxStaging;
+    prog.hidden = !show;
+    if (show) prog.firstChild.style.width = Math.max(2, Math.min(100, vm.vhdxProgress || 0)) + '%';
+}
+
+/* Name kept from the table UI: every state change calls it. Rebuilds a card
+ * only when a field that changes its buttons changes, so install-progress
+ * ticks never destroy a button mid-click. */
 function renderVmTable() {
     updateEditVmModal();
     renderSnapshotModal();
-    var tbody = document.getElementById('vm-tbody');
 
-    if (vms.length === 0) {
-        rowCache = {};
-        rowSigCache = {};
-        tbody.innerHTML = '';
-        var tr = document.createElement('tr');
-        var td = document.createElement('td');
-        td.colSpan = hostBridge.isMac ? 16 : 17;
-        td.className = 'empty-state';
-        var btn = document.createElement('button');
-        btn.className = 'primary empty-state-btn';
-        btn.textContent = '+ Create your first sandbox';
-        btn.onclick = openCreateModal;
-        td.appendChild(btn);
-        tr.appendChild(td);
-        tbody.appendChild(tr);
-        return;
-    }
+    var grid = document.getElementById('vm-grid');
+    var running = vms.filter(function(v) { return v.running; }).length;
+    document.getElementById('nav-vm-count').textContent = vms.length;
+    document.getElementById('vm-summary').textContent = vms.length
+        ? running + ' running · ' + (vms.length - running) + ' stopped'
+        : 'No virtual machines yet';
+    document.querySelectorAll('#vm-filters .chip').forEach(function(c) {
+        var on = c.getAttribute('data-filter') === vmFilter;
+        c.classList.toggle('active', on);
+        c.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
 
-    /* Drop cached rows for VMs that no longer exist. */
     var seen = {};
     vms.forEach(function(vm) { seen[vm.id] = true; });
-    Object.keys(rowCache).forEach(function(name) {
-        if (!seen[name]) {
-            var stale = rowCache[name];
+    Object.keys(rowCache).forEach(function(id) {
+        if (!seen[id]) {
+            var stale = rowCache[id];
             if (stale.parentNode) stale.parentNode.removeChild(stale);
-            delete rowCache[name];
-            delete rowSigCache[name];
+            delete rowCache[id];
+            delete rowSigCache[id];
         }
     });
-
-    /* Remove any non-cached tbody children (e.g. leftover empty-state row). */
-    var kids = Array.prototype.slice.call(tbody.children);
-    kids.forEach(function(c) {
-        var cached = false;
-        for (var n in rowCache) { if (rowCache[n] === c) { cached = true; break; } }
-        if (!cached) tbody.removeChild(c);
+    Array.prototype.slice.call(grid.children).forEach(function(c) {
+        if (!c.classList.contains('vm-card')) grid.removeChild(c);
     });
 
-    /* Skip the cell rebuild when button-relevant fields are unchanged; the
-     * install progress tick would otherwise destroy the button DOM mid-click. */
+    if (vms.length === 0) {
+        var empty = el('div', 'empty-state');
+        empty.appendChild(el('h2', '', 'Create your first virtual machine'));
+        empty.appendChild(el('p', 'muted', 'Windows 11, Ubuntu or macOS, set up automatically from an installer image.'));
+        var btn = el('button', 'primary with-icon', 'New VM');
+        btn.type = 'button';
+        btn.onclick = openCreateModal;
+        empty.appendChild(btn);
+        grid.appendChild(empty);
+    }
+
+    var pos = 0;
     vms.forEach(function(vm, i) {
-        var tr = rowCache[vm.id];
-        var firstBuild = !tr;
-        if (!tr) {
-            tr = document.createElement('tr');
-            rowCache[vm.id] = tr;
-        }
-
-        var statusTd = tr.children[2] || document.createElement('td');
-        updateStatusCell(statusTd, vm);
-
+        var card = rowCache[vm.id];
         var sig = [
-            i, i === selectedVm, vm.name,
-            vm.running, vm.starting, vm.buildingVhdx, vm.shuttingDown, vm.agentOnline,
-            vm.installComplete, vm.isTemplate,
-            vm.sshEnabled, vm.sshState, vm.sshPort,
-            vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
-            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode,
-            selectedSnap.get(vm.id) || 'current',
-            /* Snapshot tree: take/delete/rename/branch must trigger a row rebuild
-               so makeSnapCell re-runs. These fields only change on user snapshot
-               actions (never on install-progress ticks — a VM can't be snapshotted
-               while running), so the rebuild-skip optimization above is preserved. */
-            vm.hasSnapshots, vm.snapCurrent, vm.snapCurrentBranch,
+            i === selectedVm, vm.name, vm.running, vm.starting, vm.buildingVhdx, vm.vhdxStaging,
+            vm.shuttingDown, vm.installComplete, vm.isTemplate,
+            vm.sshEnabled, vm.sshState, vm.sshPort, vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
+            vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.hasSnapshots,
+            selectedSnap.get(vm.id) || 'current', vm.snapCurrent, vm.snapCurrentBranch,
             JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || [])
         ].join('|');
 
-        if (!firstBuild && rowSigCache[vm.id] === sig) {
-            if (tbody.children[i] !== tr) {
-                tbody.insertBefore(tr, tbody.children[i] || null);
-            }
-            return;
+        if (!card || rowSigCache[vm.id] !== sig) {
+            var fresh = buildVmCard(vm);
+            if (card && card.parentNode) card.parentNode.replaceChild(fresh, card);
+            card = fresh;
+            rowCache[vm.id] = card;
+            rowSigCache[vm.id] = sig;
+        } else {
+            var badge = card.querySelector('[data-role="status"]');
+            if (badge) setBadge(badge, vm);
+            updateCardProgress(card, vm);
         }
-        rowSigCache[vm.id] = sig;
+        card.classList.toggle('selected', i === selectedVm);
 
-        tr.className = (i === selectedVm ? 'selected ' : '') +
-                       (vm.running ? 'running' : 'stopped');
-        tr.onclick = function(e) {
-            if (e.target.closest('.icon-btn')) return;
-            if (e.target.closest('.snap-cell')) return;
-            selectVm(vmIndexById(vm.id));
-        };
-
-        var cells = buildRowCells(vm, i, statusTd);
-
-        for (var c = 0; c < cells.length; c++) {
-            var newCell = cells[c];
-            var oldCell = tr.children[c];
-            if (oldCell === newCell) continue;
-            if (oldCell) tr.replaceChild(newCell, oldCell);
-            else tr.appendChild(newCell);
-        }
-        while (tr.children.length > cells.length) tr.removeChild(tr.lastChild);
-
-        if (tbody.children[i] !== tr) {
-            tbody.insertBefore(tr, tbody.children[i] || null);
-        }
+        var visible = vmMatchesFilter(vm);
+        card.hidden = !visible;
+        if (grid.children[pos] !== card) grid.insertBefore(card, grid.children[pos] || null);
+        pos++;
     });
+
+    renderVmDetail();
+    renderSettingsView();
 }
 
-function makeCell(text, title) {
-    var td = document.createElement('td');
-    td.textContent = text;
-    if (title) td.title = title;
-    return td;
+/* ---- Views ---- */
+
+function showView(name) {
+    closeVmMenu();
+    if (name !== 'vm') detailVmId = null;
+    ['vms', 'vm', 'settings'].forEach(function(v) {
+        document.getElementById('view-' + v).hidden = v !== name;
+    });
+    document.querySelectorAll('.nav-item').forEach(function(n) {
+        var target = n.getAttribute('data-view');
+        var on = target === name || (name === 'vm' && target === 'vms');
+        n.classList.toggle('active', on);
+        if (on) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current');
+    });
+    if (name === 'settings') renderSettingsView();
 }
 
-function makeIconCell(cls, icon, active, handler, extraClass, title) {
-    var td = document.createElement('td');
-    td.className = 'icon-col';
-    var btn = document.createElement('button');
-    btn.className = 'icon-btn ' + cls + (active ? '' : ' inactive') + (extraClass ? ' ' + extraClass : '');
-    btn.textContent = icon;
-    if (title) btn.title = title;
-    if (active) btn.onclick = handler;
-    else btn.disabled = true;
-    td.appendChild(btn);
-    return td;
+function openVmDetail(id) {
+    var idx = vmIndexById(id);
+    if (idx < 0) return;
+    detailVmId = id;
+    selectedVm = idx;
+    sendCmd('selectVm', { vmId: id });
+    showView('vm');
+    detailVmId = id;
+    renderVmDetail();
+}
+
+function showVmTab(tab) {
+    detailTab = tab;
+    renderVmDetail();
+}
+
+function detailRow(label, value) {
+    var row = el('div', 'row');
+    var text = el('div', 'row-text');
+    text.appendChild(el('span', 'row-label', label));
+    row.appendChild(text);
+    row.appendChild(el('span', 'row-value', value));
+    return row;
+}
+
+function fillRows(container, rows) {
+    container.textContent = '';
+    rows.forEach(function(r) { container.appendChild(detailRow(r[0], r[1])); });
+}
+
+function displaySupported(vm) {
+    return !hostBridge.isMac && vm.osType === 'Windows' && !vm.isTemplate;
+}
+
+function renderVmDetail() {
+    if (!detailVmId) return;
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) { showView('vms'); return; }
+
+    document.getElementById('vmd-name').textContent = vm.name;
+    setBadge(document.getElementById('vmd-status'), vm);
+    document.getElementById('vmd-sub').textContent = vm.osType + ' · ' + gpuLabel(vm) +
+        (vm.running && vm.agentOnline ? ' · agent connected' : '');
+
+    /* Header actions: rebuilt only when they would change. */
+    var actions = document.getElementById('vmd-actions');
+    var bld = isBusy(vm);
+    var sig = [vm.id, vm.running, bld, vm.isTemplate, vm.sshEnabled, sshReady(vm)].join('|');
+    if (actions.getAttribute('data-sig') !== sig) {
+        actions.setAttribute('data-sig', sig);
+        actions.textContent = '';
+        var pa = primaryAction(vm);
+        var pb = el('button', 'primary', pa.label);
+        pb.type = 'button';
+        if (pa.disabled) pb.disabled = true; else pb.onclick = pa.run;
+        actions.appendChild(pb);
+        if (vm.sshEnabled) {
+            var sb = el('button', '', 'SSH');
+            sb.type = 'button';
+            sb.title = sshTitle(vm);
+            if (!sshReady(vm)) sb.disabled = true;
+            else sb.onclick = function() { sendCmd('sshConnect', { vmId: vm.id }); };
+            actions.appendChild(sb);
+        }
+        var sd = el('button', '', 'Shut down');
+        sd.type = 'button';
+        if (!vm.running || bld) sd.disabled = true;
+        else sd.onclick = function() { sendCmd('shutdownVm', { vmId: vm.id }); };
+        actions.appendChild(sd);
+        var fs = el('button', 'danger-outline', 'Force stop');
+        fs.type = 'button';
+        if (!vm.running || bld) fs.disabled = true;
+        else fs.onclick = function() { onStopVm(vmIndexById(vm.id)); };
+        actions.appendChild(fs);
+        var del = el('button', 'danger-outline', 'Delete');
+        del.type = 'button';
+        if (bld) del.disabled = true;
+        else del.onclick = function() { onDeleteVm(vmIndexById(vm.id)); };
+        actions.appendChild(del);
+    }
+
+    /* Tabs */
+    var showDisplay = displaySupported(vm);
+    var showSnaps = !hostBridge.isMac && !vm.isTemplate;
+    if ((detailTab === 'display' && !showDisplay) || (detailTab === 'snapshots' && !showSnaps)) detailTab = 'overview';
+    document.querySelectorAll('#vmd-tabs .tab').forEach(function(t) {
+        var name = t.getAttribute('data-tab');
+        if (name === 'display') t.hidden = !showDisplay;
+        if (name === 'snapshots') t.hidden = !showSnaps;
+        var on = name === detailTab;
+        t.classList.toggle('active', on);
+        if (on) t.setAttribute('aria-current', 'page'); else t.removeAttribute('aria-current');
+    });
+    document.querySelectorAll('#view-vm .tab-panel').forEach(function(p) {
+        p.hidden = p.getAttribute('data-panel') !== detailTab;
+    });
+
+    var overview = [
+        ['Status', vmStatus(vm).label],
+        ['Operating system', vm.osType + (vm.isTemplate ? ' (template)' : '')],
+        ['In-VM agent', !vm.running ? 'VM is off' : vm.agentOnline ? 'Connected' : 'Not connected'],
+        ['Network', hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None') + (vm.networkMode === 2 && vm.netAdapter ? ' · ' + vm.netAdapter : '')]
+    ];
+    if (vm.sshEnabled) overview.push(['SSH', 'localhost:' + vm.sshPort]);
+    if (vm.diskDirectory) overview.push(['Disk folder', vm.diskDirectory]);
+    fillRows(document.getElementById('vmd-overview'), overview);
+
+    fillRows(document.getElementById('vmd-hardware'), [
+        ['Processors', vm.cpuCores + ' vCPU'],
+        ['Memory', vm.ramMb + ' MB'],
+        ['Disk', vm.hddGb + ' GB'],
+        ['GPU', gpuLabel(vm)],
+        ['Network', hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None')]
+    ]);
+    var editHw = document.getElementById('vmd-edit-hw');
+    editHw.disabled = !!(vm.running || bld);
+    editHw.title = editHw.disabled ? 'Stop the VM to change its hardware' : '';
+
+    if (showDisplay) renderDisplayTab(vm);
+
+    if (showSnaps) {
+        var snaps = (vm.snapshots || []).filter(function(s) { return s && s.name; }).length;
+        fillRows(document.getElementById('vmd-snapshots'), [
+            ['Boots from', vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.id) || 'current') : 'Current disk'],
+            ['Snapshots', String(snaps)]
+        ]);
+        document.getElementById('vmd-open-snaps').disabled = bld;
+    }
+}
+
+/* ---- Display tab ---- */
+
+const DISPLAY_PRESETS = [
+    ['1280x720', 'HD'], ['1600x900', 'HD+'], ['1920x1080', 'Full HD'], ['1920x1200', '16:10'],
+    ['2560x1440', 'QHD'], ['3440x1440', 'Ultrawide'], ['3840x2160', '4K']
+];
+const DISPLAY_RATES = [60, 120, 144];
+let lastFixedResolution = {};
+
+function renderDisplayTab(vm) {
+    var res = vm.displayResolution || '1920x1080';
+    var hz = vm.displayHz || 60;
+    var adaptive = res === 'adaptive';
+    if (!adaptive) lastFixedResolution[vm.id] = res;
+
+    document.querySelectorAll('#view-vm [data-mode]').forEach(function(b) {
+        var on = (b.getAttribute('data-mode') === 'adaptive') === adaptive;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+
+    var grid = document.getElementById('vmd-presets');
+    grid.hidden = adaptive;
+    var psig = res;
+    if (grid.getAttribute('data-sig') !== psig) {
+        grid.setAttribute('data-sig', psig);
+        grid.textContent = '';
+        DISPLAY_PRESETS.forEach(function(p) {
+            var b = el('button', 'preset' + (p[0] === res ? ' active' : ''));
+            b.type = 'button';
+            b.setAttribute('aria-pressed', p[0] === res ? 'true' : 'false');
+            b.appendChild(el('span', '', p[0].replace('x', ' × ')));
+            b.appendChild(el('span', 'preset-note', p[1]));
+            b.onclick = function() { setDisplayChoice('fixed', p[0]); };
+            grid.appendChild(b);
+        });
+    }
+
+    var rates = document.getElementById('vmd-rates');
+    if (rates.getAttribute('data-sig') !== String(hz)) {
+        rates.setAttribute('data-sig', String(hz));
+        rates.textContent = '';
+        DISPLAY_RATES.forEach(function(r) {
+            var b = el('button', r === hz ? 'active' : '', r + ' Hz');
+            b.type = 'button';
+            b.setAttribute('aria-pressed', r === hz ? 'true' : 'false');
+            b.onclick = function() { setDisplayRate(r); };
+            rates.appendChild(b);
+        });
+    }
+}
+
+function setDisplayChoice(mode, preset) {
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) return;
+    var res = mode === 'adaptive' ? 'adaptive'
+        : (preset || lastFixedResolution[vm.id] || '1920x1080');
+    sendDisplayMode(vm, res, vm.displayHz || 60);
+}
+
+function setDisplayRate(hz) {
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) return;
+    sendDisplayMode(vm, vm.displayResolution || '1920x1080', hz);
+}
+
+function sendDisplayMode(vm, res, hz) {
+    vm.displayResolution = res;   /* optimistic; the host echoes the saved values */
+    vm.displayHz = hz;
+    renderVmDetail();
+    sendCmd('setDisplayMode', { vmId: vm.id, resolution: res, hz: hz });
+}
+
+/* ---- Settings ---- */
+
+const ACCENTS = [['Blue', '#4EA6F5'], ['Indigo', '#7C8CF8'], ['Green', '#3CCB9A'], ['Orange', '#F2A65A']];
+
+function storedPref(key, fallback) {
+    try { return localStorage.getItem(key) || fallback; } catch (e) { return fallback; }
+}
+function storePref(key, value) {
+    try { localStorage.setItem(key, value); } catch (e) {}
+}
+
+function setTheme(theme) {
+    storePref('ui_theme', theme);
+    if (theme === 'system') document.documentElement.removeAttribute('data-theme');
+    else document.documentElement.setAttribute('data-theme', theme);
+    renderSettingsView();
+}
+
+function setAccent(hex) {
+    storePref('ui_accent', hex);
+    document.documentElement.style.setProperty('--accent', hex);
+    renderSettingsView();
+}
+
+function setCloseBehavior(value) {
+    sendCmd('setCloseBehavior', { toTray: value === 'tray' });
+}
+
+function renderSettingsView() {
+    if (document.getElementById('view-settings').hidden) return;
+    var theme = storedPref('ui_theme', 'dark');
+    document.querySelectorAll('[data-theme-choice]').forEach(function(b) {
+        var on = b.getAttribute('data-theme-choice') === theme;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+
+    var accent = storedPref('ui_accent', ACCENTS[0][1]);
+    var sw = document.getElementById('set-accent');
+    if (sw.getAttribute('data-sig') !== accent) {
+        sw.setAttribute('data-sig', accent);
+        sw.textContent = '';
+        ACCENTS.forEach(function(a) {
+            var b = el('button', 'swatch' + (a[1].toLowerCase() === accent.toLowerCase() ? ' active' : ''));
+            b.type = 'button';
+            b.style.background = a[1];
+            b.setAttribute('aria-label', a[0]);
+            b.setAttribute('aria-pressed', a[1].toLowerCase() === accent.toLowerCase() ? 'true' : 'false');
+            b.onclick = function() { setAccent(a[1]); };
+            sw.appendChild(b);
+        });
+    }
+
+    if (lastHostInfo && !hostBridge.isMac)
+        document.getElementById('set-close').value = lastHostInfo.closeToTrayWithoutAsking ? 'tray' : 'ask';
+
+    var rows = [];
+    if (lastHostInfo) {
+        rows.push(['Processors', lastHostInfo.hostCores + ' cores']);
+        rows.push(['Memory', ramLabel(lastHostInfo.hostRamMb)]);
+        if (Array.isArray(lastHostInfo.gpus) && lastHostInfo.gpus.length)
+            rows.push(['GPUs', lastHostInfo.gpus.map(function(g) { return g.name; }).join(', ')]);
+        if (lastHostInfo.defaultDiskDirectory) rows.push(['Default VM folder', lastHostInfo.defaultDiskDirectory]);
+        if (lastHostInfo.freeGb >= 0) rows.push(['Free space there', lastHostInfo.freeGb + ' GB']);
+    }
+    fillRows(document.getElementById('set-host'), rows);
+}
+
+/* Sidebar resource meters. */
+function updateHostMeters(info) {
+    if (!info) return;
+    var cpuPct = info.hostCores ? Math.min(100, Math.round(100 * info.vmCores / info.hostCores)) : 0;
+    var ramPct = info.hostRamMb ? Math.min(100, Math.round(100 * info.vmRamMb / info.hostRamMb)) : 0;
+    document.getElementById('res-cpu').textContent = info.vmCores + ' / ' + info.hostCores + ' cores';
+    document.getElementById('res-cpu-bar').style.width = cpuPct + '%';
+    document.getElementById('res-ram').textContent = ramLabel(info.vmRamMb) + ' / ' + ramLabel(info.hostRamMb);
+    document.getElementById('res-ram-bar').style.width = ramPct + '%';
+    document.getElementById('res-disk').textContent = info.freeGb >= 0 ? info.freeGb + ' GB' : '–';
+    var gpus = Array.isArray(info.gpus) ? info.gpus : [];
+    var g = document.getElementById('res-gpu');
+    g.textContent = gpus.length ? gpus[0].name + (gpus.length > 1 ? ' +' + (gpus.length - 1) : '') : 'None';
+    g.title = gpus.map(function(x) { return x.name; }).join('\n');
 }
 
 /* ---- VM Selection ---- */
@@ -1224,7 +1603,7 @@ function vmIndexById(id) {
 function openEditVmModal(idx) {
     var vm = vms[idx];
     if (!vm || vm.running || vm.buildingVhdx) return;
-    editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: rowCache[vm.id].querySelector('.edit') };
+    editVmState = { id: vm.id, name: vm.name, initial: Object.assign({}, vm), previousFocus: modalOpener(vm.id) };
     document.getElementById('edit-vm-title').textContent = 'Edit ' + vm.name;
     document.getElementById('edit-ram-size').value = vm.ramMb;
     document.getElementById('edit-ram-size').min = hostBridge.isMac ? 512 : 4000;
@@ -1240,6 +1619,14 @@ function closeEditVmModal() {
     document.getElementById('edit-vm-overlay').classList.remove('active');
     restoreVmModalFocus(editVmState, '.edit');
     editVmState = null;
+}
+
+/* The control that opened a dialog, to give focus back when it closes. */
+function modalOpener(id) {
+    var a = document.activeElement;
+    if (a && a !== document.body && a.isConnected) return a;
+    var card = rowCache[id];
+    return card ? card.querySelector('.more-btn') : null;
 }
 
 function restoreVmModalFocus(state, selector) {
@@ -1470,19 +1857,6 @@ function snapshotPath(vm, value) {
     return path;
 }
 
-function makeSnapCell(vm, vmIdx) {
-    var td = document.createElement('td');
-    td.className = 'snap-cell';
-    var button = document.createElement('button');
-    button.className = 'snap-open';
-    button.textContent = vm.hasSnapshots ? snapshotPath(vm, selectedSnap.get(vm.id) || 'current') : 'No snapshots';
-    button.title = 'Snapshots — ' + button.textContent;
-    button.setAttribute('aria-haspopup', 'dialog');
-    button.onclick = function(e) { e.stopPropagation(); openSnapshotModal(vmIndexById(vm.id)); };
-    td.appendChild(button);
-    return td;
-}
-
 function openSnapshotModal(idx) {
     var vm = vms[idx];
     if (!vm || hostBridge.isMac) return;
@@ -1493,7 +1867,7 @@ function openSnapshotModal(idx) {
         currentPath: snapshotPath(vm, value),
         selectedValue: null,
         treeSignature: snapshotTreeSignature(vm),
-        previousFocus: rowCache[vm.id].querySelector('.snap-open'),
+        previousFocus: modalOpener(vm.id),
         signature: null
     };
     document.getElementById('snapshot-title').textContent = 'Snapshots — ' + vm.name;
@@ -1726,6 +2100,7 @@ function appendLog(msg) {
     div.className = 'log-line';
     div.textContent = msg;
     panel.appendChild(div);
+    document.getElementById('log-last').textContent = msg;
     panel.scrollTop = panel.scrollHeight;
 }
 
@@ -1846,33 +2221,14 @@ function modalResolve(result) {
 /* ---- Minimum size reporting ---- */
 
 function reportMinSize() {
-    var minW = 0;
-
-    /* Measure <table> elements directly — they always report true natural width */
-    var tables = document.querySelectorAll('table');
-    tables.forEach(function(t) {
-        if (t.scrollWidth > minW) minW = t.scrollWidth;
-    });
-
-    /* Add wrapper border (2px) + body padding (24px) */
-    minW += 28;
-
-    /* Height: sum of all sections at minimum height (log just needs ~100px) */
-    var minH = 0;
-    var sections = document.querySelectorAll('section');
-    sections.forEach(function(s, i) {
-        if (i < sections.length - 1) {
-            minH += s.scrollHeight + 12;
-        } else {
-            minH += 100;
-        }
-    });
-    minH += 16;
-
-    sendCmd('setMinSize', { width: minW, height: minH });
+    /* The layout reflows down to a narrow window (collapsed sidebar), so a
+       fixed floor is enough. */
+    sendCmd('setMinSize', { width: 760, height: 560 });
 }
 
 /* ---- Init ---- */
+showView('vms');
+
 /* Signal to C that the UI is ready */
 sendCmd('uiReady');
 

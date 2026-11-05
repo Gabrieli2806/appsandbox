@@ -324,6 +324,7 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_int(jb, L"freeGb", free_gb);
     jb_int(jb, L"vmHddGb", (int)vm_hdd_gb);
     jb_string(jb, L"defaultDiskDirectory", base_dir);
+    jb_bool(jb, L"closeToTrayWithoutAsking", asb_get_suppress_tray_warn());
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -396,6 +397,15 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_int(jb, L"sshState", (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state);
     jb_bool(jb, L"sshDeployKey", v->ssh_deploy_key);
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
+
+    /* Display mode (Windows guests; the IDD window owns the settings file). */
+    if (_wcsicmp(v->os_type, L"Windows") == 0) {
+        wchar_t res[32];
+        UINT hz = 60;
+        vm_display_idd_saved_mode(v->vhdx_path, res, ARRAYSIZE(res), &hz);
+        jb_string(jb, L"displayResolution", res);
+        jb_int(jb, L"displayHz", (int)hz);
+    }
 
     /* Snapshot tree */
     {
@@ -1374,6 +1384,32 @@ static void handle_webview2_message(const wchar_t *json)
             ui_show_alert(L"VM configuration could not be updated.");
         }
         send_vm_list();
+    } else if (wcscmp(action, L"setDisplayMode") == 0) {
+        /* {vmId, resolution: "adaptive"|"WxH", hz} from the VM's Display tab. */
+        int idx, hz = 0, i;
+        wchar_t res[32];
+        VmInstance *v;
+        VmDisplayIdd *display = NULL;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
+            json_get_string(json, L"resolution", res, ARRAYSIZE(res)) &&
+            json_get_int(json, L"hz", &hz) &&
+            (v = asb_vm_instance(asb_vm_get(idx))) != NULL &&
+            _wcsicmp(v->os_type, L"Windows") == 0) {
+            for (i = 0; i < ASB_MAX_VMS; i++)
+                if (g_display_vm_ids[i] == v->unique_id && g_idd_displays[i] &&
+                    vm_display_idd_is_open(g_idd_displays[i]))
+                    display = g_idd_displays[i];
+            if (!vm_display_idd_set_mode(display, v->vhdx_path, res, (UINT)hz))
+                ui_show_alert(L"That display mode is not available.");
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"setCloseBehavior") == 0) {
+        /* {toTray: true} = hide to the tray without asking; false = ask. */
+        BOOL to_tray = FALSE;
+        json_get_bool(json, L"toTray", &to_tray);
+        asb_set_suppress_tray_warn(to_tray);
+        asb_save();
+        send_host_info();
     } else if (wcscmp(action, L"selectVm") == 0) {
     } else if (wcscmp(action, L"getDiskSpace") == 0) {
         wchar_t *copy = _wcsdup(json);

@@ -147,6 +147,7 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
 #define WM_IDD_FRAME_CONNECTED  (WM_USER + 104)
+#define WM_IDD_SET_MODE         (WM_USER + 105)  /* wp = res_choice + 1, lp = Hz */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -805,6 +806,65 @@ out:
     if (res_choice) *res_choice = res;
     if (refresh_hz) *refresh_hz = hz;
     return transmit;
+}
+
+/* Parse "adaptive" / "WxH" into a res_choice. FALSE if it is not offered. */
+static BOOL idd_res_choice_from_text(const wchar_t *res, int *choice)
+{
+    unsigned int w = 0, h = 0;
+    int i;
+    if (!res) return FALSE;
+    if (_wcsicmp(res, L"adaptive") == 0) { *choice = RES_ADAPTIVE; return TRUE; }
+    if (swscanf_s(res, L"%ux%u", &w, &h) != 2) return FALSE;
+    for (i = 0; i < (int)ARRAYSIZE(g_res_presets); i++)
+        if (g_res_presets[i].w == w && g_res_presets[i].h == h) { *choice = i; return TRUE; }
+    return FALSE;
+}
+
+void vm_display_idd_saved_mode(const wchar_t *vhdx_path, wchar_t *res, size_t res_chars,
+                               UINT *hz)
+{
+    int choice = RES_DEFAULT_PRESET;
+    UINT rate = 60;
+    wchar_t path[MAX_PATH];
+
+    /* Read only: do not create the file just because the UI looked. */
+    if (vhdx_path && vhdx_path[0]) {
+        idd_display_settings_path(vhdx_path, path, MAX_PATH);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, &choice, &rate);
+    }
+    if (res && res_chars) {
+        if (choice == RES_ADAPTIVE)
+            wcscpy_s(res, res_chars, L"adaptive");
+        else
+            swprintf_s(res, res_chars, L"%ux%u", g_res_presets[choice].w, g_res_presets[choice].h);
+    }
+    if (hz) *hz = rate;
+}
+
+BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
+                             const wchar_t *res, UINT hz)
+{
+    int choice, i;
+    BOOL hz_ok = FALSE;
+    BOOL h2g = TRUE, g2h = TRUE, hotkeys;
+    int old_choice;
+    UINT old_hz;
+
+    if (!idd_res_choice_from_text(res, &choice)) return FALSE;
+    for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
+        if (g_refresh_rates[i] == hz) hz_ok = TRUE;
+    if (!hz_ok) return FALSE;
+
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd)) {
+        PostMessageW(display->hwnd, WM_IDD_SET_MODE, (WPARAM)(choice + 1), (LPARAM)hz);
+        return TRUE;
+    }
+    if (!vhdx_path || !vhdx_path[0]) return FALSE;
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &old_choice, &old_hz);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz);
+    return TRUE;
 }
 
 /* Save every per-VM display setting from the live display state. */
@@ -3024,6 +3084,17 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_apply_display_mode(d, FALSE);
         } else if (wp == IDT_APPLY_MODE && d) {
             KillTimer(hwnd, IDT_APPLY_MODE);
+            idd_apply_display_mode(d, TRUE);
+        }
+        return 0;
+
+    case WM_IDD_SET_MODE:
+        /* From the management UI (vm_display_idd_set_mode). */
+        if (d && d->mode_supported) {
+            d->res_choice = (int)wp - 1;
+            d->refresh_hz = (UINT)lp;
+            idd_update_display_menu(d);
+            idd_save_settings(d);
             idd_apply_display_mode(d, TRUE);
         }
         return 0;
