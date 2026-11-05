@@ -70,53 +70,63 @@ static BOOL device_is_vdd(const wchar_t *device)
     return EnumDisplayDevicesW(device, 0, &mon, 0) && wcsstr(mon.DeviceID, L"ASB0001") != NULL;
 }
 
-/* Make the AppSandbox display the primary and only active display. Only it
-   reaches the host window, so any other attached display (e.g. Hyper-V Video
-   after a driver update) just holds windows the user cannot see and moves
-   the desktop origin, which breaks mouse placement. */
-static void make_vdd_only(const wchar_t *vdd)
+/* The Hyper-V synthetic video adapter (or the basic display adapter Windows
+   falls back to). Nothing reaches the host through it. */
+static BOOL is_hyperv_display(const DISPLAY_DEVICEW *dd)
+{
+    return wcsstr(dd->DeviceString, L"Hyper-V") != NULL ||
+           wcsstr(dd->DeviceString, L"Basic Display") != NULL;
+}
+
+/* Hyper-V Video can come back (e.g. after a driver update) and become the
+   primary display, putting the AppSandbox display beside it: windows land
+   half off the visible screen. Detach only that adapter, and make the
+   AppSandbox display primary only when Hyper-V Video held that role. Other
+   displays -- a Sunshine/Apollo virtual display, say -- are left alone; the
+   input helper places the mouse correctly wherever the displays sit. */
+static void detach_hyperv_display(const wchar_t *vdd)
 {
     DISPLAY_DEVICEW dd;
     DWORD i;
-    int others = 0;
-    BOOL vdd_primary = FALSE;
+    BOOL hyperv_attached = FALSE, hyperv_primary = FALSE, changed = FALSE;
     DEVMODEW dm;
-    LONG rc;
 
     for (i = 0; ; i++) {
         memset(&dd, 0, sizeof(dd));
         dd.cb = sizeof(dd);
         if (!EnumDisplayDevicesW(NULL, i, &dd, 0)) break;
         if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
-        if (_wcsicmp(dd.DeviceName, vdd) == 0)
-            vdd_primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
-        else
-            others++;
+        if (_wcsicmp(dd.DeviceName, vdd) == 0 || !is_hyperv_display(&dd)) continue;
+        hyperv_attached = TRUE;
+        if (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) hyperv_primary = TRUE;
     }
-    if (vdd_primary && others == 0) return;
+    if (!hyperv_attached) return;
 
-    memset(&dm, 0, sizeof(dm));
-    dm.dmSize = sizeof(dm);
-    if (!EnumDisplaySettingsW(vdd, ENUM_CURRENT_SETTINGS, &dm)) return;
-    dm.dmFields = DM_POSITION;
-    dm.dmPosition.x = 0;
-    dm.dmPosition.y = 0;
-    ChangeDisplaySettingsExW(vdd, &dm, NULL, CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
-
+    if (hyperv_primary) {
+        memset(&dm, 0, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(vdd, ENUM_CURRENT_SETTINGS, &dm)) {
+            dm.dmFields = DM_POSITION;
+            dm.dmPosition.x = 0;
+            dm.dmPosition.y = 0;
+            ChangeDisplaySettingsExW(vdd, &dm, NULL, CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+            changed = TRUE;
+        }
+    }
     for (i = 0; ; i++) {
         DEVMODEW off;
         memset(&dd, 0, sizeof(dd));
         dd.cb = sizeof(dd);
         if (!EnumDisplayDevicesW(NULL, i, &dd, 0)) break;
         if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
-        if (_wcsicmp(dd.DeviceName, vdd) == 0) continue;
+        if (_wcsicmp(dd.DeviceName, vdd) == 0 || !is_hyperv_display(&dd)) continue;
         memset(&off, 0, sizeof(off));
         off.dmSize = sizeof(off);
         off.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;   /* 0x0 = detach */
         ChangeDisplaySettingsExW(dd.DeviceName, &off, NULL, CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+        changed = TRUE;
     }
-    rc = ChangeDisplaySettingsExW(NULL, NULL, NULL, 0, NULL);
-    fprintf(stderr, "layout:vdd_only(%d others, rc=%ld) ", others, rc);
+    if (changed) ChangeDisplaySettingsExW(NULL, NULL, NULL, 0, NULL);
 }
 
 static BOOL find_mode(const wchar_t *device, DWORD w, DWORD h, DWORD hz, DEVMODEW *out)
@@ -152,7 +162,7 @@ static int set_mode(DWORD w, DWORD h, DWORD hz)
        to settle; poll for up to ~10 s. */
     for (attempt = 0; attempt < 40; attempt++) {
         if (find_vdd_display(device, 32)) {
-            if (device_is_vdd(device)) make_vdd_only(device);
+            if (device_is_vdd(device)) detach_hyperv_display(device);
             memset(&cur, 0, sizeof(cur));
             cur.dmSize = sizeof(cur);
             if (EnumDisplaySettingsW(device, ENUM_CURRENT_SETTINGS, &cur) &&
