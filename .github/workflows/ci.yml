@@ -1,0 +1,81 @@
+# Build check for pull requests and branch pushes.
+#
+# Builds the whole solution (app, guest tools, drivers) for Release x64 and
+# ARM64 with Visual Studio 2022 + the WDK, the same way as
+# windows-test-build.yml, but packages and publishes nothing. release/**
+# branches are left out because windows-test-build.yml already builds them.
+# A Linux job checks the web UI for syntax errors and the core source lists.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches-ignore:
+      - 'release/**'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A new push to a pull request cancels that pull request's older run. Other
+# runs get a group of their own, so they never wait for or cancel each other.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Release ${{ matrix.platform }}
+    runs-on: windows-2022
+    timeout-minutes: 90
+    # ARM64 is a cross-build on the x64 runner. Directory.Build.props already
+    # turns off ApiValidator for that case: the x86 ApiExtractor cannot read
+    # ARM64 binaries. The build also needs the runner image's ARM64 MSVC
+    # tools, ARM64 Spectre-mitigated libraries (the VDD sets
+    # Driver_SpectreMitigation) and the WDK's ARM64 parts. No workflow has
+    # built ARM64 on a hosted runner yet (windows-test-build.yml builds x64
+    # only), so a failure on this leg is reported but does not fail the run.
+    # Set experimental to false once the leg has passed.
+    continue-on-error: ${{ matrix.experimental }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x64
+            experimental: false
+          - platform: ARM64
+            experimental: true
+    env:
+      # tools/sign/AppSandboxPackage.vcxproj runs make-release.ps1 after every
+      # Release build unless $(ASB_SKIP_PACKAGE_PROJECT) is 1. MSBuild reads
+      # environment variables as properties, so this skips it.
+      ASB_SKIP_PACKAGE_PROJECT: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      # cmd, not pwsh: the driver packages' post-build steps run Windows
+      # PowerShell 5, which cannot load its own modules when it inherits
+      # PowerShell 7's PSModulePath.
+      - name: Build Release|${{ matrix.platform }}
+        shell: cmd
+        run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=${{ matrix.platform }} /m /v:minimal /nologo
+
+  lint:
+    name: Web UI syntax and source lists
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax-check web/app.js
+        run: node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"
+
+      # Compares src/core with AppSandboxCore.vcxproj and the Xcode project.
+      # It reports src/core/asb_vm_id.h, which neither project file lists. The
+      # header is found through the include path, so the builds still work.
+      # This step stays non-blocking until both project files list the header.
+      - name: Check src/core against the project files
+        continue-on-error: true
+        run: python3 tools/check-sources.py

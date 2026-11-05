@@ -61,6 +61,13 @@ Stale, ignore: `tools/agent/build.cmd`, `tools/agent/deploy.bat`, the
   driver code needs the WDK and can only be compiled in CI.
 - JS: `node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"`
   catches syntax errors.
+- CI: `ci.yml` builds Release x64 and ARM64 for every pull request and every
+  push outside `release/**` (an ARM64 failure does not fail the run yet), and
+  runs the JS check and `tools/check-sources.py` on Linux. `codeql.yml` runs
+  CodeQL on the user-mode host projects for pull requests, `main`,
+  `release/**` and once a week. Set `ASB_SKIP_PACKAGE_PROJECT=1` (environment
+  variable or `/p:`) to stop `AppSandboxPackage` from running
+  `make-release.ps1` after a Release build.
 
 ## 4. Host ↔ guest channels
 

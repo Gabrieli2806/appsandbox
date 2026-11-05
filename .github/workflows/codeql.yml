@@ -1,0 +1,69 @@
+# CodeQL static analysis of the C/C++ code.
+#
+# Builds only these user-mode projects, not the drivers or the other guest
+# tools:
+#   /t:AppSandbox  builds AppSandbox.exe and the projects it depends on in
+#                  AppSandbox.sln: AppSandboxCore (appsandbox_core.dll), agent
+#                  (its post-build creates release\resources, which
+#                  AppSandbox's post-build copies) and the four NVIDIA shims.
+#   /t:iso-patch   builds iso-patch.exe, the host tool that turns installer
+#                  ISOs into VHDX images (squashfs, ext4 and xz parsers).
+# AppSandbox.exe and appsandbox_core.dll read data from the VM, which is
+# untrusted, and iso-patch.exe reads downloaded images. The drivers
+# (VDD, VAD, ivshmem and their packages) are left out because a WDK build adds
+# WPP preprocessing, PREfast (/analyze), Inf2Cat and test signing. These steps
+# slow down the CodeQL build tracer and are the most likely to break under it.
+# CodeQL's default C/C++ queries are also not written for KMDF/UMDF code.
+# ci.yml still compiles the drivers on every pull request. Microsoft's driver
+# query pack (microsoft/Windows-Driver-Developer-Supplemental-Tools) could
+# analyse the drivers in a later, separate job.
+name: CodeQL
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - 'release/**'
+  schedule:
+    - cron: '27 4 * * 1'   # Mondays 04:27 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  # Needed only in private repositories (and private forks), where CodeQL
+  # reads the workflow run to upload its results.
+  actions: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  analyze:
+    name: Analyze (c-cpp)
+    runs-on: windows-2022
+    timeout-minutes: 90
+    env:
+      # The targets below do not include AppSandboxPackage. This variable
+      # stops it from running make-release.ps1 if it is ever built here.
+      ASB_SKIP_PACKAGE_PROJECT: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: c-cpp
+          build-mode: manual
+
+      - uses: microsoft/setup-msbuild@v2
+
+      # cmd, as in ci.yml and windows-test-build.yml.
+      - name: Build host projects (Release|x64)
+        shell: cmd
+        run: msbuild AppSandbox.sln /t:AppSandbox /t:iso-patch /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: /language:c-cpp
