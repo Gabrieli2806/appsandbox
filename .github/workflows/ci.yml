@@ -28,23 +28,15 @@ jobs:
     name: Build Release ${{ matrix.platform }}
     runs-on: windows-2022
     timeout-minutes: 90
-    # ARM64 is a cross-build on the x64 runner. Directory.Build.props already
-    # turns off ApiValidator for that case: the x86 ApiExtractor cannot read
-    # ARM64 binaries. The build also needs the runner image's ARM64 MSVC
-    # tools, ARM64 Spectre-mitigated libraries (the VDD sets
-    # Driver_SpectreMitigation) and the WDK's ARM64 parts. No workflow has
-    # built ARM64 on a hosted runner yet (windows-test-build.yml builds x64
-    # only), so a failure on this leg is reported but does not fail the run.
-    # Set experimental to false once the leg has passed.
-    continue-on-error: ${{ matrix.experimental }}
+    # ARM64 is a cross-build on the x64 runner (Directory.Build.props turns
+    # off ApiValidator for it: the x86 ApiExtractor cannot read ARM64
+    # binaries). Both legs must pass.
     strategy:
       fail-fast: false
       matrix:
         include:
           - platform: x64
-            experimental: false
           - platform: ARM64
-            experimental: true
     env:
       # tools/sign/AppSandboxPackage.vcxproj runs make-release.ps1 after every
       # Release build unless $(ASB_SKIP_PACKAGE_PROJECT) is 1. MSBuild reads
