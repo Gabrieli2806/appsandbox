@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include "ui.h"
 #include "headless.h"
+#include "asb_paths.h"
 
 /* Find the management window of an already running AppSandbox and ask it to
    show itself. The window may still be starting up, so retry briefly.
@@ -88,6 +89,14 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR pCmdLine
 
     /* Initialize OLE/COM (required for WebView2) */
     OleInitialize(NULL);
+
+    /* MSIX install: the app folder is read-only, so relative writes (the
+       log) go to %ProgramData%\AppSandbox. */
+    if (asb_running_packaged()) {
+        wchar_t data[MAX_PATH];
+        asb_program_data_dir(data, MAX_PATH);
+        SetCurrentDirectoryW(data);
+    }
 
     /* Headless daemon mode: appsandbox.exe --headless
        (normal launches pass no args, so the GUI path below is unaffected). */

@@ -1,4 +1,5 @@
 #include "gpu_enum.h"
+#include "asb_paths.h"
 #include "ui.h"
 #include <setupapi.h>
 #include <devguid.h>
@@ -767,6 +768,29 @@ BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverSha
     }
     if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_DIRECTORY))
         return FALSE;
+
+    /* MSIX: the VM worker cannot read the WindowsApps folder, so share a
+       copy kept in %ProgramData%\AppSandbox\nvidia. */
+    if (asb_running_packaged()) {
+        wchar_t mirror[MAX_PATH], pat[MAX_PATH], from[MAX_PATH], to[MAX_PATH];
+        WIN32_FIND_DATAW fd;
+        HANDLE h;
+        asb_program_data_dir(mirror, MAX_PATH);
+        wcscat_s(mirror, MAX_PATH, L"\\nvidia");
+        CreateDirectoryW(mirror, NULL);
+        swprintf_s(pat, MAX_PATH, L"%s\\*", path);
+        h = FindFirstFileW(pat, &fd);
+        if (h != INVALID_HANDLE_VALUE) {
+            do {
+                if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+                swprintf_s(from, MAX_PATH, L"%s\\%s", path, fd.cFileName);
+                swprintf_s(to, MAX_PATH, L"%s\\%s", mirror, fd.cFileName);
+                CopyFileW(from, to, FALSE);
+            } while (FindNextFileW(h, &fd));
+            FindClose(h);
+        }
+        wcscpy_s(path, MAX_PATH, mirror);
+    }
 
     share = &list->shares[list->count];
     wcscpy_s(share->share_name, 128, L"AppSandbox.Nvidia");

@@ -76,11 +76,33 @@ jobs:
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
           "zip=$zip" >> $env:GITHUB_OUTPUT
           "name=$name" >> $env:GITHUB_OUTPUT
+          "stage=$stage" >> $env:GITHUB_OUTPUT
+          "ver=$ver" >> $env:GITHUB_OUTPUT
+
+      # MSIX test package (self-signed; Install-AppSandbox.ps1 trusts the
+      # certificate and installs it). A failure here does not block the zip.
+      - name: Package MSIX
+        id: msix
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          $out = Join-Path $env:RUNNER_TEMP 'msix'
+          $version = "${{ steps.package.outputs.ver }}.${{ github.run_number }}"
+          ./packaging/msix/make-msix.ps1 -Stage "${{ steps.package.outputs.stage }}" -Version $version -OutDir $out
+          $zip = Join-Path $env:RUNNER_TEMP "${{ steps.package.outputs.name }}-msix.zip"
+          Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
+          "zip=$zip" >> $env:GITHUB_OUTPUT
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ steps.package.outputs.name }}
           path: ${{ steps.package.outputs.zip }}
+
+      - uses: actions/upload-artifact@v4
+        if: steps.msix.outcome == 'success'
+        with:
+          name: ${{ steps.package.outputs.name }}-msix
+          path: ${{ steps.msix.outputs.zip }}
 
       - name: Publish pre-release
         if: startsWith(github.ref, 'refs/heads/release/')
@@ -95,6 +117,9 @@ jobs:
           - Windows may show a SmartScreen warning: the app is not code-signed. Choose "More info" -> "Run anyway".
           - Drivers are test-signed; AppSandbox enables test signing inside the VM when it installs them.
           - Guest drivers are installed when a VM is created: create a **new** Windows VM to test guest-side changes.
+          - ``*-msix.zip``: MSIX test package. Unzip, then in an elevated PowerShell run ``powershell -ExecutionPolicy Bypass -File .\Install-AppSandbox.ps1`` (trusts the included test certificate and installs).
           "@
-          gh release create $tag "${{ steps.package.outputs.zip }}" --prerelease --target "${{ github.sha }}" `
+          $assets = @("${{ steps.package.outputs.zip }}")
+          if ("${{ steps.msix.outputs.zip }}") { $assets += "${{ steps.msix.outputs.zip }}" }
+          gh release create $tag @assets --prerelease --target "${{ github.sha }}" `
             --title "Test build ${{ github.run_number }} (${{ github.ref_name }})" --notes $notes

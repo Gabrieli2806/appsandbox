@@ -18,6 +18,7 @@
  */
 
 #include "d3dlayers.h"
+#include "asb_paths.h"
 #include "fe3_templates.h"
 #include "ui.h"
 
@@ -524,7 +525,7 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     wchar_t url[6144];
     int i, present = 0;
 
-    get_exe_dir(exe_dir, MAX_PATH);
+    asb_writable_dir(exe_dir, MAX_PATH);   /* beside the exe, or ProgramData for MSIX */
     swprintf_s(cache, MAX_PATH, L"%s\\%s", exe_dir, DL_CACHE_SUBDIR);
 
     /* Already cached? */

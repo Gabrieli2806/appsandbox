@@ -18,6 +18,7 @@
 #include "vm_agent.h"
 #include "webview2_bridge.h"
 #include "prereq.h"
+#include "asb_paths.h"
 #include <dwmapi.h>
 #include <commdlg.h>
 #include <commctrl.h>
@@ -922,6 +923,15 @@ static HRESULT create_vm_shortcut(const wchar_t *vm_name, BOOL start_menu,
     swprintf_s(out_path, out_cap, L"%s\\%s.lnk", dir, file);
 
     GetModuleFileNameW(NULL, exe, MAX_PATH);
+    if (asb_running_packaged()) {
+        /* MSIX: files in WindowsApps cannot be started directly; use the
+           package's execution alias (%LOCALAPPDATA%\Microsoft\WindowsApps). */
+        PWSTR local = NULL;
+        if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, NULL, &local))) {
+            swprintf_s(exe, MAX_PATH, L"%s\\Microsoft\\WindowsApps\\AppSandbox.exe", local);
+            CoTaskMemFree(local);
+        }
+    }
     swprintf_s(args, ARRAYSIZE(args), L"--vm \"%s\"", vm_name);
     swprintf_s(desc, ARRAYSIZE(desc), L"Start %s in App Sandbox", vm_name);
 
@@ -934,7 +944,11 @@ static HRESULT create_vm_shortcut(const wchar_t *vm_name, BOOL start_menu,
     if (slash) *slash = 0;
     link->lpVtbl->SetWorkingDirectory(link, dir);
     link->lpVtbl->SetDescription(link, desc);
-    link->lpVtbl->SetIconLocation(link, exe, 0);
+    {
+        wchar_t icon[MAX_PATH];
+        GetModuleFileNameW(NULL, icon, MAX_PATH);
+        link->lpVtbl->SetIconLocation(link, icon, 0);
+    }
     hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&pf);
     if (SUCCEEDED(hr)) {
         hr = pf->lpVtbl->Save(pf, out_path, TRUE);

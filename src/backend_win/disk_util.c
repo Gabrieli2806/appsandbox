@@ -1,4 +1,5 @@
 #include "disk_util.h"
+#include "asb_paths.h"
 #include "ui.h"
 #include "../../tools/provision/win_provision.h"
 #include <virtdisk.h>
@@ -954,9 +955,8 @@ BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
 {
     wchar_t exe_dir[MAX_PATH], *slash;
 
-    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
-    slash = wcsrchr(exe_dir, L'\\');
-    if (slash) *slash = L'\0';
+    (void)slash;
+    asb_writable_dir(exe_dir, MAX_PATH);   /* beside the exe, or ProgramData for MSIX */
 
     swprintf_s(msi_path_out, max_chars, L"%s\\%s", exe_dir, SSH_MSI_NAME);
 
