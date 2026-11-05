@@ -271,10 +271,26 @@ typedef struct _VDD_SWAP_PROC {
     UINT                frameWidth;
     UINT                frameHeight;
 
-    /* Contiguous send buffer: header + rects + pixels go out in one send
-       instead of one send per row. Grown on demand. */
-    BYTE*               pSendBuf;
-    UINT                sendBufSize;
+    /* Frame sender (VddSenderThread). The capture loop packs each frame
+       (header + rects + pixels, one contiguous message) into a free slot and
+       goes on to the next frame while the sender thread transmits; when the
+       sender falls behind, the waiting frame is replaced by a newer full
+       frame, so the host always gets the latest picture.
+       sendLock serialises whole messages on hClientConn (frames, cursor,
+       hello) and guards closing it; queueLock guards the slot bookkeeping. */
+    CRITICAL_SECTION    sendLock;
+    CRITICAL_SECTION    queueLock;
+    HANDLE              hSendEvent;
+    HANDLE              hSendThread;
+    volatile BOOL       bStopSend;
+    volatile LONG       sendFailed;
+    BYTE*               slotBuf[2];
+    UINT                slotCap[2];
+    UINT                slotLen[2];
+    LONG                slotGen[2];
+    LONG                connGen;            /* bumped when hClientConn changes */
+    int                 sendingSlot;        /* -1 = none */
+    int                 pendingSlot;        /* -1 = none */
 
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
@@ -314,9 +330,13 @@ typedef struct _VDD_DEVICE_CONTEXT {
     UINT                customCount;
     UINT                customNext;
 
-    /* Re-plugs the monitor after a new custom mode was added. Runs on a WDF
-       thread, like the recovery timer. */
+    /* Applies a new custom mode. Runs on a WDF thread, like the recovery
+       timer. Stage 1 offers it with IddCxMonitorUpdateModes (no re-plug);
+       stage 2 checks the surface took that size and otherwise re-plugs the
+       monitor so the OS re-reads its modes. */
     WDFTIMER            hModeTimer;
+    VDD_MODE            pendingMode;
+    volatile LONG       modeStage;          /* 0 idle, 1 update modes, 2 verify */
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.

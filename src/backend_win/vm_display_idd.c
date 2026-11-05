@@ -159,6 +159,7 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define PRESENT_MS      16   /* fallback repaint; frames themselves repaint immediately */
 #define IDT_ADAPTIVE    2002 /* debounce adaptive resolution after resizes */
 #define IDT_APPLY_MODE  2003 /* re-apply the chosen mode after the frame channel connects */
+#define IDT_TOOLBAR     2004 /* hides the floating toolbar once the pointer leaves it */
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -232,6 +233,13 @@ struct VmDisplayIdd {
     volatile BOOL open;
     volatile BOOL stop;
     BOOL          borderless_fullscreen;
+
+    /* Floating toolbar (owned popup over the top edge of the render area). */
+    HWND          toolbar_hwnd;
+    BOOL          toolbar_pinned;
+    int           toolbar_hot;        /* item under the pointer, -1 none */
+    RECT          toolbar_items[12];  /* client rects of the items, for hit tests */
+    int           toolbar_count;
     LONG_PTR      windowed_style;
     WINDOWPLACEMENT windowed_placement;
 
@@ -357,6 +365,13 @@ static void idd_toggle_borderless_fullscreen(VmDisplayIdd *d, HWND hwnd);
 
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
+static const wchar_t *IDD_TOOLBAR_CLASS = L"AppSandboxIddToolbar";
+static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+static void tb_refresh(VmDisplayIdd *d);
+static void tb_show(VmDisplayIdd *d, UINT linger_ms);
+static void tb_hide(VmDisplayIdd *d);
+static void tb_position(VmDisplayIdd *d);
+static void tb_on_timer(VmDisplayIdd *d);
 static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 
 /* System menu command IDs — must be < 0xF000 and have low 4 bits clear */
@@ -531,6 +546,17 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
     wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
     wc.lpszClassName = IDD_LOG_CLASS;
+    RegisterClassExW(&wc);
+
+    /* Floating toolbar — painted with GDI, never takes focus. */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.style         = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc   = idd_toolbar_proc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = IDD_TOOLBAR_CLASS;
     RegisterClassExW(&wc);
 
     g_idd_class_registered = TRUE;
@@ -1039,6 +1065,389 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
                (d->mode_supported && d->frame_connected && d->guest_driver == 0)
                    ? L" - old display driver (1920x1080 only)" : L"");
     SetWindowTextW(d->hwnd, title);
+    tb_refresh(d);
+}
+
+/* ==================================================================
+ * Floating toolbar
+ *
+ * An owned, non-activating popup centred over the top of the render area.
+ * It appears when the pointer touches the top edge (and for a few seconds
+ * when the window opens), hides again once the pointer leaves it unless
+ * pinned, and stays away while the mouse is captured for games (relative
+ * mode). Buttons post the same WM_SYSCOMMAND items as the title-bar menu,
+ * so both stay in sync.
+ * ================================================================== */
+
+enum {
+    TB_NAME, TB_DISPLAY, TB_FPS, TB_SEP, TB_CLIP, TB_AUDIO, TB_KEYS,
+    TB_FULL, TB_PIN, TB_MORE, TB_COUNT
+};
+
+#define TB_TRIGGER_PX   6      /* pointer this close to the top edge shows it */
+#define TB_MARGIN_PX    10     /* gap between the window top and the toolbar */
+#define TB_ACCENT       RGB(0x4E, 0xA6, 0xF5)
+
+static int tb_scale(VmDisplayIdd *d, int px)
+{
+    UINT dpi = d->hwnd ? GetDpiForWindow(d->hwnd) : 96;
+    return MulDiv(px, dpi ? (int)dpi : 96, 96);
+}
+
+static HFONT tb_font(VmDisplayIdd *d, BOOL icons, int pt)
+{
+    LOGFONTW lf;
+    ZeroMemory(&lf, sizeof(lf));
+    lf.lfHeight = -tb_scale(d, pt);
+    lf.lfWeight = icons ? FW_NORMAL : FW_SEMIBOLD;
+    lf.lfQuality = CLEARTYPE_QUALITY;
+    lf.lfCharSet = DEFAULT_CHARSET;
+    wcscpy_s(lf.lfFaceName, LF_FACESIZE, icons ? L"Segoe Fluent Icons" : L"Segoe UI");
+    {
+        HFONT f = CreateFontIndirectW(&lf);
+        if (icons && f) {
+            /* Windows 10 has Segoe MDL2 Assets with the same code points. */
+            HDC dc = GetDC(NULL);
+            wchar_t face[LF_FACESIZE] = L"";
+            HGDIOBJ old = SelectObject(dc, f);
+            GetTextFaceW(dc, LF_FACESIZE, face);
+            SelectObject(dc, old);
+            ReleaseDC(NULL, dc);
+            if (_wcsicmp(face, L"Segoe Fluent Icons") != 0) {
+                DeleteObject(f);
+                wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe MDL2 Assets");
+                f = CreateFontIndirectW(&lf);
+            }
+        }
+        return f;
+    }
+}
+
+/* Text or glyph for one item, and whether it is a "toggled on" state. */
+static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *icon, BOOL *on)
+{
+    *icon = TRUE;
+    *on = FALSE;
+    text[0] = 0;
+    switch (item) {
+    case TB_NAME:    *icon = FALSE; wcscpy_s(text, cap, d->vm_name); break;
+    case TB_DISPLAY:
+        *icon = FALSE;
+        if (d->res_choice == RES_ADAPTIVE)
+            swprintf_s(text, cap, L"Adaptive %ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
+        else
+            swprintf_s(text, cap, L"%ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
+        break;
+    case TB_FPS:     *icon = FALSE; swprintf_s(text, cap, L"%u FPS", d->frame_connected ? d->fps_value : 0); break;
+    case TB_CLIP:    wcscpy_s(text, cap, L"\xE77F"); *on = d->clip_share_host_to_guest && d->clip_share_guest_to_host; break;
+    case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); *on = !d->audio_muted; break;
+    case TB_KEYS:    wcscpy_s(text, cap, L"\xE765"); *on = d->transmit_hotkeys; break;
+    case TB_FULL:    wcscpy_s(text, cap, d->borderless_fullscreen ? L"\xE73F" : L"\xE740"); *on = d->borderless_fullscreen; break;
+    case TB_PIN:     wcscpy_s(text, cap, d->toolbar_pinned ? L"\xE77A" : L"\xE718"); *on = d->toolbar_pinned; break;
+    case TB_MORE:    wcscpy_s(text, cap, L"\xE712"); break;
+    default: break;
+    }
+}
+
+static const wchar_t *tb_tooltip(VmDisplayIdd *d, int item)
+{
+    switch (item) {
+    case TB_DISPLAY: return L"Resolution and refresh rate";
+    case TB_CLIP:    return d->clip_share_host_to_guest && d->clip_share_guest_to_host
+                         ? L"Clipboard shared (click to stop)" : L"Clipboard not shared (click to share)";
+    case TB_AUDIO:   return d->audio_muted ? L"Unmute audio" : L"Mute audio";
+    case TB_KEYS:    return L"Send Windows shortcuts (Win, Alt+Tab) to the VM";
+    case TB_FULL:    return L"Borderless fullscreen (F11)";
+    case TB_PIN:     return d->toolbar_pinned ? L"Let the toolbar hide" : L"Keep the toolbar visible";
+    case TB_MORE:    return L"More options";
+    default:         return NULL;
+    }
+}
+
+/* Measure items and size the window; positions are kept for hit tests. */
+static SIZE tb_layout(VmDisplayIdd *d, HDC dc)
+{
+    HFONT text_font = tb_font(d, FALSE, 13), icon_font = tb_font(d, TRUE, 15);
+    int pad = tb_scale(d, 6), btn = tb_scale(d, 36), h = tb_scale(d, 44);
+    int x = pad, item;
+    SIZE out;
+    for (item = 0; item < TB_COUNT; item++) {
+        wchar_t text[96];
+        BOOL icon, on;
+        int w;
+        tb_item(d, item, text, ARRAYSIZE(text), &icon, &on);
+        if (item == TB_SEP) {
+            w = tb_scale(d, 9);
+        } else if (icon) {
+            w = btn;
+        } else {
+            SIZE ts = { 0, 0 };
+            SelectObject(dc, text_font);
+            GetTextExtentPoint32W(dc, text, (int)wcslen(text), &ts);
+            w = ts.cx + tb_scale(d, item == TB_NAME ? 22 : 20);
+            if (item == TB_FPS && w < tb_scale(d, 70)) w = tb_scale(d, 70);
+        }
+        SetRect(&d->toolbar_items[item], x, pad, x + w, h - pad);
+        x += w + (item == TB_SEP ? 0 : tb_scale(d, 2));
+    }
+    d->toolbar_count = TB_COUNT;
+    DeleteObject(text_font);
+    DeleteObject(icon_font);
+    out.cx = x + pad;
+    out.cy = h;
+    return out;
+}
+
+static void tb_position(VmDisplayIdd *d)
+{
+    RECT rc;
+    POINT top;
+    HDC dc;
+    SIZE sz;
+    if (!d->toolbar_hwnd || !d->render_hwnd) return;
+    dc = GetDC(d->toolbar_hwnd);
+    sz = tb_layout(d, dc);
+    ReleaseDC(d->toolbar_hwnd, dc);
+    GetClientRect(d->render_hwnd, &rc);
+    top.x = rc.left + (rc.right - rc.left - sz.cx) / 2;
+    top.y = rc.top + tb_scale(d, TB_MARGIN_PX);
+    ClientToScreen(d->render_hwnd, &top);
+    SetWindowPos(d->toolbar_hwnd, HWND_TOP, top.x, top.y, sz.cx, sz.cy,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+}
+
+static void tb_hide(VmDisplayIdd *d)
+{
+    if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) return;
+    ShowWindow(d->toolbar_hwnd, SW_HIDE);
+    KillTimer(d->hwnd, IDT_TOOLBAR);
+    d->toolbar_hot = -1;
+}
+
+static void tb_show(VmDisplayIdd *d, UINT linger_ms)
+{
+    if (!d->toolbar_hwnd || d->relative_mouse || IsIconic(d->hwnd)) return;
+    tb_position(d);
+    if (!IsWindowVisible(d->toolbar_hwnd))
+        ShowWindow(d->toolbar_hwnd, SW_SHOWNOACTIVATE);
+    InvalidateRect(d->toolbar_hwnd, NULL, FALSE);
+    SetTimer(d->hwnd, IDT_TOOLBAR, linger_ms, NULL);
+}
+
+/* Repaint with fresh values (FPS, toggles) if it is showing. */
+static void tb_refresh(VmDisplayIdd *d)
+{
+    if (d && d->toolbar_hwnd && IsWindowVisible(d->toolbar_hwnd)) {
+        tb_position(d);
+        InvalidateRect(d->toolbar_hwnd, NULL, FALSE);
+    }
+}
+
+/* Timer: hide once the pointer is neither on the toolbar nor near the top. */
+static void tb_on_timer(VmDisplayIdd *d)
+{
+    POINT pt;
+    RECT tr, band;
+    if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) { KillTimer(d->hwnd, IDT_TOOLBAR); return; }
+    SetTimer(d->hwnd, IDT_TOOLBAR, 400, NULL);
+    if (d->relative_mouse) { tb_hide(d); return; }
+    if (d->toolbar_pinned) return;
+    GetCursorPos(&pt);
+    GetWindowRect(d->toolbar_hwnd, &tr);
+    band = tr;
+    InflateRect(&band, tb_scale(d, 24), tb_scale(d, 24));
+    if (PtInRect(&band, pt)) return;
+    if (GetCapture() == d->toolbar_hwnd) return;
+    tb_hide(d);
+}
+
+static void tb_paint(VmDisplayIdd *d, HWND hwnd)
+{
+    PAINTSTRUCT ps;
+    RECT rc;
+    HDC dc = BeginPaint(hwnd, &ps), mem;
+    HBITMAP bmp;
+    HFONT text_font, icon_font, small_font;
+    int item;
+
+    GetClientRect(hwnd, &rc);
+    mem = CreateCompatibleDC(dc);
+    bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
+    SelectObject(mem, bmp);
+    tb_layout(d, mem);
+    text_font = tb_font(d, FALSE, 13);
+    small_font = tb_font(d, FALSE, 12);
+    icon_font = tb_font(d, TRUE, 15);
+
+    {
+        HBRUSH bg = CreateSolidBrush(RGB(0x14, 0x17, 0x1D));
+        HPEN border = CreatePen(PS_SOLID, 1, RGB(0x2E, 0x34, 0x41));
+        HGDIOBJ ob = SelectObject(mem, bg), op = SelectObject(mem, border);
+        FillRect(mem, &rc, bg);
+        RoundRect(mem, 0, 0, rc.right, rc.bottom, tb_scale(d, 14), tb_scale(d, 14));
+        SelectObject(mem, ob);
+        SelectObject(mem, op);
+        DeleteObject(bg);
+        DeleteObject(border);
+    }
+    SetBkMode(mem, TRANSPARENT);
+
+    for (item = 0; item < TB_COUNT; item++) {
+        RECT r = d->toolbar_items[item];
+        wchar_t text[96];
+        BOOL icon, on;
+        COLORREF fg = RGB(0xE8, 0xEA, 0xF0);
+        tb_item(d, item, text, ARRAYSIZE(text), &icon, &on);
+
+        if (item == TB_SEP) {
+            HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x2E, 0x34, 0x41));
+            HGDIOBJ op = SelectObject(mem, pen);
+            int cx = (r.left + r.right) / 2;
+            MoveToEx(mem, cx, r.top + tb_scale(d, 6), NULL);
+            LineTo(mem, cx, r.bottom - tb_scale(d, 6));
+            SelectObject(mem, op);
+            DeleteObject(pen);
+            continue;
+        }
+        if (item != TB_NAME && item != TB_FPS) {
+            COLORREF fill = (item == d->toolbar_hot) ? RGB(0x2A, 0x30, 0x3D)
+                          : (on && icon) ? RGB(0x1C, 0x2A, 0x3A)
+                          : (item == TB_DISPLAY) ? RGB(0x1F, 0x24, 0x30) : RGB(0x14, 0x17, 0x1D);
+            HBRUSH b = CreateSolidBrush(fill);
+            HPEN np = (HPEN)GetStockObject(NULL_PEN);
+            HGDIOBJ ob = SelectObject(mem, b), op = SelectObject(mem, np);
+            RoundRect(mem, r.left, r.top, r.right + 1, r.bottom + 1, tb_scale(d, 10), tb_scale(d, 10));
+            SelectObject(mem, ob);
+            SelectObject(mem, op);
+            DeleteObject(b);
+        }
+        if (on && icon) fg = TB_ACCENT;
+        if (item == TB_FPS) fg = d->frame_connected ? RGB(0x5F, 0xD9, 0x93) : RGB(0xA7, 0xB0, 0xC0);
+        if (item == TB_NAME) fg = RGB(0xE8, 0xEA, 0xF0);
+        SetTextColor(mem, fg);
+        SelectObject(mem, icon ? icon_font : (item == TB_FPS ? small_font : text_font));
+        DrawTextW(mem, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+    }
+
+    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
+    DeleteObject(text_font);
+    DeleteObject(small_font);
+    DeleteObject(icon_font);
+    DeleteObject(bmp);
+    DeleteDC(mem);
+    EndPaint(hwnd, &ps);
+}
+
+static int tb_hit(VmDisplayIdd *d, int x, int y)
+{
+    POINT pt = { x, y };
+    int item;
+    for (item = 0; item < d->toolbar_count; item++)
+        if (item != TB_NAME && item != TB_FPS && item != TB_SEP &&
+            PtInRect(&d->toolbar_items[item], pt))
+            return item;
+    return -1;
+}
+
+/* Show a menu under an item and run the chosen command like the title-bar
+   menu would. */
+static void tb_menu(VmDisplayIdd *d, HMENU menu, int item)
+{
+    RECT r = d->toolbar_items[item];
+    POINT pt = { r.left, r.bottom + tb_scale(d, 4) };
+    UINT cmd;
+    if (!menu) return;
+    ClientToScreen(d->toolbar_hwnd, &pt);
+    SetForegroundWindow(d->hwnd);
+    cmd = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
+                               pt.x, pt.y, 0, d->hwnd, NULL);
+    if (cmd) PostMessageW(d->hwnd, WM_SYSCOMMAND, cmd, 0);
+}
+
+static HMENU tb_display_submenu(VmDisplayIdd *d)
+{
+    HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
+    int i, count = sysmenu ? GetMenuItemCount(sysmenu) : 0;
+    for (i = 0; i < count; i++) {
+        HMENU h = GetSubMenu(sysmenu, i);
+        if (h && GetMenuState(h, IDM_RES_ADAPTIVE, MF_BYCOMMAND) != (UINT)-1) return h;
+    }
+    return NULL;
+}
+
+static void tb_click(VmDisplayIdd *d, int item)
+{
+    switch (item) {
+    case TB_DISPLAY:
+        tb_menu(d, tb_display_submenu(d), item);
+        break;
+    case TB_CLIP: {
+        /* One button for both directions: on if either is off. */
+        BOOL target = !(d->clip_share_host_to_guest && d->clip_share_guest_to_host);
+        if (d->clip_share_host_to_guest != target) PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_CLIP_H2G, 0);
+        if (d->clip_share_guest_to_host != target) PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_CLIP_G2H, 0);
+        break;
+    }
+    case TB_AUDIO: PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_AUDIO_MUTE, 0); break;
+    case TB_KEYS:  PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_XMIT_HOTKEYS, 0); break;
+    case TB_FULL:  PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_BORDERLESS_FULLSCREEN, 0); break;
+    case TB_PIN:   d->toolbar_pinned = !d->toolbar_pinned; break;
+    case TB_MORE:  tb_menu(d, GetSystemMenu(d->hwnd, FALSE), item); break;
+    default: break;
+    }
+    /* Toggles land via posted messages; repaint after they are handled. */
+    PostMessageW(d->toolbar_hwnd, WM_APP + 1, 0, 0);
+}
+
+static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA,
+                          (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        break;
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+    case WM_ERASEBKGND:
+        return 1;
+    case WM_PAINT:
+        if (d) { tb_paint(d, hwnd); return 0; }
+        break;
+    case WM_MOUSEMOVE:
+        if (d) {
+            int hot = tb_hit(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
+            TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
+            TrackMouseEvent(&tme);
+            if (hot != d->toolbar_hot) {
+                const wchar_t *tip = hot >= 0 ? tb_tooltip(d, hot) : NULL;
+                d->toolbar_hot = hot;
+                InvalidateRect(hwnd, NULL, FALSE);
+                /* Tooltip-like hint in the log line of the title is enough;
+                   keep the toolbar itself compact. */
+                (void)tip;
+            }
+            SetCursor(LoadCursorW(NULL, IDC_ARROW));
+        }
+        return 0;
+    case WM_MOUSELEAVE:
+        if (d) { d->toolbar_hot = -1; InvalidateRect(hwnd, NULL, FALSE); }
+        return 0;
+    case WM_LBUTTONDOWN:
+        SetCapture(hwnd);
+        return 0;
+    case WM_LBUTTONUP:
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (d) {
+            int item = tb_hit(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
+            if (item >= 0) tb_click(d, item);
+        }
+        return 0;
+    case WM_APP + 1:
+        if (d) tb_refresh(d);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
 }
 
 /* ==================================================================
@@ -2508,7 +2917,19 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 }
             }
 
-            if (rect_count == 0) {
+            if (rect_count == 0 && hdr.width == d->frame_width && hdr.height == d->frame_height &&
+                hdr.stride == d->frame_stride &&
+                data_size >= (UINT)d->frame_stride * d->frame_height) {
+                /* Full frame in exactly the frame buffer's layout: swap the
+                   buffers instead of copying the whole picture (about 15 MB
+                   per frame at 2560x1440). The old frame buffer becomes the
+                   next receive buffer. */
+                BYTE *old = d->frame_buf;
+                SIZE_T cap = HeapSize(GetProcessHeap(), 0, old);
+                d->frame_buf = recv_buf;
+                recv_buf = old;
+                recv_buf_size = (cap == (SIZE_T)-1) ? (UINT)d->frame_stride * d->frame_height : (UINT)cap;
+            } else if (rect_count == 0) {
                 /* Full frame update */
                 UINT row;
                 UINT copy_w = hdr.width * 4;
@@ -2718,6 +3139,20 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             d->hwnd, NULL, d->hInstance, NULL);
         if (d->render_hwnd)
             ImmAssociateContextEx(d->render_hwnd, NULL, 0);
+    }
+
+    /* Floating toolbar: shown for a few seconds now so it is discovered,
+       then whenever the pointer touches the top edge. */
+    d->toolbar_hot = -1;
+    d->toolbar_hwnd = CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, IDD_TOOLBAR_CLASS, L"",
+        WS_POPUP, 0, 0, 10, 10, d->hwnd, NULL, d->hInstance, d);
+    if (d->toolbar_hwnd) {
+        DWORD corner = 2; /* DWMWCP_ROUND */
+        BOOL dark = TRUE;
+        DwmSetWindowAttribute(d->toolbar_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof(corner));
+        DwmSetWindowAttribute(d->toolbar_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        tb_show(d, 4000);
     }
 
     /* Separate top-level log window */
@@ -3038,6 +3473,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_DESTROY:
         KillTimer(hwnd, IDT_PRESENT);
+        KillTimer(hwnd, IDT_TOOLBAR);
+        if (d && d->toolbar_hwnd) {
+            DestroyWindow(d->toolbar_hwnd);
+            d->toolbar_hwnd = NULL;
+        }
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
             d->stop = TRUE;
@@ -3087,10 +3527,13 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Adaptive: ask the guest for the new size once resizing settles. */
             if (d->res_choice == RES_ADAPTIVE && wp != SIZE_MINIMIZED)
                 SetTimer(hwnd, IDT_ADAPTIVE, ADAPTIVE_DEBOUNCE_MS, NULL);
+            if (wp == SIZE_MINIMIZED) tb_hide(d);
+            else tb_refresh(d);
         }
         return 0;
 
     case WM_MOVE:
+        if (d) tb_refresh(d);
         if (d && d->relative_mouse) {
             AcquireSRWLockExclusive(&g_mouse_capture_lock);
             if (g_mouse_capture_hwnd == hwnd) idd_clip_mouse(d);
@@ -3129,6 +3572,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->input_sizing) return 0;
             KillTimer(hwnd, IDT_ADAPTIVE);
             idd_apply_display_mode(d, FALSE);
+        } else if (wp == IDT_TOOLBAR && d) {
+            tb_on_timer(d);
         } else if (wp == IDT_APPLY_MODE && d) {
             KillTimer(hwnd, IDT_APPLY_MODE);
             idd_apply_display_mode(d, TRUE);
@@ -3236,6 +3681,11 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (!d->input_focused) {
                 idd_flush_held_keys(d);
                 idd_flush_mouse_buttons(d);
+                /* The toolbar's own menus take activation briefly; hide only
+                   when another app takes over. */
+                if (!d->toolbar_pinned && (HWND)lp != d->toolbar_hwnd &&
+                    GetForegroundWindow() != d->hwnd)
+                    tb_hide(d);
             }
             idd_update_relative_mouse(d);
         }
@@ -3294,6 +3744,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             d->mouse_in = TRUE;
             if (!d->relative_mouse && !d->cursor_visible)
                 idd_update_relative_mouse(d);
+            /* Pointer at the top edge: reveal the toolbar. */
+            if (!d->relative_mouse && (int)(short)HIWORD(lp) <= tb_scale(d, TB_TRIGGER_PX))
+                tb_show(d, 800);
 
             if (!d->relative_mouse && !d->mouse_sync_pending && d->frame_width && d->frame_height) {
                 UINT vx, vy;

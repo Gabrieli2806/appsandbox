@@ -242,9 +242,12 @@ static void VddRequestMode(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height, UIN
     ReleaseSRWLockExclusive(&ctx->modeLock);
 
     VddLog("ModeRequest: %ux%u@%u (%s)", width, height, refresh,
-           known ? "already offered" : "added, re-plugging monitor");
-    if (replug && ctx->hModeTimer)
-        WdfTimerStart(ctx->hModeTimer, WDF_REL_TIMEOUT_IN_MS(50));
+           known ? "already offered" : "added");
+    if (replug && ctx->hModeTimer) {
+        ctx->pendingMode = m;
+        InterlockedExchange(&ctx->modeStage, 1);
+        WdfTimerStart(ctx->hModeTimer, WDF_REL_TIMEOUT_IN_MS(30));
+    }
 }
 
 /* ========================================================================= */
@@ -511,6 +514,113 @@ static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
     return 0;
 }
 
+/* ========================================================================= */
+/*  Sending to the host                                                      */
+/* ========================================================================= */
+
+/* One whole message (optionally in two parts) on the client connection,
+   never interleaved with another thread's message. 0 on success. */
+static int VddSendMsg(VDD_SWAP_PROC* proc, const void* a, int alen, const void* b, int blen)
+{
+    int r = -1;
+    EnterCriticalSection(&proc->sendLock);
+    AsbConn* c = proc->hClientConn;
+    if (c) {
+        r = VddSendAll(c, (const char*)a, alen);
+        if (r == 0 && b && blen > 0) r = VddSendAll(c, (const char*)b, blen);
+    }
+    LeaveCriticalSection(&proc->sendLock);
+    return r;
+}
+
+/* Close the client connection (waits for a message in flight). */
+static void VddCloseClient(VDD_SWAP_PROC* proc)
+{
+    EnterCriticalSection(&proc->sendLock);
+    VddCloseConn(&proc->hClientConn);
+    proc->connGen++;
+    LeaveCriticalSection(&proc->sendLock);
+}
+
+/* TRUE while a packed frame waits for the sender. A frame packed now would
+   replace it, so it must be a full frame (a dirty-rect delta would lose the
+   waiting frame's changes). */
+static BOOL VddFrameWaiting(VDD_SWAP_PROC* proc)
+{
+    BOOL waiting;
+    EnterCriticalSection(&proc->queueLock);
+    waiting = proc->pendingSlot != -1;
+    LeaveCriticalSection(&proc->queueLock);
+    return waiting;
+}
+
+/* Reserve the slot the sender is not using, with room for `need` bytes.
+   Returns the slot or -1. Only the capture thread calls this. */
+static int VddQueueBegin(VDD_SWAP_PROC* proc, UINT need)
+{
+    int slot;
+    EnterCriticalSection(&proc->queueLock);
+    slot = (proc->sendingSlot == 0) ? 1 : 0;
+    if (proc->pendingSlot == slot) proc->pendingSlot = -1;   /* replaced by this frame */
+    LeaveCriticalSection(&proc->queueLock);
+
+    if (proc->slotCap[slot] < need) {
+        BYTE* nb = (BYTE*)realloc(proc->slotBuf[slot], need);
+        if (!nb) {
+            VddLog("Frame: send buffer allocation of %u bytes FAILED", need);
+            return -1;
+        }
+        proc->slotBuf[slot] = nb;
+        proc->slotCap[slot] = need;
+    }
+    return slot;
+}
+
+static void VddQueueCommit(VDD_SWAP_PROC* proc, int slot, UINT len)
+{
+    EnterCriticalSection(&proc->queueLock);
+    proc->slotLen[slot] = len;
+    proc->slotGen[slot] = proc->connGen;
+    proc->pendingSlot = slot;
+    LeaveCriticalSection(&proc->queueLock);
+    SetEvent(proc->hSendEvent);
+}
+
+static DWORD WINAPI VddSenderThread(LPVOID param)
+{
+    VDD_SWAP_PROC* proc = (VDD_SWAP_PROC*)param;
+    for (;;) {
+        WaitForSingleObject(proc->hSendEvent, INFINITE);
+        if (proc->bStopSend) break;
+        for (;;) {
+            int slot;
+            UINT len = 0;
+            LONG gen = 0;
+            EnterCriticalSection(&proc->queueLock);
+            slot = proc->pendingSlot;
+            if (slot != -1) {
+                proc->pendingSlot = -1;
+                proc->sendingSlot = slot;
+                len = proc->slotLen[slot];
+                gen = proc->slotGen[slot];
+            }
+            LeaveCriticalSection(&proc->queueLock);
+            if (slot == -1 || proc->bStopSend) break;
+
+            EnterCriticalSection(&proc->sendLock);
+            if (proc->hClientConn && gen == proc->connGen &&
+                VddSendAll(proc->hClientConn, (const char*)proc->slotBuf[slot], (int)len) != 0)
+                InterlockedExchange(&proc->sendFailed, 1);
+            LeaveCriticalSection(&proc->sendLock);
+
+            EnterCriticalSection(&proc->queueLock);
+            proc->sendingSlot = -1;
+            LeaveCriticalSection(&proc->queueLock);
+        }
+    }
+    return 0;
+}
+
 /* Query hardware cursor and send update to host if connected */
 static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
 {
@@ -564,41 +674,20 @@ static void VddSendCursorUpdate(VDD_SWAP_PROC* proc)
         chdr.shape_data_size = 0;
     }
 
-    /* Send cursor header */
-    if (VddSendAll(s, (const char*)&chdr, sizeof(chdr)) != 0) {
-        VddLog("Cursor: send header failed, disconnecting");
-        VddCloseConn(&proc->hClientConn);
-        return;
-    }
-
-    /* Send shape bitmap if updated */
-    if (chdr.shape_data_size > 0) {
-        if (VddSendAll(s, (const char*)proc->pCursorShapeBuffer, (int)chdr.shape_data_size) != 0) {
-            VddLog("Cursor: send shape data failed, disconnecting");
-            VddCloseConn(&proc->hClientConn);
-            return;
-        }
+    /* Header and shape go out as one message, between frames. */
+    (void)s;
+    if (VddSendMsg(proc, &chdr, (int)sizeof(chdr),
+                   chdr.shape_data_size > 0 ? proc->pCursorShapeBuffer : NULL,
+                   (int)chdr.shape_data_size) != 0) {
+        VddLog("Cursor: send failed, disconnecting");
+        VddCloseClient(proc);
     }
 }
 
-/* Make sure the send buffer holds at least `need` bytes. */
-static BOOL VddEnsureSendBuf(VDD_SWAP_PROC* proc, UINT need)
-{
-    if (proc->sendBufSize >= need) return TRUE;
-    BYTE* nb = (BYTE*)realloc(proc->pSendBuf, need);
-    if (!nb) {
-        VddLog("Frame: send buffer allocation of %u bytes FAILED", need);
-        return FALSE;
-    }
-    proc->pSendBuf = nb;
-    proc->sendBufSize = need;
-    return TRUE;
-}
-
-/* Pack one frame message (header [+ rects] + data_size + pixels) into the
-   send buffer and send it in a single call. Sending row by row cost one
-   transport call per scanline (1080+ per frame at 1080p), which capped the
-   frame rate. rectCount == 0 sends the whole frame. Returns 0 on success. */
+/* Pack one frame message (header [+ rects] + data_size + pixels) into a free
+   sender slot and queue it; the sender thread transmits it in one call
+   (one transport call per frame, not per scanline). rectCount == 0 sends
+   the whole frame. Returns 0 when queued. */
 static int VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* mapped,
                         const RECT* rects, UINT32 rectCount)
 {
@@ -618,7 +707,9 @@ static int VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
     }
 
     total = (UINT)sizeof(whdr) + rectCount * (UINT)sizeof(RECT) + 4 + data_size;
-    if (!VddEnsureSendBuf(proc, total)) return -1;
+    if (!proc->hClientConn) return -1;
+    int slot = VddQueueBegin(proc, total);
+    if (slot < 0) return -1;
 
     proc->frameSeq++;
     whdr.magic            = VDD_FRAME_MAGIC;
@@ -628,7 +719,7 @@ static int VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
     whdr.frame_seq        = proc->frameSeq;
     whdr.dirty_rect_count = rectCount;
 
-    p = proc->pSendBuf;
+    p = proc->slotBuf[slot];
     memcpy(p, &whdr, sizeof(whdr)); p += sizeof(whdr);
     if (rectCount) { memcpy(p, rects, rectCount * sizeof(RECT)); p += rectCount * sizeof(RECT); }
     memcpy(p, &data_size, 4); p += 4;
@@ -654,7 +745,8 @@ static int VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
         }
     }
 
-    return VddSendAll(proc->hClientConn, (const char*)proc->pSendBuf, (int)total);
+    VddQueueCommit(proc, slot, total);
+    return 0;
 }
 
 /* Read a pending mode request from the host, if any. The host only ever
@@ -682,7 +774,7 @@ static BOOL VddPollHostRequests(VDD_SWAP_PROC* proc)
             hello.magic = VDD_HELLO_MAGIC;
             hello.version = VDD_PROTOCOL_VERSION;
             VddLog("HostRequest: hello query, answering protocol %u", hello.version);
-            if (VddSendAll(c, (const char*)&hello, sizeof(hello)) != 0) return FALSE;
+            if (VddSendMsg(proc, &hello, (int)sizeof(hello), NULL, 0) != 0) return FALSE;
             continue;
         }
         if (req.magic != VDD_MODE_REQUEST_MAGIC) {
@@ -773,6 +865,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             AsbConn* pending = (AsbConn*)InterlockedExchangePointer(
                 (PVOID volatile*)&proc->hPendingConn, NULL);
             if (pending) {
+                EnterCriticalSection(&proc->sendLock);   /* no frame in flight while swapping */
                 /* Drop the previous client. On PC the old socket is distinct -> close it. On ivshmem
                    the pending connection is the SAME single slot the host just re-armed, so closing
                    the old wrapper would mark the shared slot CLOSING and kill the new one — abandon
@@ -784,17 +877,28 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     VddLog("Frame: replaced previous client connection");
                 }
                 asb_stream_reset(pending);   /* ivshmem: align the fresh full frame at ring offset 0 (no-op on PC) */
+                /* A stalled host must not pin the sender forever. */
+                asb_set_timeout(pending, 0, 5000);
                 proc->hClientConn = pending;
+                proc->connGen++;
+                LeaveCriticalSection(&proc->sendLock);
                 proc->frameSeq = 0;
                 bSentFullFrame = FALSE;   /* new connection -> first frame is full (the reconnect trigger) */
                 VddLog("Frame: new client connection active");
             }
         }
 
+        /* The sender thread could not deliver a frame. */
+        if (InterlockedExchange(&proc->sendFailed, 0)) {
+            VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
+            VddCloseClient(proc);
+            bSentFullFrame = FALSE;
+        }
+
         /* Mode requests from the host arrive on the same channel. */
         if (proc->hClientConn && !VddPollHostRequests(proc)) {
             VddLog("Frame: host channel closed while reading requests");
-            VddCloseConn(&proc->hClientConn);
+            VddCloseClient(proc);
             bSentFullFrame = FALSE;
         }
 
@@ -840,11 +944,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     BOOL send_ok = VddSendFrame(proc, &mapped, nullptr, 0) == 0;
                     proc->pDeviceContext->Unmap(proc->pStagingTex, 0);
 
-                    if (!send_ok) {
-                        VddLog("Frame: resend failed, disconnecting (seq=%llu)", proc->frameSeq);
-                        VddCloseConn(&proc->hClientConn);
-                        bSentFullFrame = FALSE;
-                    }
+                    if (!send_ok) bSentFullFrame = FALSE;
                 }
             }
 
@@ -884,7 +984,7 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                             {
                                 RECT dirtyRects[VDD_MAX_DIRTY_RECTS];
                                 UINT32 rectCount = 0;
-                                BOOL sendFull = !bSentFullFrame;  /* first frame must be full */
+                                BOOL sendFull = !bSentFullFrame || VddFrameWaiting(proc);  /* first frame, or replacing a waiting one */
 
                                 /* Query dirty rects from IddCx.  If GetDirtyRects returns
                                    0 rects OR fails, fall back to sending a full frame.
@@ -925,13 +1025,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                                     BOOL send_ok = VddSendFrame(proc, &mapped, dirtyRects,
                                                                 sendFull ? 0 : rectCount) == 0;
                                     if (!send_ok) {
-                                        VddLog("Frame: send failed, disconnecting (seq=%llu)", proc->frameSeq);
-                                        VddCloseConn(&proc->hClientConn);
                                         bSentFullFrame = FALSE;
                                     } else {
                                         if (sendFull) bSentFullFrame = TRUE;
                                         if (proc->frameSeq == 1)
-                                            VddLog("Frame: first frame sent (%ux%u)",
+                                            VddLog("Frame: first frame queued (%ux%u)",
                                                    proc->frameWidth, proc->frameHeight);
                                     }
                                 }
@@ -1013,6 +1111,14 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
         CloseHandle(proc->hNetworkThread);
     }
 
+    /* Stop the sender before its buffers and connection go away. */
+    if (proc->hSendThread) {
+        proc->bStopSend = TRUE;
+        SetEvent(proc->hSendEvent);
+        WaitForSingleObject(proc->hSendThread, 10000);
+        CloseHandle(proc->hSendThread);
+    }
+
     /* Close any remaining client connection */
     VddLog("DestroySwapProc: closing client connection (%p)", (void*)proc->hClientConn);
     VddCloseConn(&proc->hClientConn);
@@ -1043,7 +1149,11 @@ static void VddDestroySwapProc(VDD_SWAP_PROC* proc)
     if (proc->pStagingTex)
         proc->pStagingTex->Release();
     VddLog("DestroySwapProc: staging texture released");
-    free(proc->pSendBuf);
+    free(proc->slotBuf[0]);
+    free(proc->slotBuf[1]);
+    if (proc->hSendEvent) CloseHandle(proc->hSendEvent);
+    DeleteCriticalSection(&proc->queueLock);
+    DeleteCriticalSection(&proc->sendLock);
 
     free(proc);
     VddLog("DestroySwapProc: COMPLETE");
@@ -1283,6 +1393,47 @@ static VOID VddRecoveryTimerCallback(WDFTIMER Timer)
 /*  the list needs a departure + arrival. Runs on a WDF timer thread.        */
 /* ========================================================================= */
 
+/* Offer the current list as the monitor's target modes without a re-plug.
+   Returns TRUE when the OS accepted the update. */
+static BOOL VddUpdateTargetModes(VDD_DEVICE_CONTEXT* ctx)
+{
+    VDD_MODE modes[VDD_MAX_MODES];
+    UINT n = VddSnapshotModes(ctx, modes, nullptr);
+    NTSTATUS st = STATUS_NOT_SUPPORTED;
+
+#pragma warning(suppress: 4127)
+    if (IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes2)) {
+        IDDCX_TARGET_MODE2 tm[VDD_MAX_MODES];
+        IDARG_IN_UPDATEMODES2 in = {};
+        memset(tm, 0, sizeof(tm));
+        for (UINT i = 0; i < n; i++) {
+            tm[i].Size = sizeof(IDDCX_TARGET_MODE2);
+            tm[i].BitsPerComponent.Rgb = IDDCX_BITS_PER_COMPONENT_8;
+            VddCreateMonitorMode(&tm[i].TargetVideoSignalInfo.targetVideoSignalInfo, &modes[i], 1);
+        }
+        in.Reason = IDDCX_UPDATE_REASON_OTHER;
+        in.TargetModeCount = n;
+        in.pTargetModes = tm;
+        st = IddCxMonitorUpdateModes2(ctx->hMonitor, &in);
+    } else
+#pragma warning(suppress: 4127)
+    if (IDD_IS_FUNCTION_AVAILABLE(IddCxMonitorUpdateModes)) {
+        IDDCX_TARGET_MODE tm[VDD_MAX_MODES];
+        IDARG_IN_UPDATEMODES in = {};
+        memset(tm, 0, sizeof(tm));
+        for (UINT i = 0; i < n; i++) {
+            tm[i].Size = sizeof(IDDCX_TARGET_MODE);
+            VddCreateMonitorMode(&tm[i].TargetVideoSignalInfo.targetVideoSignalInfo, &modes[i], 1);
+        }
+        in.Reason = IDDCX_UPDATE_REASON_OTHER;
+        in.TargetModeCount = n;
+        in.pTargetModes = tm;
+        st = IddCxMonitorUpdateModes(ctx->hMonitor, &in);
+    }
+    VddLog("ModeUpdate: IddCxMonitorUpdateModes (%u modes) st=0x%08X", n, st);
+    return NT_SUCCESS(st);
+}
+
 static VOID VddModeTimerCallback(WDFTIMER Timer)
 {
     ModeTimerContext* timerCtx = WdfObjectGet_ModeTimerContext(Timer);
@@ -1291,8 +1442,30 @@ static VOID VddModeTimerCallback(WDFTIMER Timer)
 
     if (!ctx || !ctx->hMonitor || !ctx->hAdapter) {
         VddLog("ModeReplug: no monitor yet, the new list applies at the next arrival");
+        InterlockedExchange(&ctx->modeStage, 0);
         return;
     }
+
+    if (ctx->modeStage == 1) {
+        /* Seamless first: no monitor re-plug, so windows stay where they are.
+           The guest helper switches as soon as the mode is offered. */
+        if (VddUpdateTargetModes(ctx)) {
+            InterlockedExchange(&ctx->modeStage, 2);
+            WdfTimerStart(ctx->hModeTimer, WDF_REL_TIMEOUT_IN_MS(2500));
+            return;
+        }
+    } else if (ctx->modeStage == 2) {
+        VDD_SWAP_PROC* proc = ctx->pSwapProc;
+        UINT w = proc ? proc->frameWidth : 0, h = proc ? proc->frameHeight : 0;
+        if (w == ctx->pendingMode.width && h == ctx->pendingMode.height) {
+            VddLog("ModeUpdate: %ux%u active without a re-plug", w, h);
+            InterlockedExchange(&ctx->modeStage, 0);
+            return;
+        }
+        VddLog("ModeUpdate: still %ux%u after the update, re-plugging for %ux%u",
+               w, h, ctx->pendingMode.width, ctx->pendingMode.height);
+    }
+    InterlockedExchange(&ctx->modeStage, 0);
 
     VddLog("ModeReplug: departing monitor %p", (void*)ctx->hMonitor);
     st = IddCxMonitorDeparture(ctx->hMonitor);
@@ -1344,6 +1517,10 @@ NTSTATUS VddMonitorAssignSwapChain(
     }
     memset(proc, 0, sizeof(*proc));
     VddLog("AssignSwapChain: swap proc allocated at %p", (void*)proc);
+    InitializeCriticalSection(&proc->sendLock);
+    InitializeCriticalSection(&proc->queueLock);
+    proc->sendingSlot = -1;
+    proc->pendingSlot = -1;
 
     proc->hSwapChain      = pInArgs->hSwapChain;
     proc->hAvailableEvent = pInArgs->hNextSurfaceAvailable;
@@ -1363,6 +1540,8 @@ NTSTATUS VddMonitorAssignSwapChain(
         VddLog("AssignSwapChain: D3D11 device creation FAILED hr=0x%08X", hr);
         if (proc->hTerminateEvent)
             CloseHandle(proc->hTerminateEvent);
+        DeleteCriticalSection(&proc->queueLock);
+        DeleteCriticalSection(&proc->sendLock);
         free(proc);
         return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
     }
@@ -1394,6 +1573,8 @@ NTSTATUS VddMonitorAssignSwapChain(
         /* Don't release pDevice/pDeviceContext — they're cached in ctx */
         if (proc->hTerminateEvent)
             CloseHandle(proc->hTerminateEvent);
+        DeleteCriticalSection(&proc->queueLock);
+        DeleteCriticalSection(&proc->sendLock);
         free(proc);
         return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
     }
@@ -1435,12 +1616,36 @@ NTSTATUS VddMonitorAssignSwapChain(
                (void*)proc->hCursorEvent, (void*)proc->pCursorShapeBuffer);
     }
 
+    /* Frame sender: transmits while the swap chain thread captures. */
+    proc->hSendEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    proc->hSendThread = proc->hSendEvent
+        ? CreateThread(NULL, 0, VddSenderThread, proc, 0, NULL) : NULL;
+    if (!proc->hSendThread) {
+        VddLog("AssignSwapChain: sender thread FAILED err=%u", GetLastError());
+        if (proc->hSendEvent) CloseHandle(proc->hSendEvent);
+        proc->pStagingTex->Release();
+        if (proc->hTerminateEvent) CloseHandle(proc->hTerminateEvent);
+        if (proc->hCursorEvent) CloseHandle(proc->hCursorEvent);
+        free(proc->pCursorShapeBuffer);
+        DeleteCriticalSection(&proc->queueLock);
+        DeleteCriticalSection(&proc->sendLock);
+        free(proc);
+        return (NTSTATUS)0xC01E0012L; /* STATUS_GRAPHICS_INDIRECT_DISPLAY_ABANDON_SWAPCHAIN */
+    }
+
     /* Start swap chain processing thread (cursor must be set up first) */
     VddLog("AssignSwapChain: creating swap chain thread...");
     proc->hThread = CreateThread(NULL, 0, VddSwapChainThread, proc, 0, NULL);
     if (!proc->hThread)
     {
         VddLog("AssignSwapChain: CreateThread FAILED err=%u", GetLastError());
+        proc->bStopSend = TRUE;
+        SetEvent(proc->hSendEvent);
+        WaitForSingleObject(proc->hSendThread, 5000);
+        CloseHandle(proc->hSendThread);
+        CloseHandle(proc->hSendEvent);
+        DeleteCriticalSection(&proc->queueLock);
+        DeleteCriticalSection(&proc->sendLock);
         proc->pStagingTex->Release();
         /* Don't release pDevice/pDeviceContext — they're cached in ctx */
         if (proc->hTerminateEvent)
