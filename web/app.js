@@ -1545,7 +1545,7 @@ function renderDisplayTab(vm) {
     var snote = document.getElementById('vmd-stream-note');
     var video = typeof vm.displayVideo === 'number' ? vm.displayVideo : -1;
     if (perf && video === 1) {
-        snote.textContent = 'Active: the VM\u2019s GPU is encoding the picture.';
+        snote.textContent = 'Active: the VM\u2019s GPU is encoding the picture' + (vm.displayVideoCodec ? ' (' + vm.displayVideoCodec + ').' : '.');
     } else if (perf && drv >= 0 && drv < 3) {
         snote.textContent = 'Needs the updated display driver: shut the VM down and update its guest components.';
     } else if (perf && video === 2) {
@@ -1557,6 +1557,31 @@ function renderDisplayTab(vm) {
     } else {
         snote.textContent = '';
     }
+
+    document.getElementById('vmd-stream-options').hidden = !perf;
+    var codec = vm.displayCodec || 'auto';
+    document.querySelectorAll('#view-vm [data-codec]').forEach(function(b) {
+        var on = b.getAttribute('data-codec') === codec;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    var br = document.getElementById('vmd-bitrate');
+    var brv = String(vm.displayBitrate || 0);
+    if (!br.querySelector('option[value="' + brv + '"]')) {
+        var o = document.createElement('option');
+        o.value = brv; o.textContent = brv + ' Mbit/s';
+        br.appendChild(o);
+    }
+    if (document.activeElement !== br) br.value = brv;
+    var cnote = document.getElementById('vmd-codec-note');
+    var hevcHost = !lastHostInfo || lastHostInfo.hevcDecoder !== false;
+    var inUse = vm.displayVideoCodec ? 'In use: ' + vm.displayVideoCodec + '. ' : '';
+    if (codec !== 'h264' && !hevcHost)
+        cnote.textContent = inUse + 'HEVC needs \u201cHEVC Video Extensions\u201d from the Microsoft Store on this PC; until then H.264 is used.';
+    else if (codec === 'auto')
+        cnote.textContent = inUse + 'Auto uses HEVC (sharper at the same bit rate) when this PC and the VM\u2019s GPU support it, otherwise H.264.';
+    else
+        cnote.textContent = inUse + 'More bit rate gives a sharper picture in fast motion; Moonlight users often pick 80\u2013150 Mbit/s at 4K.';
 
     var rates = document.getElementById('vmd-rates');
     if (rates.getAttribute('data-sig') !== String(hz)) {
@@ -1591,6 +1616,30 @@ function sendDisplayMode(vm, res, hz) {
     vm.displayHz = hz;
     renderVmDetail();
     sendCmd('setDisplayMode', { vmId: vm.id, resolution: res, hz: hz });
+}
+
+function setVideoCodec(codec) {
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) return;
+    vm.displayCodec = codec;
+    renderVmDetail();
+    sendCmd('setVideoCodec', { vmId: vm.id, codec: codec });
+}
+
+function setVideoBitrate(value) {
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) return;
+    vm.displayBitrate = parseInt(value, 10) || 0;
+    sendCmd('setVideoBitrate', { vmId: vm.id, mbps: vm.displayBitrate });
+}
+
+function toggleViewerPref(which) {
+    var info = lastHostInfo || {};
+    var title = info.viewerTitleStats !== false, toolbar = info.viewerToolbar !== false;
+    if (which === 'titleStats') title = !title; else toolbar = !toolbar;
+    sendCmd('setViewerPrefs', { titleStats: title, toolbar: toolbar });
+    if (lastHostInfo) { lastHostInfo.viewerTitleStats = title; lastHostInfo.viewerToolbar = toolbar; }
+    renderSettingsView();
 }
 
 function setPerformanceMode(enabled) {
@@ -1658,6 +1707,10 @@ function renderSettingsView() {
         document.getElementById('set-close').value = lastHostInfo.closeToTrayWithoutAsking ? 'tray' : 'ask';
     document.getElementById('set-auto-tools').setAttribute('aria-checked',
         lastHostInfo && lastHostInfo.autoUpdateGuestTools === false ? 'false' : 'true');
+    document.getElementById('set-title-stats').setAttribute('aria-checked',
+        lastHostInfo && lastHostInfo.viewerTitleStats === false ? 'false' : 'true');
+    document.getElementById('set-toolbar').setAttribute('aria-checked',
+        lastHostInfo && lastHostInfo.viewerToolbar === false ? 'false' : 'true');
 
     var rows = [];
     if (lastHostInfo) {

@@ -157,11 +157,19 @@ typedef struct VideoQEntry {
     UINT32 width;
     UINT32 height;
     UINT32 flags;
+    UINT32 codec;
 } VideoQEntry;
 #pragma pack(pop)
 
 #define STREAM_QUALITY      0   /* raw frames (exact pixels) */
-#define STREAM_PERFORMANCE  1   /* GPU-encoded video (games) */
+#define STREAM_PERFORMANCE  1   /* GPU-encoded video (games), the default */
+
+/* Video codec choice (performance mode). Auto = HEVC when the guest driver
+   and this PC can do it, else H.264. */
+#define CODEC_AUTO          0
+#define CODEC_H264          1
+#define CODEC_HEVC          2
+#define VDD_PROTOCOL_HEVC   4
 
 /* Display resolution choices (system menu > Display). RES_ADAPTIVE follows
    the window's client size. */
@@ -188,7 +196,9 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define WM_IDD_FRAME_CONNECTED  (WM_USER + 104)
 #define WM_IDD_SET_MODE         (WM_USER + 105)  /* wp = res_choice + 1, lp = Hz */
 #define WM_IDD_SET_STREAM       (WM_USER + 106)  /* wp = STREAM_* */
-#define WM_IDD_VIDEO_STATUS     (WM_USER + 107)  /* guest reported video on/off */
+#define WM_IDD_VIDEO_STATUS     (WM_USER + 107)  /* guest reported video on/off; wp=1 prefs changed */
+#define WM_IDD_SET_CODEC        (WM_USER + 108)  /* wp = CODEC_* */
+#define WM_IDD_SET_BITRATE      (WM_USER + 109)  /* wp = Mbit/s, 0 = auto */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -324,6 +334,10 @@ struct VmDisplayIdd {
        queued under frame_cs (VideoQEntry + bytes, back to back) by the recv
        thread and decoded on the window thread, which owns the D3D context. */
     int            stream_mode;
+    int            codec_choice;     /* CODEC_* */
+    UINT           bitrate_mbps;     /* video bit rate, 0 = automatic */
+    volatile LONG  video_codec;      /* codec the guest is sending (VM_VIDEO_CODEC_*) */
+    BOOL           hevc_unavailable; /* HEVC decoding failed here: use H.264 */
     volatile LONG  video_active;
     volatile LONG  video_status_hr;
     BYTE          *vq_buf;           /* filled by the recv thread */
@@ -439,6 +453,9 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_RES_ADAPTIVE   0x1100
 #define IDM_RES_BASE       0x1110
 #define IDM_HZ_BASE        0x1200
+#define IDM_CODEC_AUTO     0x1320
+#define IDM_CODEC_H264     0x1330
+#define IDM_CODEC_HEVC     0x1340
 #define IDM_STREAM_QUALITY 0x1300
 #define IDM_STREAM_PERF    0x1310
 static BOOL g_idd_class_registered;
@@ -824,7 +841,8 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
 
 static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
                                       BOOL share_h2g, BOOL share_g2h,
-                                      int res_choice, UINT refresh_hz, int stream_mode)
+                                      int res_choice, UINT refresh_hz, int stream_mode,
+                                      int codec, UINT bitrate_mbps)
 {
     wchar_t path[MAX_PATH];
     char res[32];
@@ -840,11 +858,30 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
         strcpy_s(res, sizeof(res), "1920x1080");
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d,"
-               "\"resolution\":\"%s\",\"refreshHz\":%u,\"streamMode\":\"%s\"}\n",
+               "\"resolution\":\"%s\",\"refreshHz\":%u,\"streamMode\":\"%s\",\"codec\":\"%s\",\"bitrateMbps\":%u}\n",
             transmit_hotkeys ? 1 : 0, share_h2g ? 1 : 0, share_g2h ? 1 : 0,
             res, refresh_hz ? refresh_hz : 60,
-            stream_mode == STREAM_PERFORMANCE ? "performance" : "quality");
+            stream_mode == STREAM_QUALITY ? "quality" : "performance",
+            codec == CODEC_H264 ? "h264" : codec == CODEC_HEVC ? "hevc" : "auto",
+            bitrate_mbps);
     fclose(f);
+}
+
+/* Video bit rate in Mbit/s from display_settings.json (0 = automatic). */
+static UINT idd_display_settings_bitrate(const wchar_t *vhdx_path)
+{
+    wchar_t path[MAX_PATH];
+    char buf[512];
+    FILE *f;
+    UINT v = 0;
+    const char *p;
+    if (!vhdx_path || !vhdx_path[0]) return 0;
+    idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    if (_wfopen_s(&f, path, L"r") != 0 || !f) return 0;
+    if (fgets(buf, sizeof(buf), f) && (p = strstr(buf, "\"bitrateMbps\":")) != NULL)
+        if (sscanf_s(p + 14, "%u", &v) != 1) v = 0;
+    fclose(f);
+    return v > 500 ? 500 : v;
 }
 
 /* Read the persisted setting; if the file is absent, create it with the
@@ -854,7 +891,7 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
 static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
                                                 BOOL *share_h2g, BOOL *share_g2h,
                                                 int *res_choice, UINT *refresh_hz,
-                                                int *stream_mode)
+                                                int *stream_mode, int *codec)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
@@ -863,7 +900,8 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
     BOOL h2g = TRUE, g2h = TRUE;
     int res = RES_DEFAULT_PRESET;
     UINT hz = 60;
-    int stream = STREAM_QUALITY;
+    int stream = STREAM_PERFORMANCE;
+    int cdc = CODEC_AUTO;
     const char *p;
 
     if (!vhdx_path || vhdx_path[0] == L'\0') goto out;
@@ -872,7 +910,7 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
         idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE, RES_DEFAULT_PRESET, 60,
-                                  STREAM_QUALITY);
+                                  STREAM_PERFORMANCE, CODEC_AUTO, 0);
         goto out;
     }
     if (fgets(buf, sizeof(buf), f)) {
@@ -904,8 +942,12 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
                 for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
                     if (g_refresh_rates[i] == v) { hz = v; break; }
         }
-        if (strstr(buf, "\"streamMode\":\"performance\""))
-            stream = STREAM_PERFORMANCE;
+        /* Performance is the default; only an explicit choice of quality
+           keeps raw frames. */
+        if (strstr(buf, "\"streamMode\":\"quality\""))
+            stream = STREAM_QUALITY;
+        if (strstr(buf, "\"codec\":\"h264\"")) cdc = CODEC_H264;
+        else if (strstr(buf, "\"codec\":\"hevc\"")) cdc = CODEC_HEVC;
     }
     fclose(f);
 
@@ -915,6 +957,7 @@ out:
     if (res_choice) *res_choice = res;
     if (refresh_hz) *refresh_hz = hz;
     if (stream_mode) *stream_mode = stream;
+    if (codec) *codec = cdc;
     return transmit;
 }
 
@@ -942,7 +985,7 @@ void vm_display_idd_saved_mode(const wchar_t *vhdx_path, wchar_t *res, size_t re
     if (vhdx_path && vhdx_path[0]) {
         idd_display_settings_path(vhdx_path, path, MAX_PATH);
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, &choice, &rate, NULL);
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, &choice, &rate, NULL, NULL);
     }
     if (res && res_chars) {
         if (choice == RES_ADAPTIVE)
@@ -959,7 +1002,7 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
     int choice, i;
     BOOL hz_ok = FALSE;
     BOOL h2g = TRUE, g2h = TRUE, hotkeys;
-    int old_choice, stream;
+    int old_choice, stream, cdc;
     UINT old_hz;
 
     if (!idd_res_choice_from_text(res, &choice)) return FALSE;
@@ -973,28 +1016,103 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
     }
     if (!vhdx_path || !vhdx_path[0]) return FALSE;
     hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &old_choice, &old_hz,
-                                                  &stream);
-    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, stream);
+                                                  &stream, &cdc);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, stream, cdc,
+                              idd_display_settings_bitrate(vhdx_path));
     return TRUE;
 }
 
 BOOL vm_display_idd_saved_performance(const wchar_t *vhdx_path)
 {
-    int stream = STREAM_QUALITY;
+    int stream = STREAM_PERFORMANCE;
     wchar_t path[MAX_PATH];
     if (vhdx_path && vhdx_path[0]) {
         idd_display_settings_path(vhdx_path, path, MAX_PATH);
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, NULL, NULL, &stream);
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, NULL, NULL, &stream, NULL);
     }
     return stream == STREAM_PERFORMANCE;
+}
+
+const wchar_t *vm_display_idd_saved_codec(const wchar_t *vhdx_path)
+{
+    int cdc = CODEC_AUTO;
+    wchar_t path[MAX_PATH];
+    if (vhdx_path && vhdx_path[0]) {
+        idd_display_settings_path(vhdx_path, path, MAX_PATH);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, NULL, NULL, NULL, &cdc);
+    }
+    return cdc == CODEC_H264 ? L"h264" : cdc == CODEC_HEVC ? L"hevc" : L"auto";
+}
+
+BOOL vm_display_idd_set_codec(VmDisplayIdd *display, const wchar_t *vhdx_path, const wchar_t *codec)
+{
+    BOOL h2g = TRUE, g2h = TRUE, hotkeys;
+    int choice, stream, old;
+    UINT hz;
+    int cdc;
+    if (!codec) return FALSE;
+    if (_wcsicmp(codec, L"h264") == 0) cdc = CODEC_H264;
+    else if (_wcsicmp(codec, L"hevc") == 0) cdc = CODEC_HEVC;
+    else if (_wcsicmp(codec, L"auto") == 0) cdc = CODEC_AUTO;
+    else return FALSE;
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd)) {
+        PostMessageW(display->hwnd, WM_IDD_SET_CODEC, (WPARAM)cdc, 0);
+        return TRUE;
+    }
+    if (!vhdx_path || !vhdx_path[0]) return FALSE;
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &choice, &hz, &stream, &old);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, stream, cdc,
+                              idd_display_settings_bitrate(vhdx_path));
+    return TRUE;
+}
+
+UINT vm_display_idd_saved_bitrate(const wchar_t *vhdx_path)
+{
+    return idd_display_settings_bitrate(vhdx_path);
+}
+
+BOOL vm_display_idd_set_bitrate(VmDisplayIdd *display, const wchar_t *vhdx_path, UINT mbps)
+{
+    BOOL h2g = TRUE, g2h = TRUE, hotkeys;
+    int choice, stream, cdc;
+    UINT hz;
+    if (mbps > 500) return FALSE;
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd)) {
+        PostMessageW(display->hwnd, WM_IDD_SET_BITRATE, (WPARAM)mbps, 0);
+        return TRUE;
+    }
+    if (!vhdx_path || !vhdx_path[0]) return FALSE;
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &choice, &hz, &stream, &cdc);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, stream, cdc, mbps);
+    return TRUE;
+}
+
+BOOL vm_display_idd_hevc_supported(void)
+{
+    return vm_video_hevc_supported();
+}
+
+/* Codec the guest is sending: L"H.264", L"HEVC" or NULL when not video. */
+const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display)
+{
+    if (!display || !display->open || !display->frame_connected || !display->video_active) return NULL;
+    return display->video_codec == VM_VIDEO_CODEC_HEVC ? L"HEVC" : L"H.264";
+}
+
+/* VM window preferences changed (Settings): refresh title and toolbar. */
+void vm_display_idd_prefs_changed(VmDisplayIdd *display)
+{
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd))
+        PostMessageW(display->hwnd, WM_IDD_VIDEO_STATUS, 1, 0);
 }
 
 BOOL vm_display_idd_set_performance(VmDisplayIdd *display, const wchar_t *vhdx_path,
                                     BOOL performance)
 {
     BOOL h2g = TRUE, g2h = TRUE, hotkeys;
-    int choice;
+    int choice, cdc;
     UINT hz;
     int mode = performance ? STREAM_PERFORMANCE : STREAM_QUALITY;
 
@@ -1003,8 +1121,9 @@ BOOL vm_display_idd_set_performance(VmDisplayIdd *display, const wchar_t *vhdx_p
         return TRUE;
     }
     if (!vhdx_path || !vhdx_path[0]) return FALSE;
-    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &choice, &hz, NULL);
-    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, mode);
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &choice, &hz, NULL, &cdc);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, mode, cdc,
+                              idd_display_settings_bitrate(vhdx_path));
     return TRUE;
 }
 
@@ -1031,7 +1150,23 @@ static void idd_save_settings(VmDisplayIdd *d)
     idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
                               d->clip_share_host_to_guest,
                               d->clip_share_guest_to_host,
-                              d->res_choice, d->refresh_hz, d->stream_mode);
+                              d->res_choice, d->refresh_hz, d->stream_mode, d->codec_choice,
+                              d->bitrate_mbps);
+}
+
+/* The codec to ask the guest for: 1 H.264, 2 HEVC. HEVC needs a protocol 4
+   driver and an HEVC decoder on this PC. */
+static UINT idd_wanted_codec(VmDisplayIdd *d)
+{
+    BOOL hevc_ok = d->guest_driver >= VDD_PROTOCOL_HEVC && !d->hevc_unavailable &&
+                   vm_video_hevc_supported();
+    if (d->codec_choice == CODEC_H264) return 1;
+    if (d->codec_choice == CODEC_HEVC && !hevc_ok && d->guest_driver >= 0)
+        idd_log_main(d, L"HEVC is not available (%s); using H.264.",
+                     d->guest_driver < VDD_PROTOCOL_HEVC ? L"update the VM's guest components"
+                     : !vm_video_hevc_supported() ? L"install \"HEVC Video Extensions\" from the Microsoft Store on this PC"
+                     : L"decoding failed");
+    return hevc_ok ? 2 : 1;
 }
 
 /* Tell the guest driver which stream to send (protocol 3 drivers only).
@@ -1042,8 +1177,8 @@ static void idd_send_perf(VmDisplayIdd *d, UINT32 flags)
     BOOL ok = FALSE;
     if (!d || d->guest_driver < VDD_PROTOCOL_VIDEO) return;
     req.magic = PERF_REQUEST_MAGIC;
-    req.width = (d->stream_mode == STREAM_PERFORMANCE && !d->vdec_unavailable) ? 1 : 0;
-    req.height = 0;          /* kbit/s: 0 = the guest picks from size and refresh */
+    req.width = (d->stream_mode == STREAM_PERFORMANCE && !d->vdec_unavailable) ? idd_wanted_codec(d) : 0;
+    req.height = d->bitrate_mbps * 1000;   /* kbit/s: 0 = the guest picks from size and refresh */
     req.refresh = flags;
     if (req.width && !(flags & PERF_FLAG_KEYFRAME))
         InterlockedExchange(&d->video_status_hr, 0);
@@ -1053,7 +1188,8 @@ static void idd_send_perf(VmDisplayIdd *d, UINT32 flags)
     ReleaseSRWLockExclusive(&d->frame_send_lock);
     if (!(flags & PERF_FLAG_KEYFRAME) || !ok)
         idd_log_main(d, L"Stream mode %s requested (%s).",
-                req.width ? L"performance (GPU video)" : L"quality (raw frames)",
+                req.width == 2 ? L"performance (GPU video, HEVC)" :
+                req.width ? L"performance (GPU video, H.264)" : L"quality (raw frames)",
                 ok ? L"sent" : L"not connected");
 }
 
@@ -1160,6 +1296,12 @@ static void idd_update_display_menu(VmDisplayIdd *d)
     for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
         CheckMenuItem(sub, IDM_HZ_BASE + i * 0x10,
                       MF_BYCOMMAND | (d->refresh_hz == g_refresh_rates[i] ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sub, IDM_CODEC_AUTO,
+                  MF_BYCOMMAND | (d->codec_choice == CODEC_AUTO ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sub, IDM_CODEC_H264,
+                  MF_BYCOMMAND | (d->codec_choice == CODEC_H264 ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sub, IDM_CODEC_HEVC,
+                  MF_BYCOMMAND | (d->codec_choice == CODEC_HEVC ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(sub, IDM_STREAM_QUALITY,
                   MF_BYCOMMAND | (d->stream_mode == STREAM_QUALITY ? MF_CHECKED : MF_UNCHECKED));
     CheckMenuItem(sub, IDM_STREAM_PERF,
@@ -1192,6 +1334,10 @@ static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
         AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
         AppendMenuW(sub, MF_STRING, IDM_STREAM_QUALITY, L"Quality mode (exact pixels)");
         AppendMenuW(sub, MF_STRING, IDM_STREAM_PERF, L"Performance mode (GPU video, games)");
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_STRING, IDM_CODEC_AUTO, L"Codec: Auto");
+        AppendMenuW(sub, MF_STRING, IDM_CODEC_H264, L"Codec: H.264");
+        AppendMenuW(sub, MF_STRING, IDM_CODEC_HEVC, L"Codec: HEVC (H.265)");
     }
     AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)sub, L"Display");
 }
@@ -1214,11 +1360,16 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
     d->fps_last_recv = recv;
     d->fps_tick = now;
 
+    if (!asb_get_viewer_title_stats()) {
+        /* Settings > VM windows: name only. */
+        swprintf_s(title, ARRAYSIZE(title), L"%s%s", d->audio_muted ? L"\U0001F507 " : L"", d->vm_name);
+    } else
     swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS%s%s",
                d->audio_muted ? L"\U0001F507 " : L"",
                d->vm_name, d->frame_width, d->frame_height,
                d->frame_connected ? d->fps_value : 0,
-               (d->frame_connected && d->video_active) ? L" - GPU video" : L"",
+               (d->frame_connected && d->video_active)
+                   ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" - GPU HEVC" : L" - GPU H.264") : L"",
                (d->mode_supported && d->frame_connected && d->guest_driver == 0)
                    ? L" - old display driver (1920x1080 only)" : L"");
     SetWindowTextW(d->hwnd, title);
@@ -1296,7 +1447,8 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
             swprintf_s(text, cap, L"%ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
         break;
     case TB_FPS:     *icon = FALSE; swprintf_s(text, cap, L"%u FPS%s", d->frame_connected ? d->fps_value : 0,
-                              (d->frame_connected && d->video_active) ? L" \u00B7 GPU" : L""); break;
+                              (d->frame_connected && d->video_active)
+                                  ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" \u00B7 HEVC" : L" \u00B7 H.264") : L""); break;
     case TB_CLIP:    wcscpy_s(text, cap, L"\xE77F"); *on = d->clip_share_host_to_guest && d->clip_share_guest_to_host; break;
     case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); *on = !d->audio_muted; break;
     case TB_KEYS:    wcscpy_s(text, cap, L"\xE765"); *on = d->transmit_hotkeys; break;
@@ -1385,6 +1537,7 @@ static void tb_hide(VmDisplayIdd *d)
 static void tb_show(VmDisplayIdd *d, UINT linger_ms)
 {
     if (!d->toolbar_hwnd || d->relative_mouse || IsIconic(d->hwnd)) return;
+    if (!asb_get_viewer_toolbar()) { tb_hide(d); return; }   /* Settings > VM windows */
     tb_position(d);
     if (!IsWindowVisible(d->toolbar_hwnd))
         ShowWindow(d->toolbar_hwnd, SW_SHOWNOACTIVATE);
@@ -2325,12 +2478,27 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.Windowed                           = TRUE;
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
-    /* Video support lets the performance mode decode on this device. */
+    /* Flip model with two buffers: the compositor shows our latest frame
+       without an extra copy, and with Present(0) a newer frame replaces a
+       queued one instead of waiting behind it (smoother, lower latency).
+       Video support lets the performance mode decode on this device. */
+    scd.BufferCount = 2;
+    scd.SwapEffect  = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     hr = D3D11CreateDeviceAndSwapChain(
         NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
         D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         NULL, 0, D3D11_SDK_VERSION,
         &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+    if (FAILED(hr)) {
+        /* Older systems: the previous blit-model swap chain. */
+        scd.BufferCount = 1;
+        scd.SwapEffect  = DXGI_SWAP_EFFECT_DISCARD;
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
+            NULL, 0, D3D11_SDK_VERSION,
+            &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+    }
     if (FAILED(hr))
         hr = D3D11CreateDeviceAndSwapChain(
             NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
@@ -2340,6 +2508,14 @@ static BOOL d3d_init(VmDisplayIdd *d)
     if (FAILED(hr)) {
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
         return FALSE;
+    }
+    {
+        /* At most one frame queued ahead of the display. */
+        IDXGIDevice1 *dxgi1 = NULL;
+        if (SUCCEEDED(d->device->lpVtbl->QueryInterface(d->device, &IID_IDXGIDevice1, (void **)&dxgi1)) && dxgi1) {
+            dxgi1->lpVtbl->SetMaximumFrameLatency(dxgi1, 1);
+            dxgi1->lpVtbl->Release(dxgi1);
+        }
     }
 
     /* Create render target view from back buffer */
@@ -2568,15 +2744,24 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
 
         if (d->vdec_unavailable) continue;
         if (d->vdec && (vm_video_decoder_width(d->vdec) != e.width ||
-                        vm_video_decoder_height(d->vdec) != e.height)) {
+                        vm_video_decoder_height(d->vdec) != e.height ||
+                        vm_video_decoder_codec(d->vdec) != e.codec)) {
             vm_video_decoder_destroy(d->vdec);
             d->vdec = NULL;
             d->showing_video = FALSE;
         }
         if (!d->vdec) {
             if (!key) { need_key = TRUE; continue; }
-            d->vdec = vm_video_decoder_create(d->device, d->ctx, e.width, e.height,
+            d->vdec = vm_video_decoder_create(d->device, d->ctx, e.codec, e.width, e.height,
                                               idd_video_log, d);
+            if (!d->vdec && e.codec == VM_VIDEO_CODEC_HEVC) {
+                /* No working HEVC decoder here: ask for H.264 instead. */
+                d->hevc_unavailable = TRUE;
+                idd_log_main(d, L"HEVC decoding is not available on this PC; switching to H.264.");
+                idd_send_perf(d, PERF_FLAG_KEYFRAME);
+                need_key = FALSE;
+                continue;
+            }
             if (!d->vdec) {
                 /* Windows N editions lack the H.264 decoder (Media Feature
                    Pack). Fall back to raw frames for this session. */
@@ -2973,6 +3158,7 @@ static BOOL idd_video_enqueue_locked(VmDisplayIdd *d, const VideoHeader *vh, con
     e.width = vh->width;
     e.height = vh->height;
     e.flags = vh->flags;
+    e.codec = vh->codec == VM_VIDEO_CODEC_HEVC ? VM_VIDEO_CODEC_HEVC : VM_VIDEO_CODEC_H264;
     memcpy(d->vq_buf + d->vq_len, &e, sizeof(e));
     memcpy(d->vq_buf + d->vq_len + sizeof(e), data, vh->size);
     d->vq_len += need;
@@ -3152,9 +3338,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (!recv_exact(s, rest, (int)sizeof(rest)))
                     break;
                 InterlockedExchange(&d->video_active, rest[0] == 1 ? 1 : 0);
+                InterlockedExchange(&d->video_codec, rest[1] == VM_VIDEO_CODEC_HEVC ? VM_VIDEO_CODEC_HEVC
+                                                                                    : VM_VIDEO_CODEC_H264);
                 InterlockedExchange(&d->video_status_hr, (LONG)rest[2]);
                 if (rest[0] == 1)
-                    idd_log_main(d, L"Performance mode on: the guest GPU encodes H.264 video.");
+                    idd_log_main(d, L"Performance mode on: the guest GPU encodes %s video.",
+                                 rest[1] == VM_VIDEO_CODEC_HEVC ? L"HEVC" : L"H.264");
                 else if ((LONG)rest[2] < 0)
                     idd_log_main(d, L"Performance mode unavailable in the guest (0x%08X): no hardware "
                                L"video encoder on its GPU. Showing raw frames.", rest[2]);
@@ -3697,6 +3886,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                        id < IDM_HZ_BASE + ARRAYSIZE(g_refresh_rates) * 0x10) {
                 d->refresh_hz = g_refresh_rates[(id - IDM_HZ_BASE) / 0x10];
                 handled = TRUE;
+            } else if (id == IDM_CODEC_AUTO || id == IDM_CODEC_H264 || id == IDM_CODEC_HEVC) {
+                PostMessageW(hwnd, WM_IDD_SET_CODEC,
+                             id == IDM_CODEC_HEVC ? CODEC_HEVC : id == IDM_CODEC_H264 ? CODEC_H264 : CODEC_AUTO, 0);
+                return 0;
             } else if (id == IDM_STREAM_QUALITY || id == IDM_STREAM_PERF) {
                 PostMessageW(hwnd, WM_IDD_SET_STREAM,
                              id == IDM_STREAM_PERF ? STREAM_PERFORMANCE : STREAM_QUALITY, 0);
@@ -3989,7 +4182,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         return 0;
 
+    case WM_IDD_SET_CODEC:
+        if (d) {
+            d->codec_choice = (int)wp;
+            d->hevc_unavailable = FALSE;      /* choosing it again retries */
+            idd_update_display_menu(d);
+            idd_save_settings(d);
+            idd_send_perf(d, PERF_FLAG_KEYFRAME);
+            if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
+        }
+        return 0;
+
+    case WM_IDD_SET_BITRATE:
+        if (d) {
+            d->bitrate_mbps = (UINT)wp;
+            idd_save_settings(d);
+            idd_send_perf(d, PERF_FLAG_KEYFRAME);
+            if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
+        }
+        return 0;
+
     case WM_IDD_VIDEO_STATUS:
+        if (d && wp == 1 && !asb_get_viewer_toolbar()) tb_hide(d);
         if (d) {
             idd_update_title(d, TRUE);
             if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
@@ -4319,7 +4533,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &h2g, &g2h,
                                                               &d->res_choice, &d->refresh_hz,
-                                                              &d->stream_mode);
+                                                              &d->stream_mode, &d->codec_choice);
+    d->bitrate_mbps = idd_display_settings_bitrate(vm->vhdx_path);
     d->clip_share_host_to_guest = h2g;
     d->clip_share_guest_to_host = g2h;
     d->guest_linux = (_wcsicmp(vm->os_type, L"Linux") == 0);

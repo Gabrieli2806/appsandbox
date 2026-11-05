@@ -152,13 +152,39 @@
                 <div class="card" id="vmd-stream-card">
                     <div class="card-head">
                         <h3>Streaming mode</h3>
-                        <p class="muted">Performance compresses the picture on the VM's GPU (H.264), like Moonlight, so high resolutions and frame rates stay smooth. Quality sends exact, uncompressed pixels.</p>
+                        <p class="muted">Performance compresses the picture on the VM's GPU (H.264 or HEVC), like Moonlight, so high resolutions and frame rates stay smooth. Quality sends exact, uncompressed pixels.</p>
                     </div>
                     <div class="segmented" role="group" aria-label="Streaming mode">
                         <button type="button" data-stream="quality" onclick="setPerformanceMode(false)">Quality</button>
                         <button type="button" data-stream="performance" onclick="setPerformanceMode(true)">Performance (games)</button>
                     </div>
                     <p class="muted small" id="vmd-stream-note"></p>
+                    <div class="stream-options" id="vmd-stream-options">
+                        <div class="stream-option">
+                            <span class="row-label">Codec</span>
+                            <div class="segmented" role="group" aria-label="Video codec">
+                                <button type="button" data-codec="auto" onclick="setVideoCodec('auto')">Auto</button>
+                                <button type="button" data-codec="h264" onclick="setVideoCodec('h264')">H.264</button>
+                                <button type="button" data-codec="hevc" onclick="setVideoCodec('hevc')">HEVC (H.265)</button>
+                            </div>
+                        </div>
+                        <div class="stream-option">
+                            <label class="row-label" for="vmd-bitrate">Bit rate</label>
+                            <select id="vmd-bitrate" onchange="setVideoBitrate(this.value)">
+                                <option value="0">Auto (by resolution and refresh rate)</option>
+                                <option value="20">20 Mbit/s</option>
+                                <option value="40">40 Mbit/s</option>
+                                <option value="60">60 Mbit/s</option>
+                                <option value="80">80 Mbit/s</option>
+                                <option value="100">100 Mbit/s</option>
+                                <option value="120">120 Mbit/s</option>
+                                <option value="150">150 Mbit/s</option>
+                                <option value="200">200 Mbit/s</option>
+                                <option value="300">300 Mbit/s</option>
+                            </select>
+                        </div>
+                        <p class="muted small" id="vmd-codec-note"></p>
+                    </div>
                 </div>
                 <p class="muted small">More display options (FPS counter, borderless fullscreen with F11, clipboard, audio) are in the VM window: right-click its title bar.</p>
             </div>
@@ -211,6 +237,17 @@
         <div class="row">
             <div class="row-text"><span class="row-label">Update guest components automatically</span><span class="muted small">Before a Windows VM starts, copy in this version&rsquo;s agent, helpers and display driver when they are newer.</span></div>
             <button type="button" class="switch" id="set-auto-tools" role="switch" aria-checked="true" aria-label="Update guest components automatically" onclick="toggleAutoTools()"><span></span></button>
+        </div>
+    </div>
+    <h2 class="group-title win-only">VM windows</h2>
+    <div class="card rows win-only">
+        <div class="row">
+            <div class="row-text"><span class="row-label">Show resolution and FPS in the title bar</span><span class="muted small">Name, resolution, frames per second and the video codec in use.</span></div>
+            <button type="button" class="switch" id="set-title-stats" role="switch" aria-checked="true" aria-label="Show resolution and FPS in the title bar" onclick="toggleViewerPref('titleStats')"><span></span></button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Floating toolbar</span><span class="muted small">The bar that appears when the pointer touches the top edge of a VM window. Its options stay in the title bar menu.</span></div>
+            <button type="button" class="switch" id="set-toolbar" role="switch" aria-checked="true" aria-label="Floating toolbar" onclick="toggleViewerPref('toolbar')"><span></span></button>
         </div>
     </div>
     <h2 class="group-title">This computer</h2>

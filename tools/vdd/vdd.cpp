@@ -794,7 +794,7 @@ static void VddEncOut(void* user, const BYTE* data, UINT len, BOOL key, UINT wid
     h.magic  = VDD_VIDEO_MAGIC;
     h.width  = width;
     h.height = height;
-    h.codec  = VDD_CODEC_H264;
+    h.codec  = proc->videoCodec ? proc->videoCodec : VDD_CODEC_H264;
     h.flags  = key ? VDD_VIDEO_FLAG_KEY : 0;
     h.size   = len;
     h.seq    = ++proc->videoSeq;
@@ -846,7 +846,7 @@ static void VddSendPerfStatus(VDD_SWAP_PROC* proc, UINT mode, HRESULT hr)
     VDD_WIRE_PERF_STATUS st;
     st.magic = VDD_PERF_STATUS_MAGIC;
     st.mode = mode;
-    st.codec = mode ? VDD_CODEC_H264 : 0;
+    st.codec = mode ? (proc->videoCodec ? proc->videoCodec : VDD_CODEC_H264) : 0;
     st.hresult = (INT32)hr;
     if (proc->hClientConn)
         VddSendMsg(proc, &st, (int)sizeof(st), NULL, 0);
@@ -881,21 +881,25 @@ static BOOL VddPerfEnsure(VDD_SWAP_PROC* proc, UINT width, UINT height)
             VddSendPerfStatus(proc, 0, E_FAIL);
             return FALSE;
         }
-        if (VddEncoderWidth(proc->pEncoder) == width && VddEncoderHeight(proc->pEncoder) == height)
+        if (VddEncoderWidth(proc->pEncoder) == width && VddEncoderHeight(proc->pEncoder) == height &&
+            proc->perfCodecAsked == (UINT)proc->perfWanted)
             return TRUE;
         VddPerfStop(proc);   /* new size: new encoder (starts with a key frame) */
     }
 
     UINT fps = proc->pContext && proc->pContext->lastRefresh ? proc->pContext->lastRefresh : 60;
     VddEncoder* enc = nullptr;
+    UINT want = proc->perfWanted == 2 ? VDD_CODEC_HEVC : VDD_CODEC_H264;
+    proc->perfCodecAsked = (UINT)proc->perfWanted;
     HRESULT hr = VddEncoderCreate(proc->pDevice, proc->pDeviceContext, width, height, fps,
-                                  (UINT)proc->perfKbps, VddEncOut, proc, VddEncLog, &enc);
+                                  (UINT)proc->perfKbps, want, VddEncOut, proc, VddEncLog, &enc);
     if (FAILED(hr) || !enc) {
         proc->perfFailed = TRUE;
         VddLog("Perf: no GPU video encoder (0x%08X), staying with raw frames", hr);
         VddSendPerfStatus(proc, 0, FAILED(hr) ? hr : E_FAIL);
         return FALSE;
     }
+    proc->videoCodec = VddEncoderCodec(enc);
     proc->pEncoder = enc;
     VddLog("Perf: GPU video on (%s, %ux%u)", VddEncoderName(enc), width, height);
     VddSendPerfStatus(proc, 1, S_OK);
@@ -932,10 +936,10 @@ static BOOL VddPollHostRequests(VDD_SWAP_PROC* proc)
         }
         if (req.magic == VDD_PERF_REQUEST_MAGIC) {
             /* width = mode, height = kbps, refresh = flags */
-            LONG mode = req.width == 1 ? 1 : 0;
+            LONG mode = (req.width == 1 || req.width == 2) ? (LONG)req.width : 0;
             if (mode != proc->perfWanted || req.height != (UINT32)proc->perfKbps) {
                 VddLog("HostRequest: performance mode %s (%u kbit/s)",
-                       mode ? "video" : "raw", req.height);
+                       mode == 2 ? "HEVC video" : mode ? "H.264 video" : "raw", req.height);
                 if (proc->pEncoder && req.height != (UINT32)proc->perfKbps)
                     VddPerfStop(proc);   /* new bit rate: reopen */
             }

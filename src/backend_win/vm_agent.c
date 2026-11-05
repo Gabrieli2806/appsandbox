@@ -6,6 +6,7 @@
 #include "hcn_network.h"
 #include "ui.h"
 #include <stdio.h>
+#include <stdlib.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -242,11 +243,16 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
         ui_log(L"Agent service stopped in \"%s\".", vm->name);
         return 2;
     } else if (strncmp(buf, "gpu_copy_progress:", 18) == 0) {
-        ui_log(L"GPU copy progress for \"%s\": %S", vm->name, buf + 18);
+        /* Every boot the agent syncs the host's GPU driver folders; files
+           already there (same size) are skipped, so this is quick and only
+           copies after a host driver update. Progress stays out of the log. */
     } else if (strncmp(buf, "gpu_copy_done:", 14) == 0) {
-        ui_log(L"GPU copy complete for \"%s\" (%S files).", vm->name, buf + 14);
+        if (atoi(buf + 14) > 0)
+            ui_log(L"GPU drivers for \"%s\": %S files updated from this PC's driver.", vm->name, buf + 14);
+        else
+            ui_log(L"GPU drivers for \"%s\": up to date.", vm->name);
     } else if (strncmp(buf, "gpu_copy_error:", 15) == 0) {
-        ui_log(L"GPU copy error for \"%s\": %S", vm->name, buf + 15);
+        ui_log(L"GPU driver sync for \"%s\": %S", vm->name, buf + 15);
     } else if (strncmp(buf, "gpu_device_status:", 18) == 0) {
         ui_log(L"[%s] GPU: %S", vm->name, buf + 18);
     } else if (strcmp(buf, "gpu_device_ok") == 0) {

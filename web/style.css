@@ -653,3 +653,9 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 }
 
 #modal-message { white-space: pre-line; }
+
+/* Streaming options (Display tab) */
+.stream-options { display: flex; flex-direction: column; gap: 12px; margin-top: 12px; }
+.stream-options[hidden] { display: none; }
+.stream-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.stream-option select { min-width: 220px; }

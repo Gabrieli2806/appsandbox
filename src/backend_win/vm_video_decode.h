@@ -20,9 +20,16 @@ typedef struct VmVideoDecoder VmVideoDecoder;
 
 typedef void (*VmVideoLogFn)(void *user, const wchar_t *msg);
 
+#define VM_VIDEO_CODEC_H264 1
+#define VM_VIDEO_CODEC_HEVC 2
+
+/* TRUE when this PC has an HEVC decoder (Windows needs the "HEVC Video
+   Extensions" from the Microsoft Store for it). Checked once. */
+BOOL vm_video_hevc_supported(void);
+
 /* NULL when Media Foundation or the device cannot decode video. */
 VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11DeviceContext *ctx,
-                                        UINT width, UINT height,
+                                        UINT codec, UINT width, UINT height,
                                         VmVideoLogFn log, void *log_user);
 
 /* Decodes one access unit. Returns 1 when a new picture is in the output
@@ -34,6 +41,7 @@ int vm_video_decoder_decode(VmVideoDecoder *dec, const BYTE *data, UINT len);
 ID3D11ShaderResourceView *vm_video_decoder_srv(VmVideoDecoder *dec);
 
 UINT vm_video_decoder_width(VmVideoDecoder *dec);
+UINT vm_video_decoder_codec(VmVideoDecoder *dec);
 UINT vm_video_decoder_height(VmVideoDecoder *dec);
 BOOL vm_video_decoder_hardware(VmVideoDecoder *dec);
 

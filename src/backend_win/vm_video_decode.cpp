@@ -36,6 +36,7 @@ struct VmVideoDecoder {
     BOOL                    mf_started;
     BOOL                    hw;
 
+    UINT                    codec;                  /* VM_VIDEO_CODEC_* */
     UINT                    width, height;          /* picture size */
     UINT                    coded_w, coded_h;       /* decoder output size (may be padded) */
 
@@ -352,21 +353,48 @@ static int drain(VmVideoDecoder *d)
     return got;
 }
 
+extern "C" BOOL vm_video_hevc_supported(void)
+{
+    static LONG cached = -1;
+    if (cached < 0) {
+        MFT_REGISTER_TYPE_INFO in_info = { MFMediaType_Video, MFVideoFormat_HEVC };
+        IMFActivate **list = nullptr;
+        UINT32 count = 0;
+        BOOL com = SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED));
+        BOOL mf = SUCCEEDED(MFStartup(MF_VERSION, MFSTARTUP_LITE));
+        if (mf && SUCCEEDED(MFTEnumEx(MFT_CATEGORY_VIDEO_DECODER,
+                                      MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_ASYNCMFT |
+                                      MFT_ENUM_FLAG_HARDWARE | MFT_ENUM_FLAG_LOCALMFT |
+                                      MFT_ENUM_FLAG_SORTANDFILTER,
+                                      &in_info, NULL, &list, &count))) {
+            for (UINT32 i = 0; i < count; i++) list[i]->Release();
+            CoTaskMemFree(list);
+        }
+        if (mf) MFShutdown();
+        if (com) CoUninitialize();
+        InterlockedExchange(&cached, count > 0 ? 1 : 0);
+    }
+    return cached == 1;
+}
+
 extern "C" VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11DeviceContext *ctx,
-                                                   UINT width, UINT height,
+                                                   UINT codec, UINT width, UINT height,
                                                    VmVideoLogFn log, void *log_user)
 {
     VmVideoDecoder *d;
     HRESULT hr;
     IMFActivate **list = nullptr;
     UINT32 count = 0;
-    MFT_REGISTER_TYPE_INFO in_info = { MFMediaType_Video, MFVideoFormat_H264 };
+    MFT_REGISTER_TYPE_INFO in_info = { MFMediaType_Video,
+                                       codec == VM_VIDEO_CODEC_HEVC ? MFVideoFormat_HEVC : MFVideoFormat_H264 };
+    const wchar_t *cname = codec == VM_VIDEO_CODEC_HEVC ? L"HEVC" : L"H.264";
 
     if (!device || !ctx || width == 0 || height == 0) return NULL;
     d = (VmVideoDecoder *)calloc(1, sizeof(*d));
     if (!d) return NULL;
     d->log = log;
     d->log_user = log_user;
+    d->codec = codec == VM_VIDEO_CODEC_HEVC ? VM_VIDEO_CODEC_HEVC : VM_VIDEO_CODEC_H264;
     d->width = width;
     d->height = height;
     d->device = device;
@@ -398,7 +426,7 @@ extern "C" VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11D
                    MFT_ENUM_FLAG_SYNCMFT | MFT_ENUM_FLAG_LOCALMFT | MFT_ENUM_FLAG_SORTANDFILTER,
                    &in_info, NULL, &list, &count);
     if (FAILED(hr) || count == 0) {
-        dlog(d, L"Video: no H.264 decoder on this PC (0x%08X).", hr);
+        dlog(d, L"Video: no %s decoder on this PC (0x%08X).", cname, hr);
         if (list) CoTaskMemFree(list);
         goto fail;
     }
@@ -409,7 +437,7 @@ extern "C" VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11D
     }
     for (UINT32 i = 0; i < count; i++) list[i]->Release();
     CoTaskMemFree(list);
-    if (!d->mft) { dlog(d, L"Video: could not open an H.264 decoder."); goto fail; }
+    if (!d->mft) { dlog(d, L"Video: could not open an %s decoder.", cname); goto fail; }
 
     {
         IMFAttributes *attrs = nullptr;
@@ -440,13 +468,13 @@ extern "C" VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11D
         hr = MFCreateMediaType(&t);
         if (FAILED(hr)) goto fail;
         t->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-        t->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
+        t->SetGUID(MF_MT_SUBTYPE, d->codec == VM_VIDEO_CODEC_HEVC ? MFVideoFormat_HEVC : MFVideoFormat_H264);
         MFSetAttributeSize(t, MF_MT_FRAME_SIZE, width, height);
         MFSetAttributeRatio(t, MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
         t->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
         hr = d->mft->SetInputType(0, t, 0);
         t->Release();
-        if (FAILED(hr)) { dlog(d, L"Video: decoder refused %ux%u H.264 (0x%08X).", width, height, hr); goto fail; }
+        if (FAILED(hr)) { dlog(d, L"Video: decoder refused %ux%u %s (0x%08X).", width, height, cname, hr); goto fail; }
     }
     d->coded_w = width;
     d->coded_h = height;
@@ -459,7 +487,7 @@ extern "C" VmVideoDecoder *vm_video_decoder_create(ID3D11Device *device, ID3D11D
     hr = ensure_output_textures(d);
     if (FAILED(hr)) goto fail;
 
-    dlog(d, L"Video: H.264 decoder ready (%ux%u, %s).", width, height,
+    dlog(d, L"Video: %s decoder ready (%ux%u, %s).", cname, width, height,
          d->hw ? L"GPU" : L"CPU");
     return d;
 
@@ -513,6 +541,7 @@ extern "C" ID3D11ShaderResourceView *vm_video_decoder_srv(VmVideoDecoder *d)
 }
 
 extern "C" UINT vm_video_decoder_width(VmVideoDecoder *d) { return d ? d->width : 0; }
+extern "C" UINT vm_video_decoder_codec(VmVideoDecoder *d) { return d ? d->codec : 0; }
 extern "C" UINT vm_video_decoder_height(VmVideoDecoder *d) { return d ? d->height : 0; }
 extern "C" BOOL vm_video_decoder_hardware(VmVideoDecoder *d) { return d ? d->hw : FALSE; }
 

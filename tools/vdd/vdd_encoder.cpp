@@ -153,6 +153,8 @@ struct VddEncoder {
     UINT64                  framesIn, framesOut;
     BOOL                    pendingKey;
 
+    UINT                    vcodec;         /* 1 H.264, 2 HEVC */
+
     /* NVENC backend (preferred; Media Foundation is the fallback) */
     BOOL                    nvenc;
     HMODULE                 nvDll;
@@ -702,13 +704,29 @@ static HRESULT OpenNvenc(VddEncoder* e)
     NV_ENC_PRESET_CONFIG pc = {};
     pc.version = NV_ENC_PRESET_CONFIG_VER;
     pc.presetCfg.version = NV_ENC_CONFIG_VER;
-    st = e->nv.nvEncGetEncodePresetConfigEx(e->nvEnc, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID,
+    BOOL hevc = e->vcodec == 2;
+    GUID codecGuid = hevc ? NV_ENC_CODEC_HEVC_GUID : NV_ENC_CODEC_H264_GUID;
+    if (hevc) {
+        /* Not every NVENC generation encodes HEVC at every size. */
+        NV_ENC_CAPS_PARAM cp = {};
+        int val = 0;
+        cp.version = NV_ENC_CAPS_PARAM_VER;
+        cp.capsToQuery = NV_ENC_CAPS_WIDTH_MAX;
+        if (e->nv.nvEncGetEncodeCaps(e->nvEnc, NV_ENC_CODEC_HEVC_GUID, &cp, &val) != NV_ENC_SUCCESS ||
+            val < (int)e->width) {
+            EncLog(e, "Encoder: this GPU cannot encode HEVC at %ux%u, using H.264", e->width, e->height);
+            hevc = FALSE;
+            e->vcodec = 1;
+            codecGuid = NV_ENC_CODEC_H264_GUID;
+        }
+    }
+    st = e->nv.nvEncGetEncodePresetConfigEx(e->nvEnc, codecGuid, NV_ENC_PRESET_P3_GUID,
                                             NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &pc);
     if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NVENC preset failed (%d)", (int)st); CloseNvenc(e); return E_FAIL; }
 
     NV_ENC_CONFIG cfg = pc.presetCfg;
     cfg.version = NV_ENC_CONFIG_VER;
-    cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+    cfg.profileGUID = hevc ? NV_ENC_HEVC_PROFILE_MAIN_GUID : NV_ENC_H264_PROFILE_HIGH_GUID;
     cfg.gopLength = NVENC_INFINITE_GOPLENGTH;          /* key frames only on request */
     cfg.frameIntervalP = 1;                            /* no B-frames */
     cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
@@ -717,20 +735,29 @@ static HRESULT OpenNvenc(VddEncoder* e)
     /* About two frames of buffer: low latency without starving big frames. */
     cfg.rcParams.vbvBufferSize = (uint32_t)((UINT64)e->kbps * 1000 * 2 / e->fps);
     cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
-    NV_ENC_CONFIG_H264* h = &cfg.encodeCodecConfig.h264Config;
-    h->idrPeriod = NVENC_INFINITE_GOPLENGTH;
-    h->repeatSPSPPS = 1;
-    h->h264VUIParameters.videoSignalTypePresentFlag = 1;
-    h->h264VUIParameters.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
-    h->h264VUIParameters.videoFullRangeFlag = 0;
-    h->h264VUIParameters.colourDescriptionPresentFlag = 1;
-    h->h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
-    h->h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
-    h->h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+    NV_ENC_CONFIG_H264_VUI_PARAMETERS* vui;
+    if (hevc) {
+        NV_ENC_CONFIG_HEVC* h = &cfg.encodeCodecConfig.hevcConfig;
+        h->idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        h->repeatSPSPPS = 1;
+        vui = &h->hevcVUIParameters;
+    } else {
+        NV_ENC_CONFIG_H264* h = &cfg.encodeCodecConfig.h264Config;
+        h->idrPeriod = NVENC_INFINITE_GOPLENGTH;
+        h->repeatSPSPPS = 1;
+        vui = &h->h264VUIParameters;
+    }
+    vui->videoSignalTypePresentFlag = 1;
+    vui->videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    vui->videoFullRangeFlag = 0;
+    vui->colourDescriptionPresentFlag = 1;
+    vui->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    vui->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
 
     NV_ENC_INITIALIZE_PARAMS ip = {};
     ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
-    ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    ip.encodeGUID = codecGuid;
     ip.presetGUID = NV_ENC_PRESET_P3_GUID;
     ip.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
     ip.encodeWidth = e->width;
@@ -770,7 +797,7 @@ static HRESULT OpenNvenc(VddEncoder* e)
         e->nvReg[i] = rr.registeredResource;
     }
     e->nvenc = TRUE;
-    strcpy_s(e->name, sizeof(e->name), "NVIDIA NVENC H.264");
+    strcpy_s(e->name, sizeof(e->name), hevc ? "NVIDIA NVENC HEVC" : "NVIDIA NVENC H.264");
     return S_OK;
 }
 
@@ -824,7 +851,7 @@ static HRESULT NvencEncode(VddEncoder* e, UINT slot, BOOL key)
 /* ---- Public API ---- */
 
 HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
-                         UINT width, UINT height, UINT fps, UINT kbps,
+                         UINT width, UINT height, UINT fps, UINT kbps, UINT codec,
                          VddEncOutputFn out, void* user, VddEncLogFn log,
                          VddEncoder** result)
 {
@@ -840,6 +867,7 @@ HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
     e->width = width;
     e->height = height;
     e->fps = fps ? fps : 60;
+    e->vcodec = codec == 2 ? 2 : 1;
     if (!kbps) {
         /* About 0.15 bit per pixel per frame: ~19 Mbit/s at 1080p60,
            ~75 Mbit/s at 4K60. The link is local, so err on the side of
@@ -883,7 +911,8 @@ HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
         return S_OK;
     }
 
-    /* Other GPUs: a hardware encoder through Media Foundation. */
+    /* Other GPUs: a hardware H.264 encoder through Media Foundation. */
+    e->vcodec = 1;
     if (!VddMfLoad()) {
         EncLog(e, "Encoder: Media Foundation is not available in this guest");
         hr = E_NOTIMPL;
@@ -1027,6 +1056,7 @@ BOOL VddEncoderFailed(VddEncoder* e) { return !e || e->failed != 0; }
 UINT VddEncoderWidth(VddEncoder* e) { return e ? e->width : 0; }
 UINT VddEncoderHeight(VddEncoder* e) { return e ? e->height : 0; }
 const char* VddEncoderName(VddEncoder* e) { return e ? e->name : ""; }
+UINT VddEncoderCodec(VddEncoder* e) { return e ? e->vcodec : 0; }
 
 void VddEncoderDestroy(VddEncoder* e)
 {

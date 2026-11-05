@@ -267,6 +267,12 @@ ASB_API BOOL asb_get_suppress_tray_warn(void);
    and the VM's state notifications (VmInstance.updating_tools). */
 ASB_API void asb_set_auto_update_guest_tools(BOOL enabled);
 ASB_API BOOL asb_get_auto_update_guest_tools(void);
+
+/* VM window preferences: stats (resolution, FPS, codec) in the title bar and
+   the floating toolbar. Both on by default; saved with asb_save(). */
+ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar);
+ASB_API BOOL asb_get_viewer_title_stats(void);
+ASB_API BOOL asb_get_viewer_toolbar(void);
 ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm);
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm);
 

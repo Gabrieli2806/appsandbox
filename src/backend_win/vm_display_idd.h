@@ -51,4 +51,17 @@ BOOL vm_display_idd_set_performance(VmDisplayIdd *display, const wchar_t *vhdx_p
    but unavailable, -1 not connected. */
 int vm_display_idd_video_active(VmDisplayIdd *display);
 
+/* Video codec per VM: "auto" (HEVC when possible, else H.264), "h264", "hevc". */
+const wchar_t *vm_display_idd_saved_codec(const wchar_t *vhdx_path);
+BOOL vm_display_idd_set_codec(VmDisplayIdd *display, const wchar_t *vhdx_path, const wchar_t *codec);
+/* Video bit rate per VM in Mbit/s, 0 = automatic. */
+UINT vm_display_idd_saved_bitrate(const wchar_t *vhdx_path);
+BOOL vm_display_idd_set_bitrate(VmDisplayIdd *display, const wchar_t *vhdx_path, UINT mbps);
+/* TRUE when this PC can decode HEVC. */
+BOOL vm_display_idd_hevc_supported(void);
+/* Codec being received (L"H.264"/L"HEVC"), NULL when not in video mode. */
+const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display);
+/* Settings > VM windows changed: refresh title and toolbar. */
+void vm_display_idd_prefs_changed(VmDisplayIdd *display);
+
 #endif /* VM_DISPLAY_IDD_H */

@@ -101,8 +101,9 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
  * cannot change resolution; older hosts never ask, so they never see ASVH. */
 #define VDD_HELLO_QUERY_MAGIC 0x51485341  /* "ASHQ" little-endian */
 #define VDD_HELLO_MAGIC     0x48565341  /* "ASVH" little-endian */
-/* 2: mode requests. 3: performance mode (GPU-encoded video, ASPF/ASPS/ASVE). */
-#define VDD_PROTOCOL_VERSION 3
+/* 2: mode requests. 3: performance mode (GPU-encoded video, ASPF/ASPS/ASVE).
+   4: HEVC (ASPF mode 2). */
+#define VDD_PROTOCOL_VERSION 4
 
 typedef struct _VDD_WIRE_HELLO {
     UINT32  magic;              /* VDD_HELLO_MAGIC */
@@ -119,7 +120,7 @@ typedef struct _VDD_WIRE_MODE_REQUEST {
 
 /* Wire protocol: performance mode (protocol 3).
  * Host -> guest ASPF (16 bytes, same shape as a mode request):
- *   { magic, mode (0 = raw frames, 1 = H.264 video), kbps (0 = auto), flags }
+ *   { magic, mode (0 = raw frames, 1 = H.264 video, 2 = HEVC video), kbps (0 = auto), flags }
  *   flags bit 0 asks for a key frame (the host decoder restarted).
  * Guest -> host ASPS: { magic, mode in use, codec, HRESULT of the last start }.
  * Guest -> host ASVE: header + `size` bytes of one Annex-B access unit. */
@@ -128,6 +129,7 @@ typedef struct _VDD_WIRE_MODE_REQUEST {
 #define VDD_VIDEO_MAGIC         0x45565341  /* "ASVE" little-endian */
 #define VDD_PERF_FLAG_KEYFRAME  0x1
 #define VDD_CODEC_H264          1
+#define VDD_CODEC_HEVC          2
 #define VDD_VIDEO_FLAG_KEY      0x1
 
 typedef struct _VDD_WIRE_PERF_STATUS {
@@ -333,7 +335,9 @@ typedef struct _VDD_SWAP_PROC {
     /* Performance mode (GPU video). perfWanted is what the host asked for on
        the current connection; pEncoder exists while video is being sent. */
     struct VddEncoder*  pEncoder;
-    volatile LONG       perfWanted;         /* 0 raw, 1 H.264 */
+    volatile LONG       perfWanted;         /* 0 raw, 1 H.264, 2 HEVC */
+    UINT                videoCodec;         /* codec of pEncoder (VDD_CODEC_*) */
+    UINT                perfCodecAsked;     /* perfWanted the encoder was made for */
     volatile LONG       perfKbps;
     volatile LONG       perfKeyReq;         /* host asked for a key frame */
     BOOL                perfFailed;         /* encoder failed: raw until asked again */

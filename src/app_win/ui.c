@@ -328,6 +328,9 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_string(jb, L"defaultDiskDirectory", base_dir);
     jb_bool(jb, L"closeToTrayWithoutAsking", asb_get_suppress_tray_warn());
     jb_bool(jb, L"autoUpdateGuestTools", asb_get_auto_update_guest_tools());
+    jb_bool(jb, L"viewerTitleStats", asb_get_viewer_title_stats());
+    jb_bool(jb, L"viewerToolbar", asb_get_viewer_toolbar());
+    jb_bool(jb, L"hevcDecoder", vm_display_idd_hevc_supported());
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -420,8 +423,15 @@ static void build_vm_json(JsonBuilder *jb, int i)
             for (k = 0; k < ASB_MAX_VMS; k++)
                 if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
                     video = vm_display_idd_video_active(g_idd_displays[k]);
+            const wchar_t *vcodec = NULL;
+            for (k = 0; k < ASB_MAX_VMS; k++)
+                if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
+                    vcodec = vm_display_idd_video_codec(g_idd_displays[k]);
             jb_bool(jb, L"displayPerformance", vm_display_idd_saved_performance(v->vhdx_path));
             jb_int(jb, L"displayVideo", video);
+            jb_string(jb, L"displayCodec", vm_display_idd_saved_codec(v->vhdx_path));
+            jb_string(jb, L"displayVideoCodec", vcodec ? vcodec : L"");
+            jb_int(jb, L"displayBitrate", (int)vm_display_idd_saved_bitrate(v->vhdx_path));
         }
         jb_bool(jb, L"updatingTools", v->updating_tools);
         jb_bool(jb, L"guestToolsOutdated", asb_vm_guest_tools_outdated(asb_vm_get(i)));
@@ -1563,6 +1573,39 @@ static void handle_webview2_message(const wchar_t *json)
                 ui_show_alert(msg);
             }
         }
+    } else if (wcscmp(action, L"setVideoCodec") == 0 || wcscmp(action, L"setVideoBitrate") == 0) {
+        /* {vmId, codec: "auto"|"h264"|"hevc"} or {vmId, mbps} */
+        int idx, i, mbps = 0;
+        wchar_t codec[16] = L"";
+        VmInstance *v;
+        VmDisplayIdd *display = NULL;
+        BOOL is_codec = wcscmp(action, L"setVideoCodec") == 0;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
+            (v = asb_vm_instance(asb_vm_get(idx))) != NULL &&
+            _wcsicmp(v->os_type, L"Windows") == 0) {
+            for (i = 0; i < ASB_MAX_VMS; i++)
+                if (g_display_vm_ids[i] == v->unique_id && g_idd_displays[i] &&
+                    vm_display_idd_is_open(g_idd_displays[i]))
+                    display = g_idd_displays[i];
+            if (is_codec) {
+                if (json_get_string(json, L"codec", codec, ARRAYSIZE(codec)))
+                    vm_display_idd_set_codec(display, v->vhdx_path, codec);
+            } else if (json_get_int(json, L"mbps", &mbps) && mbps >= 0 && mbps <= 500) {
+                vm_display_idd_set_bitrate(display, v->vhdx_path, (UINT)mbps);
+            }
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"setViewerPrefs") == 0) {
+        /* {titleStats, toolbar} from Settings > VM windows */
+        BOOL title = asb_get_viewer_title_stats(), toolbar = asb_get_viewer_toolbar();
+        int i;
+        json_get_bool(json, L"titleStats", &title);
+        json_get_bool(json, L"toolbar", &toolbar);
+        asb_set_viewer_prefs(title, toolbar);
+        asb_save();
+        for (i = 0; i < ASB_MAX_VMS; i++)
+            if (g_idd_displays[i]) vm_display_idd_prefs_changed(g_idd_displays[i]);
+        send_host_info();
     } else if (wcscmp(action, L"setPerformanceMode") == 0) {
         /* {vmId, enabled}: GPU video (games) vs. raw frames, per VM. */
         int idx, i;

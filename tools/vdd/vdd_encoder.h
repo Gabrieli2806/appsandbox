@@ -28,8 +28,10 @@ typedef void (*VddEncLogFn)(const char* fmt, ...);
    device). fps is the display refresh, kbps the target bit rate (0 = auto).
    The device must have been created with D3D11_CREATE_DEVICE_VIDEO_SUPPORT.
    Call from a thread that has COM initialised. */
+/* codec: 1 H.264, 2 HEVC (HEVC needs NVENC; other encoders fall back to
+   H.264, see VddEncoderCodec). */
 HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
-                         UINT width, UINT height, UINT fps, UINT kbps,
+                         UINT width, UINT height, UINT fps, UINT kbps, UINT codec,
                          VddEncOutputFn out, void* user, VddEncLogFn log,
                          VddEncoder** result);
 
@@ -48,5 +50,6 @@ BOOL VddEncoderFailed(VddEncoder* enc);
 UINT VddEncoderWidth(VddEncoder* enc);
 UINT VddEncoderHeight(VddEncoder* enc);
 const char* VddEncoderName(VddEncoder* enc);
+UINT VddEncoderCodec(VddEncoder* enc);   /* codec actually produced */
 
 void VddEncoderDestroy(VddEncoder* enc);

@@ -634,6 +634,12 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
 
         if (rc != P9_OK) {
             agent_log("GPU copy share '%s' failed (rc=%d).", si->share_name, rc);
+            if (state->notify_sock != NULL) {
+                char line[256];
+                sprintf_s(line, sizeof(line), "log:GPU driver sync: '%s' failed (error %d)",
+                          si->share_name, rc);
+                send_line(state->notify_sock, line);
+            }
             failed_shares++;
         } else {
             agent_log("GPU copy share '%s' done (%d files).", si->share_name, files);
