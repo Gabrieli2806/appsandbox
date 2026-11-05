@@ -34,7 +34,7 @@ everything else is C (C++ only where an API needs it).
 | `tools/headless-api/` | Python SDK `asb.py`, API reference README, examples, integration tests |
 | `tools/sign/` | Release/sign scripts (EV signing needs the owner's hardware key) |
 | `vendor/` | devcon, WebView2, QEMU (Mac), virtio |
-| `.github/workflows/windows-test-build.yml` | The only CI: builds Release x64, packages, publishes pre-release `test-build-N` on `release/**` pushes |
+| `.github/workflows/` | `windows-test-build.yml` (Release x64 build, zip + MSIX, pre-release `test-build-N` on `release/**` pushes), `ci.yml` (build check x64 + ARM64 on PRs and other branches, web UI syntax and `tools/check-sources.py`), `codeql.yml` (CodeQL for the host C/C++) |
 
 Stale, ignore: `tools/agent/build.cmd`, `tools/agent/deploy.bat`, the
 `src\ui.h` entry in `AppSandboxCore.vcxproj`, links to
@@ -83,7 +83,8 @@ guests) / vsock port N (Linux guests), registered in `hcs_vm.c` (ports 1–6):
 | 5/6 | Clipboard host→guest / guest→host | `vm_clipboard.c` |
 | 7 | SSH | proxied TCP |
 
-Display protocol (`VDD_PROTOCOL_VERSION`, currently 4):
+Display protocol (`VDD_PROTOCOL_VERSION`, currently 4), defined once in
+`src/core/asb_display_protocol.h` for the driver and the viewer:
 - Guest→host: `ASFR` raw frame (+dirty rects), `ASCR` cursor, `ASVH` hello
   `{version}`, `ASPS` performance status `{mode, codec, hresult}`, `ASVE`
   encoded access unit `{w, h, codec, flags(key), size, seq}` + Annex-B bytes.
@@ -103,8 +104,8 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
    host must gate on the version from `ASVH` (old drivers never answer
    `ASHQ`; after `HELLO_FRAME_GRACE` frames the host treats them as old).
    Unknown input types are ignored by older helpers — keep it that way.
-2. **Mirrored definitions are kept in sync by hand**: `vdd.h` ↔
-   `vm_display_idd.c`; audio header (`appsandbox-audio.c` ↔ viewer);
+2. **Mirrored definitions are kept in sync by hand** (except the display
+   protocol, which is one shared header): audio header (`appsandbox-audio.c` ↔ viewer);
    clipboard (Windows host, Mac host, guests); `protocol.h` (shared).
 3. **Guest-side changes need delivery.** New VMs get files from
    `disk_util.c`. Existing Windows VMs get the 6 helper exes and the VDD

@@ -72,10 +72,7 @@ jobs:
       - name: Syntax-check web/app.js
         run: node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"
 
-      # Compares src/core with AppSandboxCore.vcxproj and the Xcode project.
-      # It reports src/core/asb_vm_id.h, which neither project file lists. The
-      # header is found through the include path, so the builds still work.
-      # This step stays non-blocking until both project files list the header.
+      # Compares src/core with AppSandboxCore.vcxproj and the Xcode project:
+      # a file added to src/core must be listed in both.
       - name: Check src/core against the project files
-        continue-on-error: true
         run: python3 tools/check-sources.py

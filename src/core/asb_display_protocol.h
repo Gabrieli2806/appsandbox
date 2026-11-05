@@ -10,10 +10,12 @@
  *    answer the hello query; old hosts never send it.
  *  - Never change the layout of an existing message.
  *
- * Needs <windows.h> types (UINT32, INT32, UINT64) included first.
+ * Platform-neutral (stdint types), so the macOS host's viewer can use it too.
  */
 #ifndef ASB_DISPLAY_PROTOCOL_H
 #define ASB_DISPLAY_PROTOCOL_H
+
+#include <stdint.h>
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -22,31 +24,31 @@
 
 #pragma pack(push, 1)
 typedef struct _VDD_WIRE_FRAME_HEADER {
-    UINT32  magic;              /* VDD_FRAME_MAGIC */
-    UINT32  width;
-    UINT32  height;
-    UINT32  stride;
-    UINT64  frame_seq;
-    UINT32  dirty_rect_count;   /* 0 = full frame */
+    uint32_t  magic;              /* VDD_FRAME_MAGIC */
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  stride;
+    uint64_t  frame_seq;
+    uint32_t  dirty_rect_count;   /* 0 = full frame */
 } VDD_WIRE_FRAME_HEADER;
 
 /* Wire protocol: ASCR cursor update (sent over HvSocket to host) */
 #define VDD_CURSOR_MAGIC    0x52435341  /* "ASCR" little-endian */
 
 typedef struct _VDD_WIRE_CURSOR_HEADER {
-    UINT32  magic;              /* VDD_CURSOR_MAGIC */
-    INT32   x;                  /* cursor position X (can be negative) */
-    INT32   y;                  /* cursor position Y (can be negative) */
-    UINT32  visible;            /* 0 = hidden, 1 = visible */
-    UINT32  shape_updated;      /* 0 = position only, 1 = shape data follows */
-    UINT32  shape_id;           /* monotonic shape identifier */
-    UINT32  width;              /* cursor width in pixels */
-    UINT32  height;             /* cursor height in pixels */
-    UINT32  pitch;              /* row pitch in bytes */
-    UINT32  xhot;               /* hotspot X */
-    UINT32  yhot;               /* hotspot Y */
-    UINT32  cursor_type;        /* 1=MASKED_COLOR, 2=ALPHA */
-    UINT32  shape_data_size;    /* bytes of shape data following header (0 if !shape_updated) */
+    uint32_t  magic;              /* VDD_CURSOR_MAGIC */
+    int32_t   x;                  /* cursor position X (can be negative) */
+    int32_t   y;                  /* cursor position Y (can be negative) */
+    uint32_t  visible;            /* 0 = hidden, 1 = visible */
+    uint32_t  shape_updated;      /* 0 = position only, 1 = shape data follows */
+    uint32_t  shape_id;           /* monotonic shape identifier */
+    uint32_t  width;              /* cursor width in pixels */
+    uint32_t  height;             /* cursor height in pixels */
+    uint32_t  pitch;              /* row pitch in bytes */
+    uint32_t  xhot;               /* hotspot X */
+    uint32_t  yhot;               /* hotspot Y */
+    uint32_t  cursor_type;        /* 1=MASKED_COLOR, 2=ALPHA */
+    uint32_t  shape_data_size;    /* bytes of shape data following header (0 if !shape_updated) */
 } VDD_WIRE_CURSOR_HEADER;
 /* Wire protocol: ASMR mode request (host -> guest on the same frame channel).
  * The host asks for a resolution/refresh. If the mode is not in the list yet
@@ -65,16 +67,16 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
 #define VDD_PROTOCOL_VERSION 4
 
 typedef struct _VDD_WIRE_HELLO {
-    UINT32  magic;              /* VDD_HELLO_MAGIC */
-    UINT32  version;            /* VDD_PROTOCOL_VERSION */
-    UINT32  reserved[2];
+    uint32_t  magic;              /* VDD_HELLO_MAGIC */
+    uint32_t  version;            /* VDD_PROTOCOL_VERSION */
+    uint32_t  reserved[2];
 } VDD_WIRE_HELLO;
 
 typedef struct _VDD_WIRE_MODE_REQUEST {
-    UINT32  magic;              /* VDD_MODE_REQUEST_MAGIC */
-    UINT32  width;
-    UINT32  height;
-    UINT32  refresh;            /* Hz */
+    uint32_t  magic;              /* VDD_MODE_REQUEST_MAGIC */
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  refresh;            /* Hz */
 } VDD_WIRE_MODE_REQUEST;
 
 /* Wire protocol: performance mode (protocol 3).
@@ -92,20 +94,20 @@ typedef struct _VDD_WIRE_MODE_REQUEST {
 #define VDD_VIDEO_FLAG_KEY      0x1
 
 typedef struct _VDD_WIRE_PERF_STATUS {
-    UINT32  magic;              /* VDD_PERF_STATUS_MAGIC */
-    UINT32  mode;               /* 0 raw, 1 video */
-    UINT32  codec;              /* VDD_CODEC_H264 when mode == 1 */
-    INT32   hresult;            /* why video could not start (mode 0) */
+    uint32_t  magic;              /* VDD_PERF_STATUS_MAGIC */
+    uint32_t  mode;               /* 0 raw, 1 video */
+    uint32_t  codec;              /* VDD_CODEC_H264 when mode == 1 */
+    int32_t   hresult;            /* why video could not start (mode 0) */
 } VDD_WIRE_PERF_STATUS;
 
 typedef struct _VDD_WIRE_VIDEO_HEADER {
-    UINT32  magic;              /* VDD_VIDEO_MAGIC */
-    UINT32  width;
-    UINT32  height;
-    UINT32  codec;              /* VDD_CODEC_H264 */
-    UINT32  flags;              /* VDD_VIDEO_FLAG_KEY */
-    UINT32  size;               /* bytes of bitstream that follow */
-    UINT64  seq;
+    uint32_t  magic;              /* VDD_VIDEO_MAGIC */
+    uint32_t  width;
+    uint32_t  height;
+    uint32_t  codec;              /* VDD_CODEC_H264 */
+    uint32_t  flags;              /* VDD_VIDEO_FLAG_KEY */
+    uint32_t  size;               /* bytes of bitstream that follow */
+    uint64_t  seq;
 } VDD_WIRE_VIDEO_HEADER;
 #pragma pack(pop)
 
