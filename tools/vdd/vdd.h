@@ -335,6 +335,15 @@ typedef struct _VDD_DEVICE_CONTEXT {
        stage 2 checks the surface took that size and otherwise re-plugs the
        monitor so the OS re-reads its modes. */
     WDFTIMER            hModeTimer;
+
+    /* Render adapter: the GPU the OS composes this monitor's desktop on.
+       Left alone it is WARP (the CPU), so every frame of a game rendered on
+       the GPU-PV adapter was copied to the CPU for composition. The driver
+       prefers the GPU-PV adapter; hRenderTimer retries once GPU drivers are
+       up (they are copied in after boot). */
+    WDFTIMER            hRenderTimer;
+    LUID                renderLuid;         /* adapter last requested, 0 = none */
+    UINT                renderAttempts;
     VDD_MODE            pendingMode;
     volatile LONG       modeStage;          /* 0 idle, 1 update modes, 2 verify */
 
@@ -376,6 +385,13 @@ struct ModeTimerContext
 };
 
 WDF_DECLARE_CONTEXT_TYPE(ModeTimerContext);
+
+struct RenderTimerContext
+{
+    VDD_DEVICE_CONTEXT* pContext;
+};
+
+WDF_DECLARE_CONTEXT_TYPE(RenderTimerContext);
 
 /* ============================================================================
  *  IddCx Callback declarations

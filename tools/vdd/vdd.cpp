@@ -1190,6 +1190,9 @@ static void VddContextCleanup(VDD_DEVICE_CONTEXT* ctx)
     if (ctx->hModeTimer) {
         WdfTimerStop(ctx->hModeTimer, TRUE);
     }
+    if (ctx->hRenderTimer) {
+        WdfTimerStop(ctx->hRenderTimer, TRUE);
+    }
 
     /* Stop recovery timer (wait for any in-progress callback to finish) */
     if (ctx->hRecoveryTimer) {
@@ -1279,8 +1282,7 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
 
         VddLog("InitAdapter: IddCxAdapterInitAsync succeeded (adapter=%p)", (void*)adapterInitOut.AdapterObject);
 
-        /* Render-adapter selection is left to IddCx / the OS default (WARP); the VDD is
-           display-only and pins no render adapter. */
+        /* The render adapter is chosen in FinishInit (VddApplyRenderAdapter). */
     }
     else
     {
@@ -1292,10 +1294,96 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
 /*  FinishInit (called from AdapterInitFinished)                             */
 /* ========================================================================= */
 
+/* ========================================================================= */
+/*  Render adapter                                                           */
+/* ========================================================================= */
+
+/* The hardware GPU to compose on: the non-software adapter with the most
+   dedicated memory (the GPU-PV adapter of the GPU given to the VM). FALSE
+   when only WARP / basic adapters exist. HKLM\SOFTWARE\AppSandbox
+   DisplayRenderAdapter = "default" keeps the OS choice. */
+static BOOL VddFindRenderAdapter(LUID* out, char* name, size_t name_cap)
+{
+    IDXGIFactory1* factory = nullptr;
+    IDXGIAdapter1* adapter = nullptr;
+    SIZE_T best_mem = 0;
+    BOOL found = FALSE;
+
+    {
+        HKEY k;
+        char val[32] = "";
+        DWORD len = sizeof(val);
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\AppSandbox", 0, KEY_READ, &k) == ERROR_SUCCESS) {
+            RegQueryValueExA(k, "DisplayRenderAdapter", NULL, NULL, (BYTE*)val, &len);
+            RegCloseKey(k);
+            if (_stricmp(val, "default") == 0) return FALSE;
+        }
+    }
+
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return FALSE;
+    for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
+        DXGI_ADAPTER_DESC1 d = {};
+        if (SUCCEEDED(adapter->GetDesc1(&d)) &&
+            !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
+            d.VendorId != 0x1414 /* Microsoft: WARP, Basic Render, Hyper-V video */ &&
+            (!found || d.DedicatedVideoMemory > best_mem)) {
+            found = TRUE;
+            best_mem = d.DedicatedVideoMemory;
+            *out = d.AdapterLuid;
+            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, (int)name_cap, NULL, NULL);
+        }
+        adapter->Release();
+        adapter = nullptr;
+    }
+    factory->Release();
+    return found;
+}
+
+/* Ask IddCx to compose on the hardware GPU. Returns TRUE once that is done
+   (or nothing more can be done). Runs on a WDF thread. */
+static BOOL VddApplyRenderAdapter(VDD_DEVICE_CONTEXT* ctx)
+{
+    LUID luid = {};
+    char name[128] = "";
+    if (!ctx->hAdapter) return FALSE;
+#pragma warning(suppress: 4127)
+    if (!IDD_IS_FUNCTION_AVAILABLE(IddCxAdapterSetRenderAdapter)) {
+        VddLog("RenderAdapter: IddCxAdapterSetRenderAdapter not available, OS default kept");
+        return TRUE;
+    }
+    if (!VddFindRenderAdapter(&luid, name, sizeof(name))) {
+        VddLog("RenderAdapter: no hardware GPU yet (attempt %u)", ctx->renderAttempts);
+        return FALSE;
+    }
+    if (luid.LowPart == ctx->renderLuid.LowPart && luid.HighPart == ctx->renderLuid.HighPart)
+        return TRUE;
+    {
+        IDARG_IN_ADAPTERSETRENDERADAPTER in = {};
+        in.PreferredRenderAdapter = luid;
+        IddCxAdapterSetRenderAdapter(ctx->hAdapter, &in);
+    }
+    ctx->renderLuid = luid;
+    VddLog("RenderAdapter: composing on \"%s\" (LUID=%08X:%08X)", name, luid.HighPart, luid.LowPart);
+    return TRUE;
+}
+
+static VOID VddRenderTimerCallback(WDFTIMER Timer)
+{
+    RenderTimerContext* t = WdfObjectGet_RenderTimerContext(Timer);
+    VDD_DEVICE_CONTEXT* ctx = t->pContext;
+    if (!ctx) return;
+    ctx->renderAttempts++;
+    /* GPU-PV drivers are copied in and started after boot: keep looking for
+       a few minutes. */
+    if (!VddApplyRenderAdapter(ctx) && ctx->renderAttempts < 60)
+        WdfTimerStart(ctx->hRenderTimer, WDF_REL_TIMEOUT_IN_SEC(5));
+}
+
 static void VddFinishInit(VDD_DEVICE_CONTEXT* ctx)
 {
     VddLog("FinishInit: adapter ready (ctx=%p)", (void*)ctx);
-    UNREFERENCED_PARAMETER(ctx);
+    if (ctx->hRenderTimer)
+        WdfTimerStart(ctx->hRenderTimer, WDF_REL_TIMEOUT_IN_MS(100));
 }
 
 /* ========================================================================= */
@@ -2153,6 +2241,25 @@ NTSTATUS VddDeviceAdd(
             VddLog("DeviceAdd: recovery timer created");
         } else {
             VddLog("DeviceAdd: WdfTimerCreate FAILED st=0x%08X (recovery disabled)", st);
+        }
+    }
+
+    /* Timer that moves composition onto the hardware GPU (see VddApplyRenderAdapter). */
+    {
+        WDF_TIMER_CONFIG timerConfig;
+        WDF_OBJECT_ATTRIBUTES timerAttrs;
+        WDFTIMER hTimer = NULL;
+
+        WDF_TIMER_CONFIG_INIT(&timerConfig, VddRenderTimerCallback);
+        timerConfig.AutomaticSerialization = FALSE;
+        WDF_OBJECT_ATTRIBUTES_INIT_CONTEXT_TYPE(&timerAttrs, RenderTimerContext);
+        timerAttrs.ParentObject = hDevice;
+        st = WdfTimerCreate(&timerConfig, &timerAttrs, &hTimer);
+        if (NT_SUCCESS(st)) {
+            WdfObjectGet_RenderTimerContext(hTimer)->pContext = ctx;
+            ctx->hRenderTimer = hTimer;
+        } else {
+            VddLog("DeviceAdd: render timer WdfTimerCreate FAILED st=0x%08X (OS default adapter)", st);
         }
     }
 
