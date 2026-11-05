@@ -1093,6 +1093,8 @@ function showVmMenu(vm, anchor) {
     if (!hostBridge.isMac) {
         item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
         item('Export…', !vm.running && !bld && !vm.isTemplate, function() { sendCmd('exportVm', { vmId: vm.id }); });
+        item('Create desktop shortcut', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'desktop' }); });
+        item('Add to Start menu', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'start' }); });
     }
     if (vm.sshEnabled)
         item('Open SSH terminal', sshReady(vm), function() { sendCmd('sshConnect', { vmId: vm.id }); });

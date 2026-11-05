@@ -29,6 +29,8 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "uuid.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -816,6 +818,124 @@ static void do_connect_idd(int idx)
    automatic RDP -> IDD switching handlers (WM_VM_AGENT_ONLINE,
    WM_VM_HYPERV_VIDEO_OFF) keep using the per-display functions so they
    can close one without re-opening the other. */
+static void do_connect_vm(int idx);
+
+/* ---- VM shortcuts (desktop / Start menu) ---- */
+
+#define IDT_LAUNCH_VM 0x4C56
+static wchar_t g_launch_vm[256];
+static int     g_launch_tries;
+
+void ui_launch_vm_by_name(const wchar_t *name)
+{
+    if (!name || !name[0] || !g_hwnd_main) return;
+    wcscpy_s(g_launch_vm, ARRAYSIZE(g_launch_vm), name);
+    g_launch_tries = 0;
+    SetTimer(g_hwnd_main, IDT_LAUNCH_VM, 300, NULL);
+}
+
+/* Runs until the app finished initializing (prerequisites, VM list), then
+   starts the VM or brings its display forward. */
+static void launch_vm_tick(HWND hwnd)
+{
+    int i, idx = -1;
+    VmInstance *v = NULL;
+    if (!g_launch_vm[0]) { KillTimer(hwnd, IDT_LAUNCH_VM); return; }
+    if (!g_prereq_ok) {
+        if (++g_launch_tries > 200) { KillTimer(hwnd, IDT_LAUNCH_VM); g_launch_vm[0] = 0; }
+        return;
+    }
+    KillTimer(hwnd, IDT_LAUNCH_VM);
+    for (i = 0; i < asb_vm_count(); i++) {
+        VmInstance *c = asb_vm_instance(asb_vm_get(i));
+        if (c && _wcsicmp(c->name, g_launch_vm) == 0) { idx = i; v = c; break; }
+    }
+    if (!v) {
+        wchar_t msg[400];
+        swprintf_s(msg, ARRAYSIZE(msg), L"There is no VM named \"%s\" anymore. "
+                   L"Delete the shortcut or create it again.", g_launch_vm);
+        g_launch_vm[0] = 0;
+        ShowWindow(hwnd, SW_RESTORE);
+        ui_show_alert(msg);
+        return;
+    }
+    g_launch_vm[0] = 0;
+    if (v->running) {
+        do_connect_vm(idx);
+    } else if (v->starting || asb_vm_is_building(asb_vm_get(idx))) {
+        ShowWindow(hwnd, SW_RESTORE);
+        ui_show_alert(L"That VM is busy right now; try again in a moment.");
+    } else {
+        HRESULT hr = asb_vm_start(asb_vm_get(idx), -1, -1, NULL);
+        if (FAILED(hr)) {
+            ShowWindow(hwnd, SW_RESTORE);
+            ui_show_alert(L"The VM could not be started. See the log in App Sandbox.");
+        }
+    }
+    send_vm_list();
+}
+
+/* Shortcut file name: the VM name without characters Windows forbids. */
+static void shortcut_file_name(const wchar_t *vm_name, wchar_t *out, size_t cap)
+{
+    size_t i, n = 0;
+    for (i = 0; vm_name[i] && n + 1 < cap; i++) {
+        wchar_t c = vm_name[i];
+        out[n++] = (c < 32 || wcschr(L"<>:\"/\\|?*", c)) ? L'_' : c;
+    }
+    out[n] = 0;
+}
+
+/* Creates "<VM>.lnk" on the desktop or in Start menu > App Sandbox.
+   Returns S_OK and the path in out_path. */
+static HRESULT create_vm_shortcut(const wchar_t *vm_name, BOOL start_menu,
+                                  wchar_t *out_path, size_t out_cap)
+{
+    PWSTR folder = NULL;
+    wchar_t exe[MAX_PATH], dir[MAX_PATH], args[400], file[260], desc[400], *slash;
+    IShellLinkW *link = NULL;
+    IPersistFile *pf = NULL;
+    HRESULT hr;
+
+    if (wcschr(vm_name, L'"')) return E_INVALIDARG;
+    hr = SHGetKnownFolderPath(start_menu ? &FOLDERID_Programs : &FOLDERID_Desktop, 0, NULL, &folder);
+    if (FAILED(hr)) return hr;
+    if (start_menu) {
+        swprintf_s(dir, MAX_PATH, L"%s\\App Sandbox", folder);
+        CreateDirectoryW(dir, NULL);
+    } else {
+        wcscpy_s(dir, MAX_PATH, folder);
+    }
+    CoTaskMemFree(folder);
+
+    shortcut_file_name(vm_name, file, ARRAYSIZE(file));
+    swprintf_s(out_path, out_cap, L"%s\\%s.lnk", dir, file);
+
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    swprintf_s(args, ARRAYSIZE(args), L"--vm \"%s\"", vm_name);
+    swprintf_s(desc, ARRAYSIZE(desc), L"Start %s in App Sandbox", vm_name);
+
+    hr = CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW, (void **)&link);
+    if (FAILED(hr)) return hr;
+    link->lpVtbl->SetPath(link, exe);
+    link->lpVtbl->SetArguments(link, args);
+    wcscpy_s(dir, MAX_PATH, exe);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = 0;
+    link->lpVtbl->SetWorkingDirectory(link, dir);
+    link->lpVtbl->SetDescription(link, desc);
+    link->lpVtbl->SetIconLocation(link, exe, 0);
+    hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&pf);
+    if (SUCCEEDED(hr)) {
+        hr = pf->lpVtbl->Save(pf, out_path, TRUE);
+        pf->lpVtbl->Release(pf);
+    }
+    link->lpVtbl->Release(link);
+    if (SUCCEEDED(hr))
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW | SHCNF_FLUSHNOWAIT, out_path, NULL);
+    return hr;
+}
+
 static void do_connect_vm(int idx)
 {
     VmInstance *vm;
@@ -1421,6 +1541,28 @@ static void handle_webview2_message(const wchar_t *json)
                 ui_show_alert(L"That display mode is not available.");
         }
         send_vm_list();
+    } else if (wcscmp(action, L"createShortcut") == 0) {
+        /* {vmId, where: "desktop"|"start"} */
+        int idx;
+        wchar_t where[16] = L"desktop", path[MAX_PATH * 2], msg[MAX_PATH * 2 + 200];
+        VmInstance *v;
+        json_get_string(json, L"where", where, ARRAYSIZE(where));
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
+            (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            BOOL start_menu = wcscmp(where, L"start") == 0;
+            HRESULT hr = create_vm_shortcut(v->name, start_menu, path, ARRAYSIZE(path));
+            if (SUCCEEDED(hr)) {
+                ui_log(L"Shortcut for \"%s\" created: %s", v->name, path);
+                swprintf_s(msg, ARRAYSIZE(msg), start_menu
+                    ? L"\"%s\" is now in the Start menu (App Sandbox folder). You can pin it to Start or the taskbar from there."
+                    : L"A shortcut to \"%s\" is on your desktop. Opening it starts the VM and shows its window.",
+                    v->name);
+                ui_show_alert(msg);
+            } else {
+                swprintf_s(msg, ARRAYSIZE(msg), L"The shortcut could not be created (0x%08X).", (unsigned)hr);
+                ui_show_alert(msg);
+            }
+        }
     } else if (wcscmp(action, L"setPerformanceMode") == 0) {
         /* {vmId, enabled}: GPU video (games) vs. raw frames, per VM. */
         int idx, i;
@@ -1732,11 +1874,31 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
            differ (UIPI would otherwise drop the message). */
         if (g_show_main_msg)
             ChangeWindowMessageFilterEx(hwnd, g_show_main_msg, MSGFLT_ALLOW, NULL);
+        ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
         return 0;
 
     case WM_SIZE:
         webview2_resize(hwnd);
         return 0;
+
+    case WM_TIMER:
+        if (wp == IDT_LAUNCH_VM) { launch_vm_tick(hwnd); return 0; }
+        break;
+
+    case WM_COPYDATA: {
+        /* A VM shortcut was opened while this instance runs. */
+        const COPYDATASTRUCT *cds = (const COPYDATASTRUCT *)lp;
+        if (cds && cds->dwData == UI_COPYDATA_LAUNCH_VM && cds->lpData &&
+            cds->cbData >= sizeof(wchar_t) && cds->cbData <= 256 * sizeof(wchar_t)) {
+            wchar_t name[256];
+            size_t n = cds->cbData / sizeof(wchar_t);
+            memcpy(name, cds->lpData, n * sizeof(wchar_t));
+            name[n - 1] = 0;
+            ui_launch_vm_by_name(name);
+            return TRUE;
+        }
+        break;
+    }
 
     case WM_KEYDOWN:
         if (wp == VK_F11 && !(lp & (1L << 30))) {

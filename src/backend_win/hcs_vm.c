@@ -1560,6 +1560,9 @@ static HRESULT hcs_apply_gpu(VmInstance *instance)
         ui_log(L"Dedicated-GPU assignment failed (0x%08X); using the default assignment.", hr);
     }
 
+    ui_log(instance->gpu_id[0] ? L"GPU-PV: assigning the GPU chosen for this VM (%s)."
+                               : L"GPU-PV: Hyper-V default assignment (every GPU that supports partitioning)%s.",
+           instance->gpu_id[0] ? instance->gpu_name : L"");
     for (attempt = 0; attempt < 2; attempt++) {
         if (instance->gpu_id[0] &&
             !gpu_is_available(instance->gpu_id)) {

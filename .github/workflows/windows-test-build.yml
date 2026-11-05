@@ -33,7 +33,7 @@ jobs:
         shell: cmd
         # AsbSourceRepo/Ref: Ubuntu VMs compile their guest components from
         # this repository at this exact commit (see Directory.Build.props).
-        run: msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:AsbSourceRepo=%GITHUB_REPOSITORY% /p:AsbSourceRef=%GITHUB_SHA% /m /v:minimal /nologo
+        run: msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:AsbSourceRepo=%GITHUB_REPOSITORY% /p:AsbSourceRef=%GITHUB_SHA% /p:AsbVersionRevision=%GITHUB_RUN_NUMBER% /m /v:minimal /nologo
 
       - name: Package
         id: package

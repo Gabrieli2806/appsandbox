@@ -1575,6 +1575,10 @@ static void run_logged(const wchar_t *cmd_line, const char *what)
     agent_log("%s: exit %lu.", what, code);
 }
 
+/* Result of the last staged display-driver install, sent to the host log
+   once it connects (the install runs at service start, before that). */
+static char g_vdd_update_note[600];
+
 static void apply_pending_vdd_update(void)
 {
     wchar_t dir[MAX_PATH], marker[MAX_PATH], cer[MAX_PATH], sys_dir[MAX_PATH];
@@ -1597,11 +1601,31 @@ static void apply_pending_vdd_update(void)
         swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\\certutil.exe\" -f -addstore TrustedPublisher \"%s\"", sys_dir, cer);
         run_logged(cmd, "VDD update: trust certificate (TrustedPublisher)");
     }
+    /* Stop the device first so WUDFHost releases AppSandboxVDD.dll and the
+       new file is copied now instead of being left for a later reboot. */
+    if (run_devcon(L"disable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
+        agent_log("VDD update: disable (exit %lu): %.200s", exit_code, output);
     swprintf_s(cmd, ARRAYSIZE(cmd), L"update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD", dir);
-    if (run_devcon(cmd, output, sizeof(output), &exit_code))
+    if (run_devcon(cmd, output, sizeof(output), &exit_code)) {
         agent_log("VDD update: devcon exit %lu: %.400s", exit_code, output);
-    else
+        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                    "display driver update: devcon exit %lu: %.400s", exit_code, output);
+    } else {
         agent_log("VDD update: devcon failed to launch (%lu).", GetLastError());
+        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                    "display driver update: devcon failed to launch (%lu)", GetLastError());
+    }
+    if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
+        agent_log("VDD update: enable (exit %lu): %.200s", exit_code, output);
+    {
+        /* Flatten line breaks for the one-line host log. */
+        char *c;
+        for (c = g_vdd_update_note; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
+    }
+    if (g_client_sock) {   /* host already connected: tell it now */
+        agent_log_to_host("%s", g_vdd_update_note);
+        g_vdd_update_note[0] = '\0';
+    }
 
     /* Remove the marker either way: retrying a failing install on every boot
        would only repeat the failure. The host log shows how to retry. */
@@ -1976,6 +2000,10 @@ static void handle_client(AsbConn *client)
 
     /* Report IDD driver status to host (force: always send on connect so a reconnect re-syncs) */
     report_idd_status(client, 1);
+    if (g_vdd_update_note[0]) {
+        agent_log_to_host("%s", g_vdd_update_note);
+        g_vdd_update_note[0] = '\0';
+    }
 
     /* Initial device checks */
     ensure_vdd_running();
