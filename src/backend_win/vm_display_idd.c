@@ -1267,28 +1267,28 @@ void vm_display_idd_icon_changed(VmDisplayIdd *display)
 static void idd_apply_icon(VmDisplayIdd *d)
 {
     wchar_t path[MAX_PATH], *slash;
-    HICON big = NULL, small = NULL;
+    HICON icon_big = NULL, icon_small = NULL;
     if (!d || !d->hwnd) return;
     wcscpy_s(path, MAX_PATH, d->vhdx_path);
     slash = wcsrchr(path, L'\\');
     if (slash) {
         wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"icon.ico");
-        big = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXICON) * 2,
+        icon_big = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXICON) * 2,
                                 GetSystemMetrics(SM_CYICON) * 2, LR_LOADFROMFILE);
-        small = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON) * 2,
+        icon_small = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON) * 2,
                                   GetSystemMetrics(SM_CYSMICON) * 2, LR_LOADFROMFILE);
     }
-    if (!big || !small) {
-        if (big) DestroyIcon(big);
-        if (small) DestroyIcon(small);
-        big = small = NULL;
+    if (!icon_big || !icon_small) {
+        if (icon_big) DestroyIcon(icon_big);
+        if (icon_small) DestroyIcon(icon_small);
+        icon_big = icon_small = NULL;
     }
-    SendMessageW(d->hwnd, WM_SETICON, ICON_BIG, (LPARAM)(big ? big : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
-    SendMessageW(d->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)(small ? small : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
+    SendMessageW(d->hwnd, WM_SETICON, ICON_BIG, (LPARAM)(icon_big ? icon_big : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
+    SendMessageW(d->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)(icon_small ? icon_small : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
     if (d->custom_icon_big) DestroyIcon(d->custom_icon_big);
     if (d->custom_icon_small) DestroyIcon(d->custom_icon_small);
-    d->custom_icon_big = big;
-    d->custom_icon_small = small;
+    d->custom_icon_big = icon_big;
+    d->custom_icon_small = icon_small;
 }
 
 /* VM window preferences changed (Settings): refresh title and toolbar. */
