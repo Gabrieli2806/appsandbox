@@ -388,3 +388,220 @@ done:
     if (SUCCEEDED(hr)) write_vm_signature(vm, sig);
     return hr;
 }
+
+/* ======================================================================
+ * GPU driver pre-sync
+ *
+ * GPU-PV guests run the host's GPU driver from C:\Windows\System32\
+ * HostDriverStore. The agent copies those files after boot, but after the
+ * host's GPU driver was updated the guest first boots with the old files,
+ * and the mismatch can crash or hang its display stack (start/stop loops).
+ * Before such a start, copy the new driver folders into the stopped VM's
+ * disk, like Easy-GPU-PV does. Only runs when the host's driver folders
+ * changed since the last sync (gpu_drivers.sig beside the disk).
+ * ====================================================================== */
+
+static UINT64 gpu_shares_signature(const GpuDriverShareList *shares)
+{
+    UINT64 h = 1469598103934665603ULL;
+    int i;
+    for (i = 0; i < shares->count; i++) {
+        const GpuDriverShare *s = &shares->shares[i];
+        if (_wcsnicmp(s->share_name, L"AppSandbox.Drv.", 15) != 0) continue;
+        fnv1a(&h, (const BYTE *)s->host_path, (DWORD)(wcslen(s->host_path) * sizeof(wchar_t)));
+        fnv1a(&h, (const BYTE *)s->file_filter, (DWORD)(wcslen(s->file_filter) * sizeof(wchar_t)));
+    }
+    return h;
+}
+
+static void gpu_sig_path(const VmInstance *vm, wchar_t *out, size_t cap)
+{
+    wchar_t dir[MAX_PATH], *slash;
+    wcscpy_s(dir, MAX_PATH, vm->vhdx_path);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(out, cap, L"%s\\gpu_drivers.sig", dir);
+}
+
+/* name matches one of the semicolon-separated entries (empty = all). */
+static BOOL filter_match(const wchar_t *filter, const wchar_t *name)
+{
+    const wchar_t *p = filter;
+    size_t n = wcslen(name);
+    if (!filter || !filter[0]) return TRUE;
+    while (*p) {
+        const wchar_t *e = wcschr(p, L';');
+        size_t len = e ? (size_t)(e - p) : wcslen(p);
+        if (len == n && _wcsnicmp(p, name, n) == 0) return TRUE;
+        if (!e) break;
+        p = e + 1;
+    }
+    return FALSE;
+}
+
+/* Copy src_dir into dst_dir (on the guest volume) recursively, skipping
+   files already there with the same size. Refuses links on the guest side. */
+static BOOL copy_tree(const wchar_t *src_dir, const wchar_t *dst_dir, const wchar_t *filter,
+                      int depth, int *files, wchar_t *err, size_t err_cap)
+{
+    WIN32_FIND_DATAW fd;
+    wchar_t pat[MAX_PATH], src[MAX_PATH], dst[MAX_PATH];
+    HANDLE h;
+    DWORD a;
+
+    if (depth > 16) return TRUE;
+    a = GetFileAttributesW(dst_dir);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        if (!CreateDirectoryW(dst_dir, NULL)) {
+            swprintf_s(err, err_cap, L"Could not create a driver folder in the VM (error %lu).", GetLastError());
+            return FALSE;
+        }
+    } else if ((a & FILE_ATTRIBUTE_REPARSE_POINT) || !(a & FILE_ATTRIBUTE_DIRECTORY)) {
+        wcscpy_s(err, err_cap, L"A GPU driver folder in the VM is a link; refused for safety.");
+        return FALSE;
+    }
+
+    swprintf_s(pat, MAX_PATH, L"%s\\*", src_dir);
+    h = FindFirstFileW(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return TRUE;
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) continue;
+        swprintf_s(src, MAX_PATH, L"%s\\%s", src_dir, fd.cFileName);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", dst_dir, fd.cFileName);
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            if (!copy_tree(src, dst, filter, depth + 1, files, err, err_cap)) { FindClose(h); return FALSE; }
+            continue;
+        }
+        if (!filter_match(filter, fd.cFileName)) continue;
+        {
+            WIN32_FILE_ATTRIBUTE_DATA da;
+            if (GetFileAttributesExW(dst, GetFileExInfoStandard, &da)) {
+                if (da.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY)) {
+                    wcscpy_s(err, err_cap, L"A GPU driver file in the VM is a link; refused for safety.");
+                    FindClose(h);
+                    return FALSE;
+                }
+                if (da.nFileSizeHigh == fd.nFileSizeHigh && da.nFileSizeLow == fd.nFileSizeLow)
+                    continue;      /* already there */
+                SetFileAttributesW(dst, FILE_ATTRIBUTE_NORMAL);
+            }
+        }
+        if (!CopyFileW(src, dst, FALSE)) {
+            swprintf_s(err, err_cap, L"Could not copy %s into the VM (error %lu).", fd.cFileName, GetLastError());
+            FindClose(h);
+            return FALSE;
+        }
+        (*files)++;
+    } while (FindNextFileW(h, &fd));
+    FindClose(h);
+    return TRUE;
+}
+
+BOOL guest_gpu_presync_needed(const VmInstance *vm, const GpuDriverShareList *shares)
+{
+    wchar_t path[MAX_PATH];
+    UINT64 stored = 0;
+    DWORD got = 0;
+    HANDLE f;
+    if (!guest_tools_applies(vm) || !vm->install_complete || !shares || shares->count == 0) return FALSE;
+    gpu_sig_path(vm, path, MAX_PATH);
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f != INVALID_HANDLE_VALUE) {
+        ReadFile(f, &stored, sizeof(stored), &got, NULL);
+        CloseHandle(f);
+    }
+    return got != sizeof(stored) || stored != gpu_shares_signature(shares);
+}
+
+HRESULT guest_gpu_presync(VmInstance *vm, const GpuDriverShareList *shares, int *files_out,
+                          wchar_t *err, size_t err_cap)
+{
+    VIRTUAL_STORAGE_TYPE vst = { VIRTUAL_STORAGE_TYPE_DEVICE_UNKNOWN, { 0 } };
+    OPEN_VIRTUAL_DISK_PARAMETERS op;
+    ATTACH_VIRTUAL_DISK_PARAMETERS ap;
+    HANDLE disk = INVALID_HANDLE_VALUE;
+    wchar_t physical[MAX_PATH], vol[MAX_PATH], dst[MAX_PATH], path[MAX_PATH];
+    ULONG physical_size = sizeof(physical);
+    DWORD number = 0, rc;
+    BOOL attached = FALSE;
+    HRESULT hr = E_FAIL;
+    int i, files = 0;
+
+    err[0] = L'\0';
+    if (files_out) *files_out = 0;
+    ZeroMemory(&op, sizeof(op));
+    op.Version = OPEN_VIRTUAL_DISK_VERSION_2;   /* same as guest_tools_update */
+    rc = OpenVirtualDisk(&vst, vm->vhdx_path, VIRTUAL_DISK_ACCESS_NONE, OPEN_VIRTUAL_DISK_FLAG_NONE, &op, &disk);
+    if (rc != ERROR_SUCCESS) {
+        swprintf_s(err, err_cap, L"Could not open the VM's disk (error %lu).", rc);
+        return HRESULT_FROM_WIN32(rc);
+    }
+    ZeroMemory(&ap, sizeof(ap));
+    ap.Version = ATTACH_VIRTUAL_DISK_VERSION_1;
+    rc = AttachVirtualDisk(disk, NULL, ATTACH_VIRTUAL_DISK_FLAG_NO_DRIVE_LETTER, 0, &ap, NULL);
+    if (rc != ERROR_SUCCESS) {
+        swprintf_s(err, err_cap, L"Could not attach the VM's disk (error %lu).", rc);
+        hr = HRESULT_FROM_WIN32(rc);
+        goto done;
+    }
+    attached = TRUE;
+    rc = GetVirtualDiskPhysicalPath(disk, &physical_size, physical);
+    if (rc != ERROR_SUCCESS || !disk_number_from_path(physical, &number) ||
+        !find_windows_volume(number, vol, MAX_PATH)) {
+        wcscpy_s(err, err_cap, L"The Windows installation on the VM's disk was not found.");
+        goto done;
+    }
+    if (volume_hibernated(vol)) {
+        wcscpy_s(err, err_cap, L"Windows in the VM was hibernated (Fast Startup); drivers sync after boot instead.");
+        hr = HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION);
+        goto done;
+    }
+
+    for (i = 0; i < shares->count; i++) {
+        const GpuDriverShare *s = &shares->shares[i];
+        const wchar_t *rel;
+        if (_wcsnicmp(s->share_name, L"AppSandbox.Drv.", 15) != 0) continue;
+        /* guest_path is "C:\Windows\System32\HostDriverStore\...". */
+        if (wcslen(s->guest_path) < 4 || s->guest_path[1] != L':' || s->guest_path[2] != L'\\') continue;
+        rel = s->guest_path + 3;
+        if (!guest_path_safe(vol, rel)) {
+            wcscpy_s(err, err_cap, L"The VM's driver folder contains a link; refused for safety.");
+            hr = E_ACCESSDENIED;
+            goto done;
+        }
+        /* Create the parents (HostDriverStore\FileRepository) first. */
+        {
+            wchar_t part[MAX_PATH], *ctx = NULL, *tok;
+            wcscpy_s(part, MAX_PATH, rel);
+            wcscpy_s(dst, MAX_PATH, vol);
+            for (tok = wcstok_s(part, L"\\", &ctx); tok; tok = wcstok_s(NULL, L"\\", &ctx)) {
+                size_t n = wcslen(dst);
+                if (n && dst[n - 1] != L'\\') wcscat_s(dst, MAX_PATH, L"\\");
+                wcscat_s(dst, MAX_PATH, tok);
+                CreateDirectoryW(dst, NULL);
+            }
+        }
+        if (!guest_path_safe(vol, rel)) {
+            wcscpy_s(err, err_cap, L"The VM's driver folder contains a link; refused for safety.");
+            hr = E_ACCESSDENIED;
+            goto done;
+        }
+        if (!copy_tree(s->host_path, dst, s->file_filter, 0, &files, err, err_cap)) goto done;
+    }
+    hr = S_OK;
+
+done:
+    if (attached) DetachVirtualDisk(disk, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
+    if (disk != INVALID_HANDLE_VALUE) CloseHandle(disk);
+    if (SUCCEEDED(hr)) {
+        UINT64 sig = gpu_shares_signature(shares);
+        HANDLE f;
+        DWORD w;
+        gpu_sig_path(vm, path, MAX_PATH);
+        f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (f != INVALID_HANDLE_VALUE) { WriteFile(f, &sig, sizeof(sig), &w, NULL); CloseHandle(f); }
+        if (files_out) *files_out = files;
+    }
+    return hr;
+}

@@ -19,4 +19,14 @@ BOOL guest_tools_outdated(const VmInstance *vm);
    a few seconds (attach + copy + detach): call off the UI thread. */
 HRESULT guest_tools_update(VmInstance *vm, wchar_t *err, size_t err_cap);
 
+/* GPU driver pre-sync: TRUE when the host's GPU driver folders changed since
+   this VM last received them offline. */
+BOOL guest_gpu_presync_needed(const VmInstance *vm, const GpuDriverShareList *shares);
+
+/* Copy the host's GPU driver folders (AppSandbox.Drv.* shares) into the
+   stopped VM's HostDriverStore before it boots, so a host driver update
+   never boots the guest on mismatched files. Skips files already there. */
+HRESULT guest_gpu_presync(VmInstance *vm, const GpuDriverShareList *shares, int *files_out,
+                          wchar_t *err, size_t err_cap);
+
 #endif /* GUEST_TOOLS_H */

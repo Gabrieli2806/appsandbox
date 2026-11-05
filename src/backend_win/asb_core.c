@@ -1394,6 +1394,18 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
             gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
             gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &args->config.gpu_shares);
             prepare_gl_layers_share(&args->config.gpu_shares);
+            /* After a host GPU driver update, copy the new driver into the
+               VM's disk before it boots (a mismatched driver at boot can
+               crash or hang the guest's display stack). */
+            if (guest_gpu_presync_needed(vm, &args->config.gpu_shares)) {
+                wchar_t err[512];
+                int files = 0;
+                asb_log(L"GPU driver on this PC changed; copying it into \"%s\" before it starts...", vm->name);
+                if (SUCCEEDED(guest_gpu_presync(vm, &args->config.gpu_shares, &files, err, ARRAYSIZE(err))))
+                    asb_log(L"GPU driver copied into \"%s\" (%d files).", vm->name, files);
+                else
+                    asb_log(L"GPU driver not copied before start (%s); the agent syncs it after boot.", err);
+            }
         }
     }
 
