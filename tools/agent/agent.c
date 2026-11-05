@@ -74,13 +74,39 @@ static const GUID AGENT_SERVICE_GUID =
 static SERVICE_STATUS        g_status;
 static SERVICE_STATUS_HANDLE g_status_handle;
 static HANDLE                g_stop_event;
-static AsbConn *             g_client_sock = NULL; /* Active persistent connection */
+/* Active persistent connection. Set and cleared only under g_send_cs; other
+   threads reach it only through send_to_host(). */
+static AsbConn *             g_client_sock = NULL;
 static volatile BOOL         g_os_shutting_down = FALSE;
-static CRITICAL_SECTION      g_send_cs;     /* Protects send_line from concurrent callers */
+static CRITICAL_SECTION      g_send_cs;     /* Serializes send_line and guards g_client_sock */
 
 /* ---- Logging ---- */
 
 static int send_line(AsbConn *s, const char *msg);
+
+/* Send one line to the connected host from any thread. g_send_cs is held
+   across the check and the send, and handle_client clears g_client_sock under
+   the same lock before it closes the connection, so the connection cannot be
+   freed while a send is using it. The lock is held only for the send itself.
+   Returns the send result, or 0 when no host is connected. */
+static int send_to_host(const char *line)
+{
+    int n = 0;
+    EnterCriticalSection(&g_send_cs);
+    if (g_client_sock != NULL)
+        n = send_line(g_client_sock, line);
+    LeaveCriticalSection(&g_send_cs);
+    return n;
+}
+
+static BOOL host_connected(void)
+{
+    BOOL connected;
+    EnterCriticalSection(&g_send_cs);
+    connected = g_client_sock != NULL;
+    LeaveCriticalSection(&g_send_cs);
+    return connected;
+}
 
 static void agent_log(const char *fmt, ...)
 {
@@ -101,14 +127,16 @@ static void agent_log(const char *fmt, ...)
     fclose(f);
 }
 
-/* Send a log message to the host via the command channel (non-recursive, won't call agent_log) */
-static void agent_log_to_host(const char *fmt, ...)
+/* Send a log message to the host via the command channel (non-recursive, won't call agent_log).
+   Returns the send result: > 0 when the line was sent, otherwise no host
+   was connected or the send failed. */
+static int agent_log_to_host(const char *fmt, ...)
 {
     char msg[1024];
     char line[1040];
     va_list ap;
 
-    if (g_client_sock == NULL) return;
+    if (!host_connected()) return 0;
 
     va_start(ap, fmt);
     vsnprintf(msg, sizeof(msg), fmt, ap);
@@ -117,7 +145,7 @@ static void agent_log_to_host(const char *fmt, ...)
 
     snprintf(line, sizeof(line), "log:%s", msg);
     line[sizeof(line) - 1] = '\0';
-    send_line(g_client_sock, line);
+    return send_to_host(line);
 }
 
 /* ---- p9copy log adapter ---- */
@@ -152,10 +180,11 @@ typedef struct {
     char filter[4096];
 } GpuShareInfo;
 
+/* Progress, done and error lines go through send_to_host(), so a copy that
+   outlives its connection reports to whichever host connection is current. */
 typedef struct {
     GpuShareInfo shares[MAX_GPU_SHARES];
     int          count;
-    AsbConn *    notify_sock;    /* Socket to send progress/done to host */
     volatile BOOL copying;
 } GpuCopyState;
 
@@ -224,13 +253,14 @@ static BOOL check_gpu_error43(void)
     return found_error43;
 }
 
-static void disable_hyperv_video(AsbConn *notify_sock);
+static void disable_hyperv_video(BOOL notify_host);
 
 
 /* Disable and re-enable vrd.inf display devices.
    If only_error43 is TRUE, only cycles devices with problem code 43.
-   If FALSE, cycles all vrd.inf devices (used at preshutdown). */
-static void cycle_gpu_devices(AsbConn *notify_sock, BOOL only_error43)
+   If FALSE, cycles all vrd.inf devices (used at preshutdown).
+   With notify_host, each step is reported to the connected host. */
+static void cycle_gpu_devices(BOOL notify_host, BOOL only_error43)
 {
     HDEVINFO devs;
     SP_DEVINFO_DATA dev_info;
@@ -266,13 +296,13 @@ static void cycle_gpu_devices(AsbConn *notify_sock, BOOL only_error43)
 
         agent_log("GPU cycle: disabling %ls...", dev_id);
         sprintf_s(msg, sizeof(msg), "gpu_device_status:disabling %ls", dev_id);
-        if (notify_sock != NULL) send_line(notify_sock, msg);
+        if (notify_host) send_to_host(msg);
 
         cr = CM_Disable_DevNode(dev_info.DevInst, 0);
         if (cr != CR_SUCCESS) {
             agent_log("GPU cycle: CM_Disable_DevNode failed (%lu).", cr);
             sprintf_s(msg, sizeof(msg), "gpu_device_status:disable failed (%lu)", cr);
-            if (notify_sock != NULL) send_line(notify_sock, msg);
+            if (notify_host) send_to_host(msg);
             continue;
         }
 
@@ -280,19 +310,19 @@ static void cycle_gpu_devices(AsbConn *notify_sock, BOOL only_error43)
 
         agent_log("GPU cycle: re-enabling %ls...", dev_id);
         sprintf_s(msg, sizeof(msg), "gpu_device_status:re-enabling %ls", dev_id);
-        if (notify_sock != NULL) send_line(notify_sock, msg);
+        if (notify_host) send_to_host(msg);
 
         cr = CM_Enable_DevNode(dev_info.DevInst, 0);
         if (cr != CR_SUCCESS) {
             agent_log("GPU cycle: CM_Enable_DevNode failed (%lu).", cr);
             sprintf_s(msg, sizeof(msg), "gpu_device_status:enable failed (%lu)", cr);
-            if (notify_sock != NULL) send_line(notify_sock, msg);
+            if (notify_host) send_to_host(msg);
             continue;
         }
 
         agent_log("GPU cycle: device %ls re-enabled.", dev_id);
         sprintf_s(msg, sizeof(msg), "gpu_device_status:re-enabled %ls", dev_id);
-        if (notify_sock != NULL) send_line(notify_sock, msg);
+        if (notify_host) send_to_host(msg);
     }
 
     SetupDiDestroyDeviceInfoList(devs);
@@ -564,11 +594,44 @@ static BOOL nvidia_drs_prepare(const wchar_t *dir)
     return TRUE;
 }
 
+/* Agent state kept in the registry (clean-shutdown marker, last reported
+   crash dump, per-boot flags). */
+#define AGENT_REG_KEY L"SOFTWARE\\AppSandbox\\Agent"
+
+/* TRUE only the first time it is called for 'name' in this Windows boot.
+   The marker is a volatile registry key, which Windows drops at restart, so
+   a restart of this service within the same boot still sees it. Falls back
+   to a per-process answer when the registry cannot be used. */
+static BOOL first_time_this_boot(const wchar_t *name, volatile LONG *process_flag)
+{
+    HKEY parent, key;
+    DWORD disposition = 0;
+    BOOL first = InterlockedExchange(process_flag, 1) == 0;
+
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, 0, NULL, 0,
+                        KEY_CREATE_SUB_KEY, NULL, &parent, NULL) != ERROR_SUCCESS)
+        return first;
+    if (RegCreateKeyExW(parent, name, 0, NULL, REG_OPTION_VOLATILE,
+                        KEY_READ, NULL, &key, &disposition) == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        first = disposition == REG_CREATED_NEW_KEY;
+    }
+    RegCloseKey(parent);
+    return first;
+}
+
+/* The AppSandbox.Nvidia share holds only the NVIDIA shims, and every one of
+   them is in its refresh filter: they are re-copied on every connect, so
+   files from this share say nothing about the GPU driver itself. */
+#define GPU_SHIM_SHARE "AppSandbox.Nvidia"
+
 static DWORD WINAPI gpu_copy_thread(LPVOID param)
 {
+    static volatile LONG gpu_cycled_flag = 0;
     GpuCopyState *state = (GpuCopyState *)param;
     int i;
     int total_files = 0;
+    int driver_files = 0;   /* files copied outside the always-refreshed shim share */
     int failed_shares = 0;
     char msg[256];
     wchar_t gl_dir[MAX_PATH], native_dir[MAX_PATH];
@@ -611,7 +674,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
                                      &options, &files);
             else
                 rc = P9_ERR_IO;
-        } else if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0) {
+        } else if (strcmp(si->share_name, GPU_SHIM_SHARE) == 0) {
             const P9CopyOptions options = {
                 FALSE, NULL, "appsandbox-nvidia-vk-gl-shim.dll;appsandbox-nvidia-vk-gl-shim32.dll;"
                              "appsandbox-nvidia-dlss-shim.dll;appsandbox-nvidia-cuda-shim.dll;"
@@ -633,47 +696,59 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         }
 
         if (rc != P9_OK) {
+            char line[256];
             agent_log("GPU copy share '%s' failed (rc=%d).", si->share_name, rc);
-            if (state->notify_sock != NULL) {
-                char line[256];
-                sprintf_s(line, sizeof(line), "log:GPU driver sync: '%s' failed (error %d)",
-                          si->share_name, rc);
-                send_line(state->notify_sock, line);
-            }
+            sprintf_s(line, sizeof(line), "log:GPU driver sync: '%s' failed (error %d)",
+                      si->share_name, rc);
+            send_to_host(line);
             failed_shares++;
         } else {
             agent_log("GPU copy share '%s' done (%d files).", si->share_name, files);
-            if (strcmp(si->share_name, "AppSandbox.Nvidia") == 0)
+            if (strcmp(si->share_name, GPU_SHIM_SHARE) == 0)
                 wcscpy_s(native_dir, MAX_PATH, dest_wide);
         }
         total_files += files;
+        if (strcmp(si->share_name, GPU_SHIM_SHARE) != 0)
+            driver_files += files;
 
         /* Send progress to host */
         sprintf_s(msg, sizeof(msg), "gpu_copy_progress:%d/%d", i + 1, state->count);
-        if (state->notify_sock != NULL)
-            send_line(state->notify_sock, msg);
+        send_to_host(msg);
     }
 
-    /* If files were copied and vrd.inf has error 43, restart GPU + IDD devices
-       and re-disable Hyper-V Video adapter. */
-    if (total_files > 0 && check_gpu_error43()) {
-        agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
-        cycle_gpu_devices(state->notify_sock, TRUE);
+    /* If driver files were copied and vrd.inf has error 43, restart the GPU
+       device, at most once per boot: the device restart itself can disturb
+       the display, and a second one in the same boot does not help. */
+    if (driver_files > 0 && check_gpu_error43()) {
+        if (first_time_this_boot(L"GpuCycledThisBoot", &gpu_cycled_flag)) {
+            agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
+            cycle_gpu_devices(TRUE, TRUE);
 
-        /* TODO: re-enable once IDD display is stable
-        Sleep(2000);
-        disable_hyperv_video(state->notify_sock);
-        */
-    } else if (total_files > 0) {
+            /* TODO: re-enable once IDD display is stable
+            Sleep(2000);
+            disable_hyperv_video(TRUE);
+            */
+        } else {
+            agent_log("GPU drivers copied and error 43 detected, but the GPU device was "
+                      "already restarted in this boot - not restarting it again.");
+        }
+    } else if (driver_files > 0) {
         agent_log("GPU drivers copied, no error 43 - no device restart needed.");
+    } else if (total_files > 0) {
+        agent_log("Only the NVIDIA shims were refreshed - no device restart needed.");
     } else {
         agent_log("All GPU driver files already present (pre-staged) - no copy or restart needed.");
     }
 
     if (failed_shares == 0 && (gl_dir[0] || native_dir[0] || gpu_prefers_system_opengl()))
         gl_provision(gl_dir, native_dir);
-    if (failed_shares == 0 && !nvidia_runtime_provision(native_dir))
-        failed_shares++;
+    /* The NVIDIA runtime setup (CUDA, OpenCL, NVAPI, DLSS) is optional and
+       not a share: a failure is reported once and the GPU sync still counts
+       as done. gl_vk_provision.c logs the step that failed. */
+    if (failed_shares == 0 && !nvidia_runtime_provision(native_dir)) {
+        agent_log("NVIDIA runtime setup skipped: provisioning failed (details above).");
+        send_to_host("log:NVIDIA runtime setup skipped (see C:\\Windows\\AppSandbox\\agent.log)");
+    }
 
     /* Send final result to host */
     if (failed_shares == 0) {
@@ -686,11 +761,25 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
                   failed_shares, state->count);
     }
 
-    if (state->notify_sock != NULL)
-        send_line(state->notify_sock, msg);
+    send_to_host(msg);
 
     state->copying = FALSE;
     return 0;
+}
+
+/* Read and drop the share lines of a gpu_query_response that is not used,
+   so they are not taken for commands. Hosts send at most a few dozen. */
+static void discard_share_lines(AsbConn *client, int share_count)
+{
+    int i;
+    if (share_count > 1024) share_count = 1024;
+    for (i = 0; i < share_count; i++) {
+        char line[8192];
+        if (recv_line(client, line, sizeof(line)) <= 0) {
+            agent_log("GPU query: failed to read share line %d.", i);
+            return;
+        }
+    }
 }
 
 /* Parse gpu_query_response and start background copy.
@@ -703,11 +792,14 @@ static void handle_gpu_query_response(AsbConn *client, int share_count)
 
     if (share_count <= 0 || share_count > MAX_GPU_SHARES) {
         agent_log("GPU query response: invalid share count %d.", share_count);
+        discard_share_lines(client, share_count);
         return;
     }
 
     if (g_gpu_copy.copying) {
+        /* The running copy reports its result to this connection too. */
         agent_log("GPU copy already in progress, ignoring.");
+        discard_share_lines(client, share_count);
         return;
     }
 
@@ -761,7 +853,6 @@ static void handle_gpu_query_response(AsbConn *client, int share_count)
     }
 
     /* Start background copy */
-    g_gpu_copy.notify_sock = client;
     g_gpu_copy.copying = TRUE;
     thread = CreateThread(NULL, 0, gpu_copy_thread, &g_gpu_copy, 0, NULL);
     if (thread)
@@ -822,6 +913,12 @@ static BOOL enable_privilege(LPCWSTR priv_name)
 
 /* ---- Input helper process (spawned into console session as SYSTEM) ---- */
 
+/* Protects g_input_process / g_input_session.  The connection thread
+   (idd_connect) and the input monitor thread both kill and respawn the
+   helper, so the handle is only taken out of the global under this lock
+   and closed by whoever took it -- never twice. */
+static CRITICAL_SECTION g_input_proc_cs;
+
 static HANDLE g_input_process = NULL;
 static DWORD  g_input_session = 0xFFFFFFFF;  /* session the helper was spawned into */
 static volatile BOOL g_input_monitor_running = FALSE;
@@ -829,12 +926,18 @@ static HANDLE g_input_monitor_thread = NULL;
 
 static void kill_input_helper(void)
 {
-    if (g_input_process) {
-        TerminateProcess(g_input_process, 0);
-        WaitForSingleObject(g_input_process, 3000);
-        CloseHandle(g_input_process);
-        g_input_process = NULL;
-        g_input_session = 0xFFFFFFFF;
+    HANDLE proc;
+
+    EnterCriticalSection(&g_input_proc_cs);
+    proc = g_input_process;
+    g_input_process = NULL;
+    g_input_session = 0xFFFFFFFF;
+    LeaveCriticalSection(&g_input_proc_cs);
+
+    if (proc) {
+        TerminateProcess(proc, 0);
+        WaitForSingleObject(proc, 3000);
+        CloseHandle(proc);
     }
 }
 
@@ -893,8 +996,21 @@ static BOOL spawn_input_in_session(DWORD session_id)
     }
 
     agent_log("Input helper: spawned PID %lu in session %lu.", pi.dwProcessId, session_id);
-    g_input_process = pi.hProcess;
-    g_input_session = session_id;
+    {
+        /* If the other thread spawned a helper meanwhile, the newer one
+           replaces it: only one helper may own the input channel. */
+        HANDLE older;
+        EnterCriticalSection(&g_input_proc_cs);
+        older = g_input_process;
+        g_input_process = pi.hProcess;
+        g_input_session = session_id;
+        LeaveCriticalSection(&g_input_proc_cs);
+        if (older) {
+            TerminateProcess(older, 0);
+            WaitForSingleObject(older, 3000);
+            CloseHandle(older);
+        }
+    }
     CloseHandle(pi.hThread);
     CloseHandle(dup_token);
     return TRUE;
@@ -911,25 +1027,44 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
         DWORD cur_session = WTSGetActiveConsoleSessionId();
 
         if (cur_session != 0xFFFFFFFF) {
-            BOOL helper_alive = g_input_process &&
-                WaitForSingleObject(g_input_process, 0) != WAIT_OBJECT_0;
+            HANDLE proc_snap;
+            DWORD  sess_snap;
+            BOOL helper_alive;
 
-            if (cur_session != g_input_session) {
+            /* Check liveness under the lock so the handle cannot be closed
+               by idd_connect while it is being waited on. */
+            EnterCriticalSection(&g_input_proc_cs);
+            proc_snap = g_input_process;
+            sess_snap = g_input_session;
+            helper_alive = proc_snap &&
+                WaitForSingleObject(proc_snap, 0) != WAIT_OBJECT_0;
+            LeaveCriticalSection(&g_input_proc_cs);
+
+            if (cur_session != sess_snap) {
                 /* Console session changed — kill old helper and respawn */
                 if (helper_alive) {
                     agent_log("Input monitor: console session changed %lu -> %lu, respawning.",
-                               g_input_session, cur_session);
+                               sess_snap, cur_session);
                     kill_input_helper();
                 }
                 spawn_input_in_session(cur_session);
             } else if (!helper_alive) {
-                /* Same session but helper died — respawn */
-                if (g_input_process) {
-                    CloseHandle(g_input_process);
+                /* Same session but helper died — respawn.  If idd_connect
+                   replaced the helper meanwhile, there is nothing to do. */
+                HANDLE dead = NULL;
+                BOOL replaced;
+                EnterCriticalSection(&g_input_proc_cs);
+                replaced = g_input_process != proc_snap;
+                if (!replaced) {
+                    dead = g_input_process;
                     g_input_process = NULL;
                 }
-                agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
-                spawn_input_in_session(cur_session);
+                LeaveCriticalSection(&g_input_proc_cs);
+                if (dead) CloseHandle(dead);
+                if (!replaced) {
+                    agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
+                    spawn_input_in_session(cur_session);
+                }
             }
         }
 
@@ -954,11 +1089,14 @@ static void start_input_monitor(void)
 
 static void stop_input_monitor(void)
 {
+    /* Called from the connection thread (shutdown/restart commands) and from
+       service_main: whoever takes the thread handle closes it. */
+    HANDLE thread = (HANDLE)InterlockedExchangePointer(
+        (PVOID volatile *)&g_input_monitor_thread, NULL);
     g_input_monitor_running = FALSE;
-    if (g_input_monitor_thread) {
-        WaitForSingleObject(g_input_monitor_thread, 5000);
-        CloseHandle(g_input_monitor_thread);
-        g_input_monitor_thread = NULL;
+    if (thread) {
+        WaitForSingleObject(thread, 5000);
+        CloseHandle(thread);
     }
 }
 
@@ -1403,69 +1541,188 @@ static void stop_audio_monitor(void)
     }
 }
 
-/* ---- IDD driver status check ---- */
+/* ---- Helper: run devcon command and capture stdout ---- */
 
-/* Check the AppSandboxVDD driver state and report "idd_status:<status>" to the host
-   (ok / error / disabled / not_found / unknown), derived from devcon's PnP devnode
-   state. Called once at connect (force=1: always send, so a reconnect re-syncs the
-   host's latched idd_ready) AND periodically from the device-check loop (force=0:
-   send only on change) -- so the host's display-readiness tracks the LIVE VDD state,
-   which can self-heal via ensure_vdd_running(). The host re-latches every line, so
-   the change-gate avoids spamming the daemon log/events. */
-static void report_idd_status(AsbConn *client, int force)
+/* devcon waits for PnP, which can be busy for many seconds at boot or while
+   drivers install. Queries and changes get separate time limits; a run that
+   hits its limit is killed and reported with DEVCON_TIMED_OUT instead of an
+   exit code, so callers never act on partial output. */
+#define DEVCON_QUERY_TIMEOUT_MS   15000UL    /* status */
+#define DEVCON_CHANGE_TIMEOUT_MS  60000UL    /* enable / disable / restart */
+#define DEVCON_UPDATE_TIMEOUT_MS  120000UL   /* update (driver package install) */
+#define DEVCON_TIMED_OUT          0xFFFFFFFFUL
+
+/* Start cmd with stdout/stderr on 'out' (an inheritable pipe end).
+   PROC_THREAD_ATTRIBUTE_HANDLE_LIST limits inheritance to that pipe, so the
+   child does not get copies of the agent's sockets, pipes and process
+   handles. Falls back to plain inheritance if the attribute list cannot be
+   built. */
+static BOOL create_process_with_output(wchar_t *cmd, HANDLE out, PROCESS_INFORMATION *pi)
 {
-    static char last_status[16];   /* last value sent (process-global; force=1 overrides on (re)connect) */
-    char output[4096];
-    wchar_t cmd[MAX_PATH];
-    wchar_t exe_dir[MAX_PATH];
-    wchar_t *slash;
-    STARTUPINFOW si;
+    STARTUPINFOEXW six;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    SIZE_T size = 0;
+    HANDLE inherit[1];
+
+    ZeroMemory(&six, sizeof(six));
+    six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    six.StartupInfo.hStdOutput = out;
+    six.StartupInfo.hStdError = out;
+    six.StartupInfo.hStdInput = NULL;
+    ZeroMemory(pi, sizeof(*pi));
+    inherit[0] = out;
+
+    InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+    if (size)
+        attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, size);
+    if (attrs) {
+        if (InitializeProcThreadAttributeList(attrs, 1, 0, &size)) {
+            BOOL ok = FALSE;
+            if (UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+                                          inherit, sizeof(inherit), NULL, NULL)) {
+                six.StartupInfo.cb = sizeof(six);
+                six.lpAttributeList = attrs;
+                ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE,
+                                    CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
+                                    NULL, NULL, &six.StartupInfo, pi);
+                if (!ok)
+                    agent_log("devcon: start with a restricted handle list failed (%lu), "
+                              "retrying without it.", GetLastError());
+            }
+            DeleteProcThreadAttributeList(attrs);
+            if (ok) {
+                HeapFree(GetProcessHeap(), 0, attrs);
+                return TRUE;
+            }
+        }
+        HeapFree(GetProcessHeap(), 0, attrs);
+    }
+
+    six.StartupInfo.cb = sizeof(STARTUPINFOW);
+    six.lpAttributeList = NULL;
+    ZeroMemory(pi, sizeof(*pi));
+    return CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                          NULL, NULL, &six.StartupInfo, pi);
+}
+
+/* Move whatever is waiting in the pipe into output, without blocking.
+   Bytes beyond the buffer are read and dropped so the child never stalls
+   on a full pipe. */
+static void drain_pipe(HANDLE pipe, char *output, int output_size, int *pos)
+{
+    char scratch[512];
+    DWORD avail, got;
+
+    while (PeekNamedPipe(pipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        int room = output_size - 1 - *pos;
+        if (room > 0) {
+            if (avail > (DWORD)room) avail = (DWORD)room;
+            if (!ReadFile(pipe, output + *pos, avail, &got, NULL) || got == 0) break;
+            *pos += (int)got;
+        } else {
+            if (avail > sizeof(scratch)) avail = sizeof(scratch);
+            if (!ReadFile(pipe, scratch, avail, &got, NULL) || got == 0) break;
+        }
+    }
+    output[*pos] = '\0';
+}
+
+/* Run devcon with args, capture its output and wait up to timeout_ms.
+   Returns FALSE (GetLastError set) if devcon could not be started. On
+   success *out_exit_code is devcon's exit code, or DEVCON_TIMED_OUT when it
+   did not finish in time (it is killed; output holds what it printed). */
+static BOOL run_devcon(const wchar_t *args, char *output, int output_size,
+                       DWORD *out_exit_code, DWORD timeout_ms)
+{
     PROCESS_INFORMATION pi;
     HANDLE hRead = NULL, hWrite = NULL;
     SECURITY_ATTRIBUTES sa;
-    DWORD bytes_read;
+    wchar_t cmd[MAX_PATH * 2];
+    wchar_t exe_dir[MAX_PATH];
+    wchar_t *slash;
+    DWORD start, exit_code = DEVCON_TIMED_OUT;
+    BOOL timed_out = FALSE;
     int pos = 0;
-    const char *st = "not_found";
 
+    output[0] = '\0';
     GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
     slash = wcsrchr(exe_dir, L'\\');
     if (slash) *(slash + 1) = L'\0';
-    swprintf_s(cmd, MAX_PATH, L"\"%sdrivers\\devcon.exe\" status Root\\AppSandboxVDD", exe_dir);
+
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%sdrivers\\devcon.exe\" %s", exe_dir, args);
 
     sa.nLength = sizeof(sa);
     sa.lpSecurityDescriptor = NULL;
     sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) {
-        st = "not_found"; goto emit;
-    }
+    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return FALSE;
     SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
 
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
-    si.hStdInput = NULL;
-    ZeroMemory(&pi, sizeof(pi));
-
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        agent_log("IDD status: devcon failed to launch (%lu).", GetLastError());
+    if (!create_process_with_output(cmd, hWrite, &pi)) {
+        DWORD err = GetLastError();
         CloseHandle(hRead);
         CloseHandle(hWrite);
-        st = "not_found"; goto emit;
+        SetLastError(err);
+        return FALSE;
     }
     CloseHandle(hWrite);
 
-    while (ReadFile(hRead, output + pos, (DWORD)(sizeof(output) - pos - 1), &bytes_read, NULL) && bytes_read > 0)
-        pos += (int)bytes_read;
-    output[pos] = '\0';
+    /* Read while waiting, so a long output cannot fill the pipe and stall
+       devcon until the time limit. */
+    start = GetTickCount();
+    for (;;) {
+        DWORD wait;
+        drain_pipe(hRead, output, output_size, &pos);
+        wait = WaitForSingleObject(pi.hProcess, 100);
+        if (wait != WAIT_TIMEOUT) break;
+        if (GetTickCount() - start >= timeout_ms) {
+            agent_log("run_devcon: '%ls' did not finish within %lu s, killing it.",
+                      args, timeout_ms / 1000);
+            TerminateProcess(pi.hProcess, DEVCON_TIMED_OUT);
+            WaitForSingleObject(pi.hProcess, 3000);
+            timed_out = TRUE;
+            break;
+        }
+    }
+
+    /* devcon has exited: everything it wrote is in the pipe. */
+    drain_pipe(hRead, output, output_size, &pos);
     CloseHandle(hRead);
 
-    WaitForSingleObject(pi.hProcess, 5000);
+    if (!timed_out && !GetExitCodeProcess(pi.hProcess, &exit_code))
+        exit_code = DEVCON_TIMED_OUT;
+    if (out_exit_code) *out_exit_code = exit_code;
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
+    return TRUE;
+}
 
-    if (strstr(output, "running")) {
+/* ---- IDD driver status check ---- */
+
+/* Check the AppSandboxVDD driver state and report "idd_status:<status>" to the host
+   (ok / error / disabled / not_found / unknown), derived from devcon's PnP devnode
+   state. Called by the device-check thread when a host connects (force=1: always
+   send, so a reconnect re-syncs the host's latched idd_ready) AND periodically
+   (force=0: send only on change) -- so the host's display-readiness tracks the LIVE
+   VDD state, which can self-heal via ensure_vdd_running(). The host re-latches every
+   line, so the change-gate avoids spamming the daemon log/events. */
+static void report_idd_status(int force)
+{
+    static char last_status[16];   /* last value the host received */
+    char output[4096];
+    DWORD exit_code = 0;
+    const char *st = "not_found";
+
+    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                    DEVCON_QUERY_TIMEOUT_MS)) {
+        agent_log("IDD status: devcon failed to launch (%lu).", GetLastError());
+        st = "not_found";
+    } else if (exit_code == DEVCON_TIMED_OUT) {
+        /* No answer from PnP: nothing new to tell, except on connect, where
+           the host waits for a first status. */
+        agent_log("IDD status: devcon status timed out.");
+        if (!force) return;
+        st = "unknown";
+    } else if (strstr(output, "running")) {
         agent_log("IDD status: AppSandboxVDD running.");
         st = "ok";
     } else if (strstr(output, "problem")) {
@@ -1482,74 +1739,14 @@ static void report_idd_status(AsbConn *client, int force)
         st = "unknown";
     }
 
-emit:
-    /* Send only when the value changes (force overrides on connect). */
+    /* Send only when the value changes (force overrides on connect); remember
+       it only once the host has it. */
     if (force || strcmp(st, last_status) != 0) {
         char line[32];
         sprintf_s(line, sizeof(line), "idd_status:%s", st);
-        send_line(client, line);
-        strcpy_s(last_status, sizeof(last_status), st);
+        if (send_to_host(line) > 0)
+            strcpy_s(last_status, sizeof(last_status), st);
     }
-}
-
-/* ---- Helper: run devcon command and capture stdout ---- */
-
-static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD *out_exit_code)
-{
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    HANDLE hRead = NULL, hWrite = NULL;
-    SECURITY_ATTRIBUTES sa;
-    wchar_t cmd[MAX_PATH];
-    wchar_t exe_dir[MAX_PATH];
-    wchar_t *slash;
-    DWORD bytes_read;
-    int pos = 0;
-
-    GetModuleFileNameW(NULL, exe_dir, MAX_PATH);
-    slash = wcsrchr(exe_dir, L'\\');
-    if (slash) *(slash + 1) = L'\0';
-
-    swprintf_s(cmd, MAX_PATH, L"\"%sdrivers\\devcon.exe\" %s", exe_dir, args);
-
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&hRead, &hWrite, &sa, 0)) return FALSE;
-    SetHandleInformation(hRead, HANDLE_FLAG_INHERIT, 0);
-
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdOutput = hWrite;
-    si.hStdError = hWrite;
-    si.hStdInput = NULL;
-    ZeroMemory(&pi, sizeof(pi));
-
-    if (!CreateProcessW(NULL, cmd, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        CloseHandle(hRead);
-        CloseHandle(hWrite);
-        return FALSE;
-    }
-    CloseHandle(hWrite);
-
-    /* Wait for devcon to finish (10s max). If it hangs, kill it. */
-    if (WaitForSingleObject(pi.hProcess, 2000) == WAIT_TIMEOUT) {
-        agent_log("run_devcon: process timed out, killing.");
-        TerminateProcess(pi.hProcess, 1);
-        WaitForSingleObject(pi.hProcess, 3000);
-    }
-
-    /* Now read whatever output is available (process is dead, pipe will EOF) */
-    while (ReadFile(hRead, output + pos, (DWORD)(output_size - pos - 1), &bytes_read, NULL) && bytes_read > 0)
-        pos += (int)bytes_read;
-    output[pos] = '\0';
-    CloseHandle(hRead);
-
-    if (out_exit_code) GetExitCodeProcess(pi.hProcess, out_exit_code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    return TRUE;
 }
 
 /* ---- VDD device check: restart if not running ---- */
@@ -1582,7 +1779,8 @@ static void run_logged(const wchar_t *cmd_line, const char *what)
 }
 
 /* Result of the last staged display-driver install, sent to the host log
-   once it connects (the install runs at service start, before that). */
+   once it connects (the install runs at service start, before that).
+   Used only by the device-check thread. */
 static char g_vdd_update_note[600];
 
 static void apply_pending_vdd_update(void)
@@ -1590,7 +1788,11 @@ static void apply_pending_vdd_update(void)
     wchar_t dir[MAX_PATH], marker[MAX_PATH], cer[MAX_PATH], sys_dir[MAX_PATH];
     wchar_t cmd[1024], *slash;
     char output[1024];
-    DWORD exit_code = 1;
+    DWORD exit_code = 0;
+    /* devcon update's exit code: 0 done, 1 done but a restart is needed (the
+       old driver file was still in use), 2 failed; DEVCON_TIMED_OUT when it
+       was killed. Stays 2 if devcon could not be started. */
+    DWORD update_code = 2;
 
     GetModuleFileNameW(NULL, dir, MAX_PATH);
     slash = wcsrchr(dir, L'\\');
@@ -1613,48 +1815,64 @@ static void apply_pending_vdd_update(void)
     }
     /* Stop the device first so WUDFHost releases AppSandboxVDD.dll and the
        new file is copied now instead of being left for a later reboot. */
-    if (run_devcon(L"disable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
-        agent_log("VDD update: disable (exit %lu): %.200s", exit_code, output);
-    swprintf_s(cmd, ARRAYSIZE(cmd), L"update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD", dir);
-    if (run_devcon(cmd, output, sizeof(output), &exit_code)) {
-        agent_log("VDD update: devcon exit %lu: %.400s", exit_code, output);
-        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
-                    "display driver update: devcon exit %lu: %.400s", exit_code, output);
-    } else {
-        agent_log("VDD update: devcon failed to launch (%lu).", GetLastError());
-        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
-                    "display driver update: devcon failed to launch (%lu)", GetLastError());
+    if (run_devcon(L"disable Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                   DEVCON_CHANGE_TIMEOUT_MS)) {
+        if (exit_code == DEVCON_TIMED_OUT)
+            agent_log("VDD update: disable timed out: %.200s", output);
+        else
+            agent_log("VDD update: disable (exit %lu): %.200s", exit_code, output);
     }
-    {
-        /* devcon exit codes: 0 done, 1 done but a restart is needed (the old
-           driver file was still in use), 2 failed. */
-        DWORD update_code = exit_code;
-        if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
-            agent_log("VDD update: enable (exit %lu): %.200s", exit_code, output);
-        if (update_code == 1) {
-            wchar_t restart[MAX_PATH + 96];
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD", dir);
+    if (run_devcon(cmd, output, sizeof(output), &update_code, DEVCON_UPDATE_TIMEOUT_MS)) {
+        if (update_code == DEVCON_TIMED_OUT) {
+            agent_log("VDD update: devcon did not finish within %lu s: %.400s",
+                      DEVCON_UPDATE_TIMEOUT_MS / 1000, output);
             _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
-                        "display driver update installed; restarting the VM in 15 seconds to finish it.");
-            agent_log("VDD update: restart required, restarting in 15 s.");
-            swprintf_s(restart, ARRAYSIZE(restart),
-                       L"\"%s\\shutdown.exe\" /r /t 15 /d p:2:4 /c \"App Sandbox: finishing the display driver update\"",
-                       sys_dir);
-            run_logged(restart, "VDD update: restart");
-        } else if (update_code == 0) {
+                        "display driver update: devcon did not finish within %lu s and was stopped; "
+                        "the VM was not restarted (see C:\\Windows\\AppSandbox\\agent.log).",
+                        DEVCON_UPDATE_TIMEOUT_MS / 1000);
+        } else {
+            agent_log("VDD update: devcon exit %lu: %.400s", update_code, output);
             _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
-                        "display driver updated.");
+                        "display driver update: devcon exit %lu: %.400s", update_code, output);
         }
+    } else {
+        DWORD err = GetLastError();
+        update_code = 2;
+        agent_log("VDD update: devcon failed to launch (%lu).", err);
+        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                    "display driver update: devcon failed to launch (%lu)", err);
+    }
+    if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                   DEVCON_CHANGE_TIMEOUT_MS)) {
+        if (exit_code == DEVCON_TIMED_OUT)
+            agent_log("VDD update: enable timed out: %.200s", output);
+        else
+            agent_log("VDD update: enable (exit %lu): %.200s", exit_code, output);
+    }
+    /* Restart only when devcon itself said so (exit 1); a timeout is not a
+       restart request. */
+    if (update_code == 1) {
+        wchar_t restart[MAX_PATH + 96];
+        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                    "display driver update installed; restarting the VM in 15 seconds to finish it.");
+        agent_log("VDD update: restart required, restarting in 15 s.");
+        swprintf_s(restart, ARRAYSIZE(restart),
+                   L"\"%s\\shutdown.exe\" /r /t 15 /d p:2:4 /c \"App Sandbox: finishing the display driver update\"",
+                   sys_dir);
+        run_logged(restart, "VDD update: restart");
+    } else if (update_code == 0) {
+        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                    "display driver updated.");
     }
     {
         /* Flatten line breaks for the one-line host log. */
         char *c;
         for (c = g_vdd_update_note; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
     }
-    if (g_client_sock) {   /* host already connected: tell it now */
-        agent_log_to_host("%s", g_vdd_update_note);
+    /* Host already connected: tell it now (otherwise at its connect check). */
+    if (agent_log_to_host("%s", g_vdd_update_note) > 0)
         g_vdd_update_note[0] = '\0';
-    }
-
 }
 
 /* ---- Controllers: ViGEmBus (virtual Xbox 360 pads) ----
@@ -1682,9 +1900,8 @@ static DWORD WINAPI vigem_install_thread(LPVOID param)
     run_logged(cmd, "Controllers: ViGEmBus setup");
     ok = service_exists(L"ViGEmBus");
     agent_log("Controllers: ViGEmBus %s.", ok ? "installed" : "did not install");
-    if (g_client_sock)
-        agent_log_to_host(ok ? "Controllers: ViGEmBus installed in the VM; game controllers can be used."
-                             : "Controllers: ViGEmBus could not be installed in the VM (controllers will not work).");
+    agent_log_to_host(ok ? "Controllers: ViGEmBus installed in the VM; game controllers can be used."
+                         : "Controllers: ViGEmBus could not be installed in the VM (controllers will not work).");
     free(setup);
     return 0;
 }
@@ -1705,59 +1922,102 @@ static void ensure_vigem_installed(void)
     if (t) CloseHandle(t); else free(setup);
 }
 
+/* Bring the VDD back when it is disabled or stuck. One bad reading is not
+   enough: while PnP is busy (boot, driver installs, logon) devcon can briefly
+   report the device stopped or with a problem, and restarting the display
+   driver then drops the host's display connection for nothing. So act only
+   when two consecutive checks, at least VDD_RECHECK_MIN_MS apart, saw
+   "disabled" (enable it) or a problem / stopped device (restart it).
+   Anything else -- an unrecognised, empty or timed-out status -- is left
+   alone. Runs only on the device-check thread. */
+#define VDD_RECHECK_MIN_MS 10000
+
 static void ensure_vdd_running(void)
 {
+    static int   bad_readings = 0;     /* consecutive disabled / problem readings */
+    static DWORD first_bad_tick = 0;
     char output[4096];
     DWORD exit_code = 0;
+    BOOL disabled, stuck;
 
-    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
+    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                    DEVCON_QUERY_TIMEOUT_MS)) {
         agent_log("ensure_vdd_running: devcon failed to launch (%lu).", GetLastError());
         return;
     }
-
-    if (strstr(output, "running"))
+    if (exit_code == DEVCON_TIMED_OUT) {
+        agent_log("ensure_vdd_running: devcon status timed out - leaving the VDD alone.");
         return;
+    }
 
-    if (strstr(output, "No matching"))
-        return; /* not installed yet */
+    if (strstr(output, "running") || strstr(output, "No matching")) {
+        bad_readings = 0;   /* fine, or not installed yet */
+        return;
+    }
+
+    disabled = strstr(output, "disabled") != NULL;
+    stuck = !disabled && (strstr(output, "problem") != NULL || strstr(output, "stopped") != NULL);
+    if (!disabled && !stuck) {
+        agent_log("VDD: unrecognised status - leaving it alone. Output: %.400s", output);
+        bad_readings = 0;
+        return;
+    }
+
+    if (bad_readings == 0)
+        first_bad_tick = GetTickCount();
+    bad_readings++;
+    if (bad_readings < 2 || GetTickCount() - first_bad_tick < VDD_RECHECK_MIN_MS) {
+        agent_log("VDD: %s - checking again before acting.", disabled ? "disabled" : "problem");
+        return;
+    }
+    bad_readings = 0;
 
     /* A device in CM_PROB_DISABLED (explicitly disabled) has its CONFIGFLAG_DISABLED bit set;
        `devcon restart` (DICS_PROPCHANGE: stop->start) reports success but CANNOT clear that bit,
        so the device snaps straight back to disabled. Only `devcon enable` (DICS_ENABLE) clears it.
        So: ENABLE a disabled device; RESTART a stuck-but-enabled ("problem") one. */
-    if (strstr(output, "disabled")) {
+    if (disabled) {
         agent_log("VDD: disabled - enabling.");
-        if (!run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
+        if (!run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                        DEVCON_CHANGE_TIMEOUT_MS)) {
             agent_log("VDD enable: devcon failed to launch (%lu).", GetLastError());
             return;
         }
-        agent_log("VDD enable (exit=%lu): %.400s", exit_code, output);
+        if (exit_code == DEVCON_TIMED_OUT)
+            agent_log("VDD enable: devcon timed out: %.400s", output);
+        else
+            agent_log("VDD enable (exit=%lu): %.400s", exit_code, output);
         return;
     }
 
-    if (strstr(output, "problem"))
-        agent_log("VDD: problem - restarting.");
-    else
-        agent_log("VDD: unknown state - restarting.");
-
-    if (!run_devcon(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code)) {
+    agent_log("VDD: problem - restarting. Status: %.400s", output);
+    if (!run_devcon(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+                    DEVCON_CHANGE_TIMEOUT_MS)) {
         agent_log("VDD restart: devcon failed to launch (%lu).", GetLastError());
         return;
     }
-    agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
+    if (exit_code == DEVCON_TIMED_OUT)
+        agent_log("VDD restart: devcon timed out: %.400s", output);
+    else
+        agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
 }
 
 /* ---- Hyper-V Video device check: disable if running ---- */
 
 #define HYPERV_VIDEO_HWID L"*DA0A7802*"
 
-static void ensure_hyperv_video_disabled(AsbConn *notify)
+static void ensure_hyperv_video_disabled(BOOL notify_host)
 {
     char output[4096];
     DWORD exit_code = 0;
 
-    if (!run_devcon(L"status " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code)) {
+    if (!run_devcon(L"status " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code,
+                    DEVCON_QUERY_TIMEOUT_MS)) {
         agent_log("ensure_hyperv_video_disabled: devcon failed to launch (%lu).", GetLastError());
+        return;
+    }
+    if (exit_code == DEVCON_TIMED_OUT) {
+        agent_log("ensure_hyperv_video_disabled: devcon status timed out.");
         return;
     }
 
@@ -1769,13 +2029,18 @@ static void ensure_hyperv_video_disabled(AsbConn *notify)
 
     agent_log("Hyper-V Video: running — disabling.");
 
-    if (!run_devcon(L"disable " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code)) {
+    if (!run_devcon(L"disable " HYPERV_VIDEO_HWID, output, sizeof(output), &exit_code,
+                    DEVCON_CHANGE_TIMEOUT_MS)) {
         agent_log("Hyper-V Video disable: devcon failed to launch (%lu).", GetLastError());
         return;
     }
+    if (exit_code == DEVCON_TIMED_OUT) {
+        agent_log("Hyper-V Video disable: devcon timed out: %.400s", output);
+        return;
+    }
 
-    if (notify != NULL)
-        send_line(notify, "hyperv_video:disabled");
+    if (notify_host)
+        send_to_host("hyperv_video:disabled");
     agent_log("Hyper-V Video disable (exit=%lu): %.400s", exit_code, output);
 }
 
@@ -1956,7 +2221,7 @@ static void handle_idd_connect(AsbConn *client, const char *tag)
 /* Disable the Hyper-V synthetic video adapter (if present).
    Hardware ID: VMBUS\{da0a7802-e377-4aac-8e77-0558eb1073f8}
    Silently does nothing if the device doesn't exist. */
-static void disable_hyperv_video(AsbConn *notify_sock)
+static void disable_hyperv_video(BOOL notify_host)
 {
     HDEVINFO devs;
     SP_DEVINFO_DATA dev_info;
@@ -1985,21 +2250,21 @@ static void disable_hyperv_video(AsbConn *notify_sock)
         cr = CM_Get_DevNode_Status(&dev_status, &dev_problem, dev_info.DevInst, 0);
         if (cr == CR_SUCCESS && !(dev_status & DN_STARTED) && (dev_problem == CM_PROB_DISABLED)) {
             agent_log("Hyper-V Video adapter already disabled: %ls", hw_id);
-            if (notify_sock != NULL)
-                send_line(notify_sock, "hyperv_video:already_disabled");
+            if (notify_host)
+                send_to_host("hyperv_video:already_disabled");
             SetupDiDestroyDeviceInfoList(devs);
             return;
         }
 
         agent_log("Disabling Hyper-V Video adapter: %ls (status=0x%lX problem=%lu)", hw_id, dev_status, dev_problem);
-        if (notify_sock != NULL)
-            send_line(notify_sock, "hyperv_video:disabling");
+        if (notify_host)
+            send_to_host("hyperv_video:disabling");
 
         cr = CM_Disable_DevNode(dev_info.DevInst, 0);
         if (cr == CR_SUCCESS) {
             agent_log("Hyper-V Video adapter disabled.");
-            if (notify_sock != NULL)
-                send_line(notify_sock, "hyperv_video:disabled");
+            if (notify_host)
+                send_to_host("hyperv_video:disabled");
         } else {
             agent_log("Hyper-V Video disable failed (%lu).", cr);
         }
@@ -2008,8 +2273,8 @@ static void disable_hyperv_video(AsbConn *notify_sock)
     }
 
     agent_log("Hyper-V Video adapter not found (enumerated %lu devices).", idx);
-    if (notify_sock != NULL)
-        send_line(notify_sock, "hyperv_video:not_found");
+    if (notify_host)
+        send_to_host("hyperv_video:not_found");
     SetupDiDestroyDeviceInfoList(devs);
 }
 
@@ -2048,42 +2313,223 @@ static ULONG primary_nic_index(void)
     return index;
 }
 
+/* ---- Diagnostics: did the previous Windows session end cleanly? ----
+ * CleanShutdown (DWORD under HKLM\SOFTWARE\AppSandbox\Agent) is 0 while the
+ * service runs and 1 once it is told to stop or that Windows shuts down.
+ * Finding 0 at the first service start of a boot means the last session
+ * ended some other way: a crash (bugcheck), a reset or a power-off. The host
+ * log is told once, at the first connection, together with the newest crash
+ * dump not reported before. Best effort: any registry or file error just
+ * skips the report. */
+
+static char      g_reset_note[600];     /* set before the listener starts, then used only by handle_client */
+static ULONGLONG g_reset_dump_time;     /* write time of the dump named in g_reset_note */
+
+static void mark_clean_shutdown(DWORD clean)
+{
+    HKEY key;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &key, NULL) != ERROR_SUCCESS)
+        return;
+    RegSetValueExW(key, L"CleanShutdown", 0, REG_DWORD, (const BYTE *)&clean, sizeof(clean));
+    /* Write it through now: a crash or reset later in this session must find
+       the 0, and a shutdown must not lose the 1. */
+    RegFlushKey(key);
+    RegCloseKey(key);
+}
+
+/* Newest *.dmp in %windir%\Minidump written after 'after' (a FILETIME as a
+   64-bit value). Returns FALSE when there is none. */
+static BOOL newest_minidump(ULONGLONG after, wchar_t *name, int name_len, ULONGLONG *written)
+{
+    wchar_t pattern[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    HANDLE find;
+    UINT len = GetWindowsDirectoryW(pattern, MAX_PATH);
+    BOOL found = FALSE;
+
+    if (!len || len >= MAX_PATH - 20) return FALSE;
+    wcscat_s(pattern, MAX_PATH, L"\\Minidump\\*.dmp");
+    find = FindFirstFileW(pattern, &fd);
+    if (find == INVALID_HANDLE_VALUE) return FALSE;
+    do {
+        ULONGLONG t;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        t = ((ULONGLONG)fd.ftLastWriteTime.dwHighDateTime << 32) | fd.ftLastWriteTime.dwLowDateTime;
+        if (t > after && (!found || t > *written)) {
+            *written = t;
+            wcscpy_s(name, name_len, fd.cFileName);
+            found = TRUE;
+        }
+    } while (FindNextFileW(find, &fd));
+    FindClose(find);
+    return found;
+}
+
+/* At service start: read the previous session's marker, set it to 0 for
+   this one, and prepare the host-log note. */
+static void check_previous_session(void)
+{
+    static volatile LONG started_flag = 0;
+    HKEY key;
+    DWORD value = 1, type = 0, size = sizeof(value);
+    ULONGLONG last_dump = 0, dump_time = 0;
+    BOOL unclean = FALSE, have_dump;
+    wchar_t dump[MAX_PATH];
+    /* A restart of this service within the same boot (it crashed and the SCM
+       restarted it) is not a Windows session ending. */
+    BOOL first_start = first_time_this_boot(L"StartedThisBoot", &started_flag);
+
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, 0, NULL, 0,
+                        KEY_QUERY_VALUE | KEY_SET_VALUE, NULL, &key, NULL) != ERROR_SUCCESS)
+        return;
+    if (RegQueryValueExW(key, L"CleanShutdown", NULL, &type, (BYTE *)&value, &size) == ERROR_SUCCESS &&
+        type == REG_DWORD && size == sizeof(value) && value == 0)
+        unclean = first_start;
+    size = sizeof(last_dump);
+    if (RegQueryValueExW(key, L"LastMinidumpReported", NULL, &type, (BYTE *)&last_dump, &size) != ERROR_SUCCESS ||
+        type != REG_QWORD || size != sizeof(last_dump))
+        last_dump = 0;
+    RegCloseKey(key);
+    mark_clean_shutdown(0);
+
+    have_dump = newest_minidump(last_dump, dump, MAX_PATH, &dump_time);
+    if (unclean) {
+        agent_log("Previous Windows session ended unexpectedly (CleanShutdown was 0).%s%ls",
+                  have_dump ? " Newest crash dump: " : "", have_dump ? dump : L"");
+        _snprintf_s(g_reset_note, sizeof(g_reset_note), _TRUNCATE,
+                    "log:the previous Windows session in this VM ended unexpectedly (crash or reset); "
+                    "see C:\\Windows\\Minidump and the System event log%s%ls%s",
+                    have_dump ? " (newest crash dump: " : "", have_dump ? dump : L"",
+                    have_dump ? ")" : "");
+    } else if (have_dump) {
+        agent_log("New crash dump found: %ls", dump);
+        _snprintf_s(g_reset_note, sizeof(g_reset_note), _TRUNCATE,
+                    "log:Windows wrote a crash dump in this VM: C:\\Windows\\Minidump\\%ls "
+                    "(see the System event log)", dump);
+    }
+    if (have_dump)
+        g_reset_dump_time = dump_time;
+}
+
+/* Send the note prepared by check_previous_session() once, on the first
+   connection that takes it, and remember the dump as reported. */
+static void report_previous_session(AsbConn *client)
+{
+    HKEY key;
+
+    if (!g_reset_note[0] || send_line(client, g_reset_note) <= 0)
+        return;
+    g_reset_note[0] = '\0';
+    if (g_reset_dump_time &&
+        RegCreateKeyExW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &key, NULL) == ERROR_SUCCESS) {
+        RegSetValueExW(key, L"LastMinidumpReported", 0, REG_QWORD,
+                       (const BYTE *)&g_reset_dump_time, sizeof(g_reset_dump_time));
+        RegCloseKey(key);
+    }
+}
+
+/* ---- Device checks (VDD, Hyper-V Video, idd_status) ----
+ * devcon waits for PnP and can take many seconds while PnP is busy (boot,
+ * driver installs). The checks therefore run on their own thread and never
+ * on the connection thread, which must keep answering host commands: the
+ * host drops the connection when a reply takes longer than its 5 s receive
+ * timeout. All devcon use is serialized on this thread, including the staged
+ * display-driver update at service start. */
+#define DEVICE_CHECK_INTERVAL_MS 20000
+
+static HANDLE        g_device_check_wake;       /* auto-reset: run a check now */
+static volatile LONG g_device_check_connect;    /* a host connected: full check, forced idd_status */
+static volatile LONG g_device_check_logoff;     /* a user logged off: Hyper-V Video check only */
+
+static void request_device_check(volatile LONG *reason)
+{
+    InterlockedExchange(reason, 1);
+    if (g_device_check_wake) SetEvent(g_device_check_wake);
+}
+
+/* param != NULL: also run the service-start tasks first. */
+static DWORD WINAPI device_check_thread(LPVOID param)
+{
+    HANDLE waits[2];
+    DWORD count = 1;
+
+    if (param) {
+        /* A newer display driver staged by the host while the VM was off. */
+        apply_pending_vdd_update();
+        ensure_vigem_installed();
+
+        /* Ensure VDD device is running (may need restart after logout teardown) */
+        ensure_vdd_running();
+
+        /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
+        ensure_hyperv_video_disabled(FALSE);
+    }
+
+    waits[0] = g_stop_event;
+    if (g_device_check_wake) waits[count++] = g_device_check_wake;
+
+    for (;;) {
+        DWORD w = WaitForMultipleObjects(count, waits, FALSE, DEVICE_CHECK_INTERVAL_MS);
+        if (w != WAIT_TIMEOUT && w != WAIT_OBJECT_0 + 1) break;   /* stop, or the wait failed */
+
+        if (InterlockedExchange(&g_device_check_connect, 0)) {
+            /* New connection: the host resets idd_ready and waits for a status. */
+            report_idd_status(1);
+            if (g_vdd_update_note[0] && agent_log_to_host("%s", g_vdd_update_note) > 0)
+                g_vdd_update_note[0] = '\0';
+            ensure_vdd_running();
+            ensure_hyperv_video_disabled(TRUE);
+        } else if (w == WAIT_TIMEOUT && host_connected()) {
+            /* Periodic check while a host is connected (VDD recovery is expensive) */
+            ensure_vdd_running();
+            ensure_hyperv_video_disabled(TRUE);
+            report_idd_status(0);   /* re-report the (possibly self-healed) VDD state; on-change only */
+        }
+
+        if (InterlockedExchange(&g_device_check_logoff, 0)) {
+            /* Disable Hyper-V Video after logoff (may have been re-enabled).
+               The VDD is deliberately not checked here; see service_ctrl_ex. */
+            ensure_hyperv_video_disabled(FALSE);
+        }
+    }
+    return 0;
+}
+
 static void handle_client(AsbConn *client)
 {
     char buf[256];
     int n;
     DWORD heartbeat_interval = 5000;     /* ms between heartbeats */
-    DWORD device_check_interval = 20000; /* ms between VDD/Hyper-V device checks */
     DWORD last_heartbeat;
-    DWORD last_device_check;
 
     agent_log("Client connected.");
-    g_client_sock = client;
 
     /* Set timeouts so recv/send don't block forever if host disconnects (no-op on ivshmem) */
     asb_set_timeout(client, 10000, 10000);
 
-    /* Send hello */
-    if (send_line(client, "hello") <= 0) {
+    /* Send hello, and publish the connection to the other threads in the same
+       locked step: the host requires "hello" to be the first line. */
+    EnterCriticalSection(&g_send_cs);
+    n = send_line(client, "hello");
+    if (n > 0)
+        g_client_sock = client;
+    LeaveCriticalSection(&g_send_cs);
+    if (n <= 0) {
         agent_log("Failed to send hello.");
         asb_close(client);
-        g_client_sock = NULL;
         return;
     }
 
-    /* Report IDD driver status to host (force: always send on connect so a reconnect re-syncs) */
-    report_idd_status(client, 1);
-    if (g_vdd_update_note[0]) {
-        agent_log_to_host("%s", g_vdd_update_note);
-        g_vdd_update_note[0] = '\0';
-    }
+    report_previous_session(client);
 
-    /* Initial device checks */
-    ensure_vdd_running();
-    ensure_hyperv_video_disabled(client);
+    /* The device-check thread reports the IDD driver status (forced, so a
+       reconnect re-syncs), any display-driver update result, and runs the
+       initial device checks without holding up this connection. */
+    request_device_check(&g_device_check_connect);
 
     last_heartbeat = GetTickCount();
-    last_device_check = last_heartbeat;
 
     /* Persistent connection loop */
     while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
@@ -2101,14 +2547,6 @@ static void handle_client(AsbConn *client)
                 break;
             }
             last_heartbeat = now;
-        }
-
-        /* Device checks on a slower cadence (VDD recovery is expensive) */
-        if (now - last_device_check >= device_check_interval) {
-            last_device_check = now;
-            ensure_vdd_running();
-            ensure_hyperv_video_disabled(client);
-            report_idd_status(client, 0);   /* re-report the (possibly self-healed) VDD state; on-change only */
         }
 
 
@@ -2335,11 +2773,11 @@ static void handle_client(AsbConn *client)
         }
     }
 
-    /* If GPU copy is still running, wait for it to finish */
-    if (g_gpu_copy.copying) {
+    /* A running GPU copy reports through send_to_host(), so after a plain
+       disconnect it carries on and reports to the next connection. When the
+       service is stopping, give it a moment to finish first. */
+    if (g_gpu_copy.copying && WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) {
         agent_log("Waiting for GPU copy thread to finish...");
-        /* Invalidate notify socket so it doesn't try to send on closed socket */
-        g_gpu_copy.notify_sock = NULL;
         {
             int wait;
             for (wait = 0; wait < 10000 && g_gpu_copy.copying; wait += 500)
@@ -2347,7 +2785,11 @@ static void handle_client(AsbConn *client)
         }
     }
 
+    /* Unpublish under the send lock before closing: once this returns, no
+       other thread is inside a send on this connection or can start one. */
+    EnterCriticalSection(&g_send_cs);
     g_client_sock = NULL;
+    LeaveCriticalSection(&g_send_cs);
     asb_close(client);
     agent_log("Client handler exiting.");
 }
@@ -2615,20 +3057,14 @@ static DWORD WINAPI ssh_wait_thread(LPVOID param)
         if (ensure_sshd_running()) {
             agent_log("SSH: sshd is running (after %d seconds).", attempts);
             start_ssh_proxy();
-            EnterCriticalSection(&g_send_cs);
-            if (g_client_sock != NULL)
-                send_line(g_client_sock, "ssh_ready");
-            LeaveCriticalSection(&g_send_cs);
+            send_to_host("ssh_ready");
             g_ssh_waiting = FALSE;
             return 0;
         }
     }
 
     agent_log("SSH: sshd did not start within timeout.");
-    EnterCriticalSection(&g_send_cs);
-    if (g_client_sock != NULL)
-        send_line(g_client_sock, "ssh_failed");
-    LeaveCriticalSection(&g_send_cs);
+    send_to_host("ssh_failed");
     g_ssh_waiting = FALSE;
     return 1;
 }
@@ -2684,18 +3120,19 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
     (void)context;
     agent_log("service_ctrl received: %lu (event_type=%lu)", ctrl, event_type);
 
+    /* The session is ending (or the service stopping) the orderly way:
+       see check_previous_session(). */
+    if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN ||
+        ctrl == SERVICE_CONTROL_PRESHUTDOWN)
+        mark_clean_shutdown(1);
+
     if (ctrl == SERVICE_CONTROL_STOP || ctrl == SERVICE_CONTROL_SHUTDOWN) {
         if (ctrl == SERVICE_CONTROL_SHUTDOWN)
             g_os_shutting_down = TRUE;
 
         /* Notify host */
-        if (g_client_sock != NULL) {
-            if (ctrl == SERVICE_CONTROL_SHUTDOWN)
-                send_line(g_client_sock, "os_shutdown");
-            else
-                send_line(g_client_sock, "service_stopping");
+        if (send_to_host(ctrl == SERVICE_CONTROL_SHUTDOWN ? "os_shutdown" : "service_stopping") > 0)
             agent_log("Sent notification to host (ctrl=%lu).", ctrl);
-        }
 
         set_service_status(SERVICE_STOP_PENDING, 0);
         agent_log("Setting stop event...");
@@ -2714,8 +3151,10 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
                A devcon restart mid-transition destroys the adapter/monitor
                and prevents IddCx from completing the handoff. */
 
-            /* Disable Hyper-V Video after logoff (may have been re-enabled) */
-            ensure_hyperv_video_disabled(NULL);
+            /* Disable Hyper-V Video after logoff (may have been re-enabled).
+               devcon can be slow, so the device-check thread does it rather
+               than this control handler. */
+            request_device_check(&g_device_check_logoff);
         }
         if (event_type == WTS_SESSION_LOGON || event_type == WTS_SESSION_UNLOCK) {
             DWORD sid = sn ? sn->dwSessionId : WTSGetActiveConsoleSessionId();
@@ -2736,26 +3175,33 @@ static DWORD WINAPI service_ctrl_ex(DWORD ctrl, DWORD event_type, LPVOID event_d
 
 static void WINAPI service_main(DWORD argc, LPSTR *argv)
 {
-    HANDLE thread;
+    HANDLE thread, device_thread;
+    BOOL device_thread_done = TRUE;
 
     (void)argc; (void)argv;
 
     g_status_handle = RegisterServiceCtrlHandlerExA(SERVICE_NAME, service_ctrl_ex, NULL);
     if (!g_status_handle) return;
 
-    /* Init before accepting SESSIONCHANGE so the control handler and the
-       clipboard monitor threads share this lock for the helper-process globals. */
+    /* Init before accepting controls: the control handler uses the send lock
+       (host notifications), the stop event and the device-check wake event;
+       it and the clipboard monitor threads share g_clip_proc_cs for the
+       helper-process globals. */
     InitializeCriticalSection(&g_clip_proc_cs);
+    InitializeCriticalSection(&g_input_proc_cs);
+    InitializeCriticalSection(&g_send_cs);
+    g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    g_device_check_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     g_status.dwServiceType = SERVICE_WIN32_OWN_PROCESS;
     g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
     set_service_status(SERVICE_START_PENDING, 0);
 
-    g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
-    InitializeCriticalSection(&g_send_cs);
-
     /* Wire p9copy logging into agent_log */
     p9_set_log(p9copy_log);
+
+    /* Note how the previous Windows session ended (before any host connects) */
+    check_previous_session();
 
     /* Start listener on a worker thread */
     thread = CreateThread(NULL, 0, listener_thread, NULL, 0, NULL);
@@ -2775,15 +3221,11 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
 
-    /* A newer display driver staged by the host while the VM was off. */
-    apply_pending_vdd_update();
-    ensure_vigem_installed();
-
-    /* Ensure VDD device is running (may need restart after logout teardown) */
-    ensure_vdd_running();
-
-    /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
-    ensure_hyperv_video_disabled(NULL);
+    /* Device checks, starting with the service-start tasks (staged display
+       driver update, ViGEmBus, VDD running, Hyper-V Video disabled). */
+    device_thread = CreateThread(NULL, 0, device_check_thread, (LPVOID)1, 0, NULL);
+    if (!device_thread)
+        agent_log("Failed to create device-check thread (error %lu).", GetLastError());
 
     /* Wait until stop is signaled */
     WaitForSingleObject(g_stop_event, INFINITE);
@@ -2813,9 +3255,23 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
         CloseHandle(thread);
         agent_log("Listener thread exited.");
     }
+    if (device_thread) {
+        agent_log("Waiting for device-check thread...");
+        device_thread_done = WaitForSingleObject(device_thread, 5000) == WAIT_OBJECT_0;
+        CloseHandle(device_thread);
+        agent_log(device_thread_done ? "Device-check thread exited."
+                                     : "Device-check thread still busy (devcon); leaving it to process exit.");
+    }
     CloseHandle(g_stop_event);
     DeleteCriticalSection(&g_clip_proc_cs);
-    DeleteCriticalSection(&g_send_cs);
+    DeleteCriticalSection(&g_input_proc_cs);
+    /* A device check still inside devcon may yet send to the host: keep its
+       lock and wake event alive until the process exits. */
+    if (device_thread_done) {
+        if (g_device_check_wake) CloseHandle(g_device_check_wake);
+        g_device_check_wake = NULL;
+        DeleteCriticalSection(&g_send_cs);
+    }
 
     agent_log("Service stopped.");
     set_service_status(SERVICE_STOPPED, 0);
@@ -2938,13 +3394,25 @@ int main(int argc, char *argv[])
         };
         if (!StartServiceCtrlDispatcherA(table)) {
             /* Not running as service — run listener directly for debugging */
+            HANDLE device_thread;
             printf("Running in console mode (Ctrl+C to stop)...\n");
             p9_set_log(p9copy_log);
             InitializeCriticalSection(&g_send_cs);
             InitializeCriticalSection(&g_clip_proc_cs);
+            InitializeCriticalSection(&g_input_proc_cs);
             g_stop_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+            g_device_check_wake = CreateEventW(NULL, FALSE, FALSE, NULL);
+            /* Connection-time and periodic device checks only (no service-start tasks) */
+            device_thread = CreateThread(NULL, 0, device_check_thread, NULL, 0, NULL);
             listener_thread(NULL);
+            SetEvent(g_stop_event);
+            if (device_thread) {
+                WaitForSingleObject(device_thread, INFINITE);
+                CloseHandle(device_thread);
+            }
+            if (g_device_check_wake) CloseHandle(g_device_check_wake);
             CloseHandle(g_stop_event);
+            DeleteCriticalSection(&g_input_proc_cs);
             DeleteCriticalSection(&g_clip_proc_cs);
             DeleteCriticalSection(&g_send_cs);
         }
