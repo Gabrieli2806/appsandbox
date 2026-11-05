@@ -325,6 +325,9 @@ HRESULT guest_tools_update(VmInstance *vm, wchar_t *err, size_t err_cap)
         if (!copy_into(res, g_guest_bins[i], app_dir, err, err_cap)) goto done;
     for (i = 0; i < (int)ARRAYSIZE(g_vdd_files); i++)
         if (!copy_into(drv, g_vdd_files[i], drv_dir, err, err_cap)) goto done;
+    /* Optional: a ViGEmBus installer placed in drivers\ (game controllers);
+       the agent installs it when the bus is missing. */
+    if (!copy_into(drv, L"ViGEmBus_setup.exe", drv_dir, err, err_cap)) goto done;
 
     swprintf_s(marker, MAX_PATH, L"%s\\%s", drv_dir, VDD_PENDING_MARKER);
     {

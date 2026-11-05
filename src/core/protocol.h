@@ -20,6 +20,10 @@
 #define INPUT_MOUSE_POSITION_REPLY 11
 #define INPUT_MOUSE_VERSION   1
 #define INPUT_SET_DISPLAY     12
+#define INPUT_GAMEPAD         13
+#define INPUT_GAMEPAD_REMOVE  14
+#define INPUT_TYPE_BASE(t)    ((t) & 0xFFu)
+#define INPUT_PAD_INDEX(t)    (((t) >> 8) & 0x3u)
 
 #define INPUT_BTN_LEFT        0
 #define INPUT_BTN_RIGHT       1
@@ -43,6 +47,15 @@
  * guests switch the AppSandbox virtual display to that mode (the host first
  * asks the VDD to offer it on the frame channel). No reply; older helpers
  * ignore the packet.
+ * GAMEPAD: type = INPUT_GAMEPAD | (controller index 0-3) << 8. The state of
+ * one host controller in XINPUT_GAMEPAD layout:
+ *   param1 = buttons (XINPUT_GAMEPAD_* bits, 0x0400 = Guide)
+ *            | left trigger << 16 | right trigger << 24
+ *   param2 = left stick X (int16) | left stick Y << 16
+ *   param3 = right stick X (int16) | right stick Y << 16
+ * The guest shows it as a virtual Xbox 360 controller (ViGEmBus).
+ * GAMEPAD_REMOVE: type = INPUT_GAMEPAD_REMOVE | index << 8: unplugged.
+ * Older helpers ignore both.
  */
 #pragma pack(push, 1)
 typedef struct {

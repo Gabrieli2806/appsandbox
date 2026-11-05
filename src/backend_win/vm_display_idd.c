@@ -231,6 +231,26 @@ static const char g_ps_hlsl[] =
     "    return tex.Sample(samp, uv);\n"
     "}\n";
 
+/* Blurred backdrop for the bars around the picture while adaptive
+   resolution catches up with the window (instead of black bars): the
+   frame scaled to cover the window, read from a small mip level and
+   smoothed with a 5x5 tent filter, dimmed. */
+static const char g_ps_blur_hlsl[] =
+    "Texture2D tex : register(t0);\n"
+    "SamplerState samp : register(s0);\n"
+    "cbuffer P : register(b0) { float4 a; float4 b; };\n"
+    "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
+    "    float2 c = 0.5 + (uv - 0.5) * a.xy;\n"
+    "    float4 s = 0; float w = 0;\n"
+    "    [unroll] for (int y = -2; y <= 2; y++)\n"
+    "    [unroll] for (int x = -2; x <= 2; x++) {\n"
+    "        float k = (3 - abs(x)) * (3 - abs(y));\n"
+    "        s += tex.SampleLevel(samp, c + float2(x, y) * b.xy * 1.5, a.z) * k;\n"
+    "        w += k;\n"
+    "    }\n"
+    "    return float4((s / w).rgb * a.w, 1);\n"
+    "}\n";
+
 /* ---- Frame header from wire ---- */
 
 #pragma pack(push, 1)
@@ -299,6 +319,12 @@ struct VmDisplayIdd {
     UINT                     tex_width, tex_height;   /* size of frame_tex */
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
+    ID3D11PixelShader       *ps_blur;     /* adaptive backdrop */
+    ID3D11Buffer            *cb_blur;
+    ID3D11Texture2D         *bg_tex;      /* frame copy with mips for the backdrop */
+    ID3D11ShaderResourceView *bg_srv;
+    UINT                     bg_w, bg_h;
+    BOOL                     bg_stale;
     ID3D11SamplerState      *sampler;
 
     /* Frame buffer (CPU-side, updated by recv thread) */
@@ -413,6 +439,7 @@ struct VmDisplayIdd {
 
     /* Threads */
     HANDLE         recv_thread;
+    HANDLE         gamepad_thread;   /* forwards host controllers (XInput) */
     HANDLE         window_thread;
 };
 
@@ -725,6 +752,112 @@ static void send_input(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT3
     AcquireSRWLockExclusive(&d->input_lock);
     send_input_locked(d, type, p1, p2, p3);
     ReleaseSRWLockExclusive(&d->input_lock);
+}
+
+/* send_input that reports whether the packet went out. */
+static BOOL send_input_locked_safe(VmDisplayIdd *d, UINT32 type, UINT32 p1, UINT32 p2, UINT32 p3)
+{
+    BOOL ok;
+    AcquireSRWLockExclusive(&d->input_lock);
+    ok = send_input_locked(d, type, p1, p2, p3);
+    ReleaseSRWLockExclusive(&d->input_lock);
+    return ok;
+}
+
+/* ==================================================================
+ * Game controllers
+ *
+ * Like Moonlight: the host's controllers (XInput: Xbox controllers and
+ * anything Steam Input or DS4Windows presents as one) are read about 250
+ * times a second while the VM window has focus and sent on the input
+ * channel; the guest helper plays them through virtual Xbox 360 pads
+ * (ViGEmBus). When the window loses focus the pads are centred.
+ * ================================================================== */
+
+typedef struct {
+    DWORD dwPacketNumber;
+    WORD  wButtons;
+    BYTE  bLeftTrigger, bRightTrigger;
+    SHORT sThumbLX, sThumbLY, sThumbRX, sThumbRY;
+} IddXInputState;
+typedef DWORD (WINAPI *PFN_IddXInputGetState)(DWORD, IddXInputState *);
+
+static DWORD WINAPI idd_gamepad_thread_proc(LPVOID param)
+{
+    VmDisplayIdd *d = (VmDisplayIdd *)param;
+    HMODULE xi = LoadLibraryExW(L"xinput1_4.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    PFN_IddXInputGetState get = NULL;
+    HANDLE timer;
+    BOOL connected[4] = { FALSE }, centred[4] = { FALSE };
+    DWORD last_packet[4] = { 0 };
+    ULONGLONG last_send[4] = { 0 }, last_scan = 0;
+    int i;
+
+    if (!xi) return 0;
+    /* Ordinal 100 (XInputGetStateEx) also reports the Guide button. */
+    get = (PFN_IddXInputGetState)(void *)GetProcAddress(xi, (LPCSTR)100);
+    if (!get) get = (PFN_IddXInputGetState)(void *)GetProcAddress(xi, "XInputGetState");
+    if (!get) { FreeLibrary(xi); return 0; }
+
+    timer = CreateWaitableTimerExW(NULL, NULL, 0x00000002 /* HIGH_RESOLUTION */, TIMER_ALL_ACCESS);
+    if (!timer) timer = CreateWaitableTimerW(NULL, FALSE, NULL);
+
+    while (!d->stop) {
+        ULONGLONG now = GetTickCount64();
+        BOOL scan = now - last_scan >= 1000;   /* absent pads are slow to query */
+        BOOL active = d->input_focused && d->frame_connected;
+        LARGE_INTEGER due;
+
+        if (scan) last_scan = now;
+        for (i = 0; i < 4; i++) {
+            IddXInputState st;
+            UINT32 p1, p2, p3;
+            if (!connected[i] && !scan) continue;
+            ZeroMemory(&st, sizeof(st));
+            if (get((DWORD)i, &st) != ERROR_SUCCESS) {
+                if (connected[i]) {
+                    connected[i] = FALSE;
+                    send_input(d, INPUT_GAMEPAD_REMOVE | ((UINT32)i << 8), 0, 0, 0);
+                    idd_log_main(d, L"Controller %d disconnected.", i + 1);
+                }
+                continue;
+            }
+            if (!connected[i]) {
+                connected[i] = TRUE;
+                centred[i] = FALSE;
+                last_packet[i] = st.dwPacketNumber - 1;
+                idd_log_main(d, L"Controller %d connected; it is sent to the VM while its window has focus.", i + 1);
+            }
+            if (!active) {
+                if (!centred[i]) {   /* release everything once */
+                    centred[i] = send_input_locked_safe(d, INPUT_GAMEPAD | ((UINT32)i << 8), 0, 0, 0);
+                    last_packet[i] = st.dwPacketNumber - 1;
+                }
+                continue;
+            }
+            centred[i] = FALSE;
+            /* On change, and every 500 ms so a dropped packet heals. */
+            if (st.dwPacketNumber == last_packet[i] && now - last_send[i] < 500) continue;
+            p1 = (UINT32)st.wButtons | ((UINT32)st.bLeftTrigger << 16) | ((UINT32)st.bRightTrigger << 24);
+            p2 = (UINT32)(USHORT)st.sThumbLX | ((UINT32)(USHORT)st.sThumbLY << 16);
+            p3 = (UINT32)(USHORT)st.sThumbRX | ((UINT32)(USHORT)st.sThumbRY << 16);
+            if (send_input_locked_safe(d, INPUT_GAMEPAD | ((UINT32)i << 8), p1, p2, p3)) {
+                last_packet[i] = st.dwPacketNumber;
+                last_send[i] = now;
+            }
+        }
+
+        due.QuadPart = -40000;   /* 4 ms */
+        if (timer && SetWaitableTimer(timer, &due, 0, NULL, NULL, FALSE))
+            WaitForSingleObject(timer, 50);
+        else
+            Sleep(4);
+    }
+    for (i = 0; i < 4; i++)
+        if (connected[i]) send_input(d, INPUT_GAMEPAD_REMOVE | ((UINT32)i << 8), 0, 0, 0);
+    if (timer) CloseHandle(timer);
+    FreeLibrary(xi);
+    return 0;
 }
 
 static BOOL idd_clip_mouse(VmDisplayIdd *d)
@@ -2596,6 +2729,24 @@ static BOOL d3d_init(VmDisplayIdd *d)
         return FALSE;
     }
 
+    /* Backdrop shader + constants (optional: without it the bars stay black). */
+    {
+        ID3DBlob *blob = NULL;
+        D3D11_BUFFER_DESC bd;
+        if (d3d_compile_shader(g_ps_blur_hlsl, "main", "ps_4_0", &blob)) {
+            d->device->lpVtbl->CreatePixelShader(d->device,
+                blob->lpVtbl->GetBufferPointer(blob), blob->lpVtbl->GetBufferSize(blob),
+                NULL, &d->ps_blur);
+            blob->lpVtbl->Release(blob);
+        }
+        ZeroMemory(&bd, sizeof(bd));
+        bd.ByteWidth = 32;
+        bd.Usage = D3D11_USAGE_DYNAMIC;
+        bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        d->device->lpVtbl->CreateBuffer(d->device, &bd, NULL, &d->cb_blur);
+    }
+
     /* Sampler state (linear filtering) */
     ZeroMemory(&sd, sizeof(sd));
     sd.Filter         = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
@@ -2791,6 +2942,91 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
     return got;
 }
 
+/* Draw the blurred backdrop over the whole client area. src is the
+   picture being shown. */
+static void d3d_draw_backdrop(VmDisplayIdd *d, ID3D11ShaderResourceView *src, UINT cw, UINT ch)
+{
+    ID3D11Resource *res = NULL;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT full;
+    float fa, ca, lod;
+    UINT fw = d->frame_width, fh = d->frame_height;
+
+    if (!d->ps_blur || !d->cb_blur || !src || !fw || !fh || !cw || !ch) return;
+
+    if (!d->bg_tex || d->bg_w != fw || d->bg_h != fh) {
+        D3D11_TEXTURE2D_DESC td;
+        if (d->bg_srv) { d->bg_srv->lpVtbl->Release(d->bg_srv); d->bg_srv = NULL; }
+        if (d->bg_tex) { d->bg_tex->lpVtbl->Release(d->bg_tex); d->bg_tex = NULL; }
+        ZeroMemory(&td, sizeof(td));
+        td.Width = fw;
+        td.Height = fh;
+        td.MipLevels = 0;                     /* full chain */
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
+        if (FAILED(d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->bg_tex))) return;
+        if (FAILED(d->device->lpVtbl->CreateShaderResourceView(d->device, (ID3D11Resource *)d->bg_tex,
+                                                               NULL, &d->bg_srv))) {
+            d->bg_tex->lpVtbl->Release(d->bg_tex);
+            d->bg_tex = NULL;
+            return;
+        }
+        d->bg_w = fw;
+        d->bg_h = fh;
+        d->bg_stale = TRUE;
+    }
+
+    if (d->bg_stale) {
+        D3D11_BOX box;
+        src->lpVtbl->GetResource(src, &res);
+        if (!res) return;
+        box.left = 0; box.top = 0; box.front = 0;
+        box.right = fw; box.bottom = fh; box.back = 1;
+        d->ctx->lpVtbl->CopySubresourceRegion(d->ctx, (ID3D11Resource *)d->bg_tex, 0, 0, 0, 0,
+                                              res, 0, &box);
+        res->lpVtbl->Release(res);
+        d->ctx->lpVtbl->GenerateMips(d->ctx, d->bg_srv);
+        d->bg_stale = FALSE;
+    }
+
+    /* Cover: scale the picture to fill the window, cropping the overflow. */
+    fa = (float)fw / (float)fh;
+    ca = (float)cw / (float)ch;
+    lod = 0.0f;
+    {
+        float mw = (float)fw;
+        while (mw > 48.0f) { mw *= 0.5f; lod += 1.0f; }   /* ~48 px wide mip */
+    }
+    if (SUCCEEDED(d->ctx->lpVtbl->Map(d->ctx, (ID3D11Resource *)d->cb_blur, 0,
+                                      D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float *c = (float *)m.pData;
+        c[0] = ca > fa ? 1.0f : ca / fa;
+        c[1] = ca > fa ? fa / ca : 1.0f;
+        c[2] = lod;
+        c[3] = 0.55f;                          /* dim */
+        c[4] = 1.0f / (float)(fw >> (UINT)lod ? fw >> (UINT)lod : 1);
+        c[5] = 1.0f / (float)(fh >> (UINT)lod ? fh >> (UINT)lod : 1);
+        c[6] = c[7] = 0.0f;
+        d->ctx->lpVtbl->Unmap(d->ctx, (ID3D11Resource *)d->cb_blur, 0);
+    }
+
+    ZeroMemory(&full, sizeof(full));
+    full.Width = (float)cw;
+    full.Height = (float)ch;
+    full.MaxDepth = 1.0f;
+    d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &full);
+    d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
+    d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps_blur, NULL, 0);
+    d->ctx->lpVtbl->PSSetConstantBuffers(d->ctx, 0, 1, &d->cb_blur);
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &d->bg_srv);
+    d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
+    d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2858,17 +3094,28 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     /* Title with resolution and FPS (self-throttled to twice a second;
        setting it per frame was measurable at high frame rates). */
-    if (frame_uploaded)
+    if (frame_uploaded) {
         idd_update_title(d, FALSE);
+        d->bg_stale = TRUE;
+    }
     d->render_count++;
 
     d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
-    d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
     d->ctx->lpVtbl->ClearRenderTargetView(d->ctx, d->rtv, clear_color);
 
     d->ctx->lpVtbl->IASetPrimitiveTopology(d->ctx,
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d->ctx->lpVtbl->IASetInputLayout(d->ctx, NULL);
+
+    /* Adaptive resolution: while the guest catches up with a new window
+       shape, fill the bars with a blurred copy of the picture. */
+    if (d->res_choice == RES_ADAPTIVE &&
+        (vp.Width + 1.5f < (float)rc.right || vp.Height + 1.5f < (float)rc.bottom)) {
+        ID3D11ShaderResourceView *src = d->frame_srv;
+        if (d->showing_video && d->vdec) src = vm_video_decoder_srv(d->vdec);
+        d3d_draw_backdrop(d, src, (UINT)rc.right, (UINT)rc.bottom);
+    }
+    d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
 
     d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
     d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
@@ -2889,6 +3136,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
 static void d3d_cleanup(VmDisplayIdd *d)
 {
     if (d->vdec)       { vm_video_decoder_destroy(d->vdec);              d->vdec = NULL; }
+    if (d->bg_srv)     { d->bg_srv->lpVtbl->Release(d->bg_srv);         d->bg_srv = NULL; }
+    if (d->bg_tex)     { d->bg_tex->lpVtbl->Release(d->bg_tex);         d->bg_tex = NULL; }
+    if (d->cb_blur)    { d->cb_blur->lpVtbl->Release(d->cb_blur);       d->cb_blur = NULL; }
+    if (d->ps_blur)    { d->ps_blur->lpVtbl->Release(d->ps_blur);       d->ps_blur = NULL; }
     if (d->sampler)    { d->sampler->lpVtbl->Release(d->sampler);       d->sampler = NULL; }
     if (d->ps)         { d->ps->lpVtbl->Release(d->ps);                 d->ps = NULL; }
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
@@ -3782,6 +4033,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
+    /* Game controllers (best effort; no thread, no controllers). */
+    d->gamepad_thread = CreateThread(NULL, 0, idd_gamepad_thread_proc, d, 0, NULL);
+
     /* Start the recv thread now that the window and D3D11 are ready */
     d->recv_thread = CreateThread(NULL, 0, idd_recv_thread_proc, d, 0, NULL);
     if (!d->recv_thread) {
@@ -4021,6 +4275,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 WaitForSingleObject(d->audio_recv_thread, 2000);
                 CloseHandle(d->audio_recv_thread);
                 d->audio_recv_thread = NULL;
+            }
+
+            if (d->gamepad_thread) {
+                WaitForSingleObject(d->gamepad_thread, 1000);
+                CloseHandle(d->gamepad_thread);
+                d->gamepad_thread = NULL;
             }
 
             /* Wait briefly for recv thread to exit */

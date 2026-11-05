@@ -1638,6 +1638,54 @@ static void apply_pending_vdd_update(void)
     DeleteFileW(marker);
 }
 
+/* ---- Controllers: ViGEmBus (virtual Xbox 360 pads) ----
+ * The guest components carry the ViGEmBus installer (BSD-3, by Nefarius, the
+ * bus Sunshine uses). Install it once, in the background, when the bus
+ * service is not there yet. */
+static BOOL service_exists(const wchar_t *name)
+{
+    SC_HANDLE scm = OpenSCManagerW(NULL, NULL, SC_MANAGER_CONNECT);
+    SC_HANDLE svc;
+    if (!scm) return FALSE;
+    svc = OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+    if (svc) CloseServiceHandle(svc);
+    CloseServiceHandle(scm);
+    return svc != NULL;
+}
+
+static DWORD WINAPI vigem_install_thread(LPVOID param)
+{
+    wchar_t *setup = (wchar_t *)param;
+    wchar_t cmd[MAX_PATH + 64];
+    BOOL ok;
+    agent_log("Controllers: installing ViGEmBus...");
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\" /quiet /norestart", setup);
+    run_logged(cmd, "Controllers: ViGEmBus setup");
+    ok = service_exists(L"ViGEmBus");
+    agent_log("Controllers: ViGEmBus %s.", ok ? "installed" : "did not install");
+    if (g_client_sock)
+        agent_log_to_host(ok ? "Controllers: ViGEmBus installed in the VM; game controllers can be used."
+                             : "Controllers: ViGEmBus could not be installed in the VM (controllers will not work).");
+    free(setup);
+    return 0;
+}
+
+static void ensure_vigem_installed(void)
+{
+    wchar_t dir[MAX_PATH], *setup, *slash;
+    HANDLE t;
+    if (service_exists(L"ViGEmBus")) return;
+    GetModuleFileNameW(NULL, dir, MAX_PATH);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = L'\0';
+    setup = (wchar_t *)malloc(MAX_PATH * sizeof(wchar_t));
+    if (!setup) return;
+    swprintf_s(setup, MAX_PATH, L"%s\\drivers\\ViGEmBus_setup.exe", dir);
+    if (GetFileAttributesW(setup) == INVALID_FILE_ATTRIBUTES) { free(setup); return; }
+    t = CreateThread(NULL, 0, vigem_install_thread, setup, 0, NULL);
+    if (t) CloseHandle(t); else free(setup);
+}
+
 static void ensure_vdd_running(void)
 {
     char output[4096];
@@ -2710,6 +2758,7 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* A newer display driver staged by the host while the VM was off. */
     apply_pending_vdd_update();
+    ensure_vigem_installed();
 
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();

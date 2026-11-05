@@ -16,8 +16,12 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <wchar.h>
+#include <stdlib.h>
+#include <winioctl.h>
+#include <setupapi.h>
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "setupapi.lib")
 
 typedef struct {
     BYTE scan[2][256];
@@ -428,6 +432,168 @@ static void queue_display_mode(const InputPacket *pkt)
     SetEvent(g_display_event);
 }
 
+/* ---- Controllers: virtual Xbox 360 pads through ViGEmBus ----
+   The same bus driver Sunshine uses. The agent installs it from the guest
+   components; until it is there, controller packets are ignored. The IOCTL
+   layout follows ViGEmClient (MIT, github.com/nefarius/ViGEmClient). */
+
+static const GUID GUID_VIGEM_BUS =
+    { 0x96E42B22, 0xF5E9, 0x42F8, { 0xB0, 0x43, 0xED, 0x0F, 0x93, 0x2F, 0x01, 0x4F } };
+#define VIGEM_IOCTL(i) CTL_CODE(FILE_DEVICE_BUS_EXTENDER, 0x801 + (i), METHOD_BUFFERED, FILE_WRITE_DATA)
+#define IOCTL_VIGEM_PLUGIN_TARGET      VIGEM_IOCTL(0x000)
+#define IOCTL_VIGEM_UNPLUG_TARGET      VIGEM_IOCTL(0x001)
+#define IOCTL_VIGEM_CHECK_VERSION      VIGEM_IOCTL(0x002)
+#define IOCTL_VIGEM_WAIT_DEVICE_READY  VIGEM_IOCTL(0x003)
+#define IOCTL_XUSB_SUBMIT_REPORT       VIGEM_IOCTL(0x201)
+#define VIGEM_COMMON_VERSION 0x0001
+#define VIGEM_MAX_SERIAL     16
+
+typedef struct { ULONG Size; ULONG SerialNo; LONG TargetType; USHORT VendorId; USHORT ProductId; } VigemPlugin;
+typedef struct { ULONG Size; ULONG SerialNo; } VigemSerial;          /* unplug, wait ready */
+typedef struct { ULONG Size; ULONG Version; } VigemVersion;
+typedef struct {
+    ULONG Size; ULONG SerialNo;
+    USHORT wButtons; BYTE bLeftTrigger; BYTE bRightTrigger;
+    SHORT sThumbLX; SHORT sThumbLY; SHORT sThumbRX; SHORT sThumbRY;
+} VigemXusbReport;
+
+static HANDLE    g_vigem = INVALID_HANDLE_VALUE;
+static HANDLE    g_vigem_event;
+static ULONGLONG g_vigem_retry_at;
+static ULONG     g_pad_serial[4];
+
+static BOOL vigem_ioctl(DWORD code, void *in, DWORD len)
+{
+    OVERLAPPED ov;
+    DWORD done = 0;
+    ZeroMemory(&ov, sizeof(ov));
+    ov.hEvent = g_vigem_event;
+    if (!DeviceIoControl(g_vigem, code, in, len, NULL, 0, &done, &ov) &&
+        GetLastError() != ERROR_IO_PENDING)
+        return FALSE;
+    return GetOverlappedResult(g_vigem, &ov, &done, TRUE);
+}
+
+/* Open the bus (retried at most every 30 s while it is missing). */
+static BOOL vigem_open(void)
+{
+    HDEVINFO set;
+    SP_DEVICE_INTERFACE_DATA ifd;
+    DWORD i;
+    if (g_vigem != INVALID_HANDLE_VALUE) return TRUE;
+    if (GetTickCount64() < g_vigem_retry_at) return FALSE;
+    g_vigem_retry_at = GetTickCount64() + 30000;
+    if (!g_vigem_event) g_vigem_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+    set = SetupDiGetClassDevsW(&GUID_VIGEM_BUS, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (set == INVALID_HANDLE_VALUE) return FALSE;
+    ifd.cbSize = sizeof(ifd);
+    for (i = 0; g_vigem == INVALID_HANDLE_VALUE &&
+                SetupDiEnumDeviceInterfaces(set, NULL, &GUID_VIGEM_BUS, i, &ifd); i++) {
+        DWORD need = 0;
+        SP_DEVICE_INTERFACE_DETAIL_DATA_W *det;
+        VigemVersion ver;
+        SetupDiGetDeviceInterfaceDetailW(set, &ifd, NULL, 0, &need, NULL);
+        det = (SP_DEVICE_INTERFACE_DETAIL_DATA_W *)malloc(need);
+        if (!det) break;
+        det->cbSize = sizeof(*det);
+        if (SetupDiGetDeviceInterfaceDetailW(set, &ifd, det, need, &need, NULL)) {
+            g_vigem = CreateFileW(det->DevicePath, GENERIC_READ | GENERIC_WRITE,
+                                  FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                                  FILE_ATTRIBUTE_NORMAL | FILE_FLAG_NO_BUFFERING |
+                                  FILE_FLAG_WRITE_THROUGH | FILE_FLAG_OVERLAPPED, NULL);
+            if (g_vigem != INVALID_HANDLE_VALUE) {
+                ver.Size = sizeof(ver);
+                ver.Version = VIGEM_COMMON_VERSION;
+                if (!vigem_ioctl(IOCTL_VIGEM_CHECK_VERSION, &ver, sizeof(ver))) {
+                    CloseHandle(g_vigem);
+                    g_vigem = INVALID_HANDLE_VALUE;
+                }
+            }
+        }
+        free(det);
+    }
+    SetupDiDestroyDeviceInfoList(set);
+    if (g_vigem == INVALID_HANDLE_VALUE)
+        input_log("Controllers: ViGEmBus is not installed yet (the agent installs it); "
+                  "controller input is ignored until then.");
+    else
+        input_log("Controllers: ViGEmBus ready.");
+    return g_vigem != INVALID_HANDLE_VALUE;
+}
+
+static void pad_unplug(UINT idx)
+{
+    VigemSerial u;
+    if (idx > 3 || !g_pad_serial[idx] || g_vigem == INVALID_HANDLE_VALUE) return;
+    u.Size = sizeof(u);
+    u.SerialNo = g_pad_serial[idx];
+    vigem_ioctl(IOCTL_VIGEM_UNPLUG_TARGET, &u, sizeof(u));
+    input_log("Controllers: controller %u unplugged.", idx + 1);
+    g_pad_serial[idx] = 0;
+}
+
+static void pad_unplug_all(void)
+{
+    UINT i;
+    for (i = 0; i < 4; i++) pad_unplug(i);
+}
+
+static BOOL pad_plug(UINT idx)
+{
+    ULONG serial;
+    if (g_pad_serial[idx]) return TRUE;
+    if (!vigem_open()) return FALSE;
+    for (serial = 1; serial <= VIGEM_MAX_SERIAL; serial++) {
+        VigemPlugin p;
+        VigemSerial w;
+        UINT k;
+        BOOL used = FALSE;
+        for (k = 0; k < 4; k++) if (g_pad_serial[k] == serial) used = TRUE;
+        if (used) continue;
+        ZeroMemory(&p, sizeof(p));
+        p.Size = sizeof(p);
+        p.SerialNo = serial;
+        p.TargetType = 0;   /* Xbox 360 wired */
+        if (!vigem_ioctl(IOCTL_VIGEM_PLUGIN_TARGET, &p, sizeof(p))) continue;
+        w.Size = sizeof(w);
+        w.SerialNo = serial;
+        vigem_ioctl(IOCTL_VIGEM_WAIT_DEVICE_READY, &w, sizeof(w));   /* older buses: fails, fine */
+        g_pad_serial[idx] = serial;
+        input_log("Controllers: controller %u plugged in (virtual Xbox 360, serial %lu).", idx + 1, serial);
+        return TRUE;
+    }
+    input_log("Controllers: could not plug in controller %u.", idx + 1);
+    return FALSE;
+}
+
+static void pad_report(const InputPacket *pkt)
+{
+    VigemXusbReport r;
+    UINT idx = INPUT_PAD_INDEX(pkt->type);
+    if (!pad_plug(idx)) return;
+    ZeroMemory(&r, sizeof(r));
+    r.Size = sizeof(r);
+    r.SerialNo = g_pad_serial[idx];
+    r.wButtons = (USHORT)(pkt->param1 & 0xFFFF);
+    r.bLeftTrigger = (BYTE)((pkt->param1 >> 16) & 0xFF);
+    r.bRightTrigger = (BYTE)(pkt->param1 >> 24);
+    r.sThumbLX = (SHORT)(pkt->param2 & 0xFFFF);
+    r.sThumbLY = (SHORT)(pkt->param2 >> 16);
+    r.sThumbRX = (SHORT)(pkt->param3 & 0xFFFF);
+    r.sThumbRY = (SHORT)(pkt->param3 >> 16);
+    if (!vigem_ioctl(IOCTL_XUSB_SUBMIT_REPORT, &r, sizeof(r))) {
+        DWORD err = GetLastError();
+        input_log("Controllers: report for controller %u failed (%lu).", idx + 1, err);
+        if (err == ERROR_DEVICE_NOT_CONNECTED || err == ERROR_INVALID_HANDLE) {
+            /* The bus went away (driver update): start over. */
+            ZeroMemory(g_pad_serial, sizeof(g_pad_serial));
+            CloseHandle(g_vigem);
+            g_vigem = INVALID_HANDLE_VALUE;
+            g_vigem_retry_at = 0;
+        }
+    }
+}
+
 /* ---- Handle one host connection ---- */
 
 static void handle_conn(AsbConn *c)
@@ -461,6 +627,14 @@ static void handle_conn(AsbConn *c)
         if (pkt_count == 1)
             input_log("First packet: type=%u p1=%u p2=%u p3=%u",
                        pkt.type, pkt.param1, pkt.param2, pkt.param3);
+        if (INPUT_TYPE_BASE(pkt.type) == INPUT_GAMEPAD) {
+            pad_report(&pkt);
+            continue;
+        }
+        if (INPUT_TYPE_BASE(pkt.type) == INPUT_GAMEPAD_REMOVE) {
+            pad_unplug(INPUT_PAD_INDEX(pkt.type));
+            continue;
+        }
         if (pkt.type == INPUT_MOUSE_QUERY) {
             InputPacket reply = {INPUT_MAGIC, INPUT_MOUSE_REPLY, 0, pkt.param2, 0};
             if (pkt.param3 != 0) continue;
@@ -509,6 +683,7 @@ static void handle_conn(AsbConn *c)
         }
     }
     release_physical_keys(&keys);
+    pad_unplug_all();   /* host gone: no controllers left plugged in */
 }
 
 /* ---- Main: listen on the input channel, accept connections ---- */
