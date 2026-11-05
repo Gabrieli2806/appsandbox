@@ -70,6 +70,40 @@ static void switch_to_input_desktop(void)
     }
 }
 
+/* ---- Screen size for absolute mouse moves ----
+ *
+ * The host sends positions in guest pixels; MOUSEEVENTF_ABSOLUTE wants them
+ * normalised to the primary display. GetSystemMetrics(SM_CX/CYSCREEN) is
+ * cached per process and this helper has no window to receive
+ * WM_DISPLAYCHANGE, so after the resolution changed it kept the old size and
+ * the guest pointer drifted away from the host's. Read the live mode from the
+ * display driver instead, re-checked at most every 250 ms (moves arrive at
+ * hundreds per second) and right after a display mode request. */
+static volatile LONG g_screen_stale = 1;
+
+static void primary_screen_size(int *w, int *h)
+{
+    static int cached_w = 1920, cached_h = 1080;
+    static ULONGLONG checked;
+    ULONGLONG now = GetTickCount64();
+    if (InterlockedExchange(&g_screen_stale, 0) || now - checked >= 250) {
+        DEVMODEW dm;
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
+            dm.dmPelsWidth > 1 && dm.dmPelsHeight > 1) {
+            cached_w = (int)dm.dmPelsWidth;
+            cached_h = (int)dm.dmPelsHeight;
+        } else {
+            int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+            if (sw > 1 && sh > 1) { cached_w = sw; cached_h = sh; }
+        }
+        checked = now;
+    }
+    *w = cached_w;
+    *h = cached_h;
+}
+
 /* ---- Input injection ---- */
 
 static void inject_input(const InputPacket *pkt)
@@ -81,10 +115,8 @@ static void inject_input(const InputPacket *pkt)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w = GetSystemMetrics(SM_CXSCREEN);
-        int screen_h = GetSystemMetrics(SM_CYSCREEN);
-        if (screen_w <= 0) screen_w = 1920;
-        if (screen_h <= 0) screen_h = 1080;
+        int screen_w, screen_h;
+        primary_screen_size(&screen_w, &screen_h);
         inp.type = INPUT_MOUSE;
         inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
         inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
@@ -303,6 +335,7 @@ static DWORD WINAPI display_thread_proc(LPVOID param)
         g_display_pending = FALSE;
         LeaveCriticalSection(&g_display_cs);
         run_display_switch(w, h, hz);
+        InterlockedExchange(&g_screen_stale, 1);
     }
 }
 
