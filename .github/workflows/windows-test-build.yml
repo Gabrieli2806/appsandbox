@@ -1,0 +1,97 @@
+# Unsigned test build of AppSandbox for Windows x64.
+#
+# Builds the whole solution with Visual Studio 2022 + the WDK (drivers are
+# test-signed by the WDK, exactly like a local dev build; AppSandbox enables
+# test signing inside the guest when it installs them) and packages the same
+# layout as tools/sign/make-release.ps1, keeping the drivers' test .cer files.
+#
+# Pushing to a release/** branch also publishes the zip as a GitHub pre-release.
+name: Windows test build
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - 'release/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: microsoft/setup-msbuild@v2
+
+      - name: Build Release|x64
+        shell: pwsh
+        run: |
+          msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /m /v:minimal /nologo
+          if ($LASTEXITCODE -ne 0) { throw "Build failed (exit $LASTEXITCODE)" }
+
+      - name: Package
+        id: package
+        shell: pwsh
+        run: |
+          $bin = Join-Path $PWD 'bin\Release'
+          $props = Get-Content Directory.Build.props -Raw
+          $parts = foreach ($k in 'Major', 'Minor', 'Patch') {
+            if ($props -match "<AsbVersion$k>(\d+)</AsbVersion$k>") { $matches[1] } else { '0' }
+          }
+          $ver = $parts -join '.'
+          $sha = $env:GITHUB_SHA.Substring(0, 7)
+          $name = "AppSandbox-$ver-test-$sha-win-x64"
+          $stage = Join-Path $env:RUNNER_TEMP $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+
+          foreach ($b in 'AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll') {
+            Copy-Item (Join-Path $bin $b) $stage -ErrorAction Stop
+          }
+          foreach ($sub in 'resources', 'drivers', 'web') {
+            robocopy (Join-Path $bin $sub) (Join-Path $stage $sub) /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy $sub failed ($LASTEXITCODE)" }
+          }
+          $sdk = Join-Path $stage 'headless-api'
+          New-Item -ItemType Directory -Force -Path $sdk | Out-Null
+          Copy-Item tools\headless-api\asb.py, tools\headless-api\README.md $sdk
+          foreach ($sub in 'examples', 'tests') {
+            robocopy (Join-Path 'tools\headless-api' $sub) (Join-Path $sdk $sub) /E /XD __pycache__ /XF *.pyc | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "robocopy headless-api\$sub failed ($LASTEXITCODE)" }
+          }
+          $global:LASTEXITCODE = 0
+
+          $required = 'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
+                      'drivers\AppSandboxVDD.cer', 'drivers\devcon.exe'
+          $missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
+          if ($missing.Count) { throw "Missing artifacts: $($missing -join ', ')" }
+
+          Get-ChildItem $stage -Recurse -File | ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
+          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          "zip=$zip" >> $env:GITHUB_OUTPUT
+          "name=$name" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.package.outputs.name }}
+          path: ${{ steps.package.outputs.zip }}
+
+      - name: Publish pre-release
+        if: startsWith(github.ref, 'refs/heads/release/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = "test-build-${{ github.run_number }}"
+          $notes = @"
+          Unsigned **test build** from ``${{ github.ref_name }}`` (commit ${{ github.sha }}).
+
+          - Windows may show a SmartScreen warning: the app is not code-signed. Choose "More info" -> "Run anyway".
+          - Drivers are test-signed; AppSandbox enables test signing inside the VM when it installs them.
+          - Guest drivers are installed when a VM is created: create a **new** Windows VM to test guest-side changes.
+          "@
+          gh release create $tag "${{ steps.package.outputs.zip }}" --prerelease --target "${{ github.sha }}" `
+            --title "Test build ${{ github.run_number }} (${{ github.ref_name }})" --notes $notes
