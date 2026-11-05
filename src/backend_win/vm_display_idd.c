@@ -28,6 +28,7 @@
 #pragma warning(pop)
 
 #include <stdio.h>
+#include <math.h>
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
@@ -231,24 +232,33 @@ static const char g_ps_hlsl[] =
     "    return tex.Sample(samp, uv);\n"
     "}\n";
 
-/* Blurred backdrop for the bars around the picture while adaptive
-   resolution catches up with the window (instead of black bars): the
-   frame scaled to cover the window, read from a small mip level and
-   smoothed with a 5x5 tent filter, dimmed. */
+/* Adaptive resolution backdrop. While the guest catches up with a new
+   window shape, the whole window is drawn in one pass: a blurred, dimmed
+   copy of the picture scaled to cover the window (small mip level + 5x5
+   tent), and the sharp picture on top whose edges fade into it over a
+   feather band, so there is no visible seam.
+   b0: a = cover scale xy, lod, dim; b = backdrop texel xy, fade, 0;
+       r = picture rect in window uv (x0 y0 x1 y1); f = feather xy in uv. */
 static const char g_ps_blur_hlsl[] =
-    "Texture2D tex : register(t0);\n"
+    "Texture2D pic : register(t0);\n"
+    "Texture2D bg : register(t1);\n"
     "SamplerState samp : register(s0);\n"
-    "cbuffer P : register(b0) { float4 a; float4 b; };\n"
+    "cbuffer P : register(b0) { float4 a; float4 b; float4 r; float4 f; };\n"
     "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
     "    float2 c = 0.5 + (uv - 0.5) * a.xy;\n"
     "    float4 s = 0; float w = 0;\n"
     "    [unroll] for (int y = -2; y <= 2; y++)\n"
     "    [unroll] for (int x = -2; x <= 2; x++) {\n"
     "        float k = (3 - abs(x)) * (3 - abs(y));\n"
-    "        s += tex.SampleLevel(samp, c + float2(x, y) * b.xy * 1.5, a.z) * k;\n"
+    "        s += bg.SampleLevel(samp, c + float2(x, y) * b.xy * 1.5, a.z) * k;\n"
     "        w += k;\n"
     "    }\n"
-    "    return float4((s / w).rgb * a.w, 1);\n"
+    "    float3 back = (s / w).rgb * a.w * b.z;\n"
+    "    float2 puv = (uv - r.xy) / (r.zw - r.xy);\n"
+    "    float3 sharp = pic.SampleLevel(samp, saturate(puv), 0).rgb;\n"
+    "    float2 d = min(uv - r.xy, r.zw - uv) / f.xy;\n"
+    "    float m = smoothstep(0.0, 1.0, saturate(min(d.x, d.y)));\n"
+    "    return float4(lerp(back, sharp, m), 1);\n"
     "}\n";
 
 /* ---- Frame header from wire ---- */
@@ -322,6 +332,13 @@ struct VmDisplayIdd {
     ID3D11PixelShader       *ps_blur;     /* adaptive backdrop */
     ID3D11Buffer            *cb_blur;
     ID3D11Texture2D         *bg_tex;      /* frame copy with mips for the backdrop */
+    /* Backdrop animation: fade in when bars appear; the picture rect eases
+       to its new place when the window or the guest resolution changes. */
+    ULONGLONG                bd_start;    /* tick the bars appeared, 0 = none */
+    float                    anim_rect[4];/* shown picture rect (x, y, w, h) */
+    BOOL                     anim_valid;
+    ULONGLONG                anim_tick;
+    BOOL                     anim_active; /* keep repainting until settled */
     ID3D11ShaderResourceView *bg_srv;
     UINT                     bg_w, bg_h;
     BOOL                     bg_stale;
@@ -2740,7 +2757,7 @@ static BOOL d3d_init(VmDisplayIdd *d)
             blob->lpVtbl->Release(blob);
         }
         ZeroMemory(&bd, sizeof(bd));
-        bd.ByteWidth = 32;
+        bd.ByteWidth = 64;
         bd.Usage = D3D11_USAGE_DYNAMIC;
         bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
         bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -2942,18 +2959,11 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
     return got;
 }
 
-/* Draw the blurred backdrop over the whole client area. src is the
-   picture being shown. */
-static void d3d_draw_backdrop(VmDisplayIdd *d, ID3D11ShaderResourceView *src, UINT cw, UINT ch)
+/* Keep a mip-mapped copy of the shown picture for the backdrop. */
+static BOOL d3d_bg_update(VmDisplayIdd *d, ID3D11ShaderResourceView *src)
 {
     ID3D11Resource *res = NULL;
-    D3D11_MAPPED_SUBRESOURCE m;
-    D3D11_VIEWPORT full;
-    float fa, ca, lod;
     UINT fw = d->frame_width, fh = d->frame_height;
-
-    if (!d->ps_blur || !d->cb_blur || !src || !fw || !fh || !cw || !ch) return;
-
     if (!d->bg_tex || d->bg_w != fw || d->bg_h != fh) {
         D3D11_TEXTURE2D_DESC td;
         if (d->bg_srv) { d->bg_srv->lpVtbl->Release(d->bg_srv); d->bg_srv = NULL; }
@@ -2968,22 +2978,21 @@ static void d3d_draw_backdrop(VmDisplayIdd *d, ID3D11ShaderResourceView *src, UI
         td.Usage = D3D11_USAGE_DEFAULT;
         td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
         td.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
-        if (FAILED(d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->bg_tex))) return;
+        if (FAILED(d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &d->bg_tex))) return FALSE;
         if (FAILED(d->device->lpVtbl->CreateShaderResourceView(d->device, (ID3D11Resource *)d->bg_tex,
                                                                NULL, &d->bg_srv))) {
             d->bg_tex->lpVtbl->Release(d->bg_tex);
             d->bg_tex = NULL;
-            return;
+            return FALSE;
         }
         d->bg_w = fw;
         d->bg_h = fh;
         d->bg_stale = TRUE;
     }
-
     if (d->bg_stale) {
         D3D11_BOX box;
         src->lpVtbl->GetResource(src, &res);
-        if (!res) return;
+        if (!res) return FALSE;
         box.left = 0; box.top = 0; box.front = 0;
         box.right = fw; box.bottom = fh; box.back = 1;
         d->ctx->lpVtbl->CopySubresourceRegion(d->ctx, (ID3D11Resource *)d->bg_tex, 0, 0, 0, 0,
@@ -2992,25 +3001,61 @@ static void d3d_draw_backdrop(VmDisplayIdd *d, ID3D11ShaderResourceView *src, UI
         d->ctx->lpVtbl->GenerateMips(d->ctx, d->bg_srv);
         d->bg_stale = FALSE;
     }
+    return TRUE;
+}
 
-    /* Cover: scale the picture to fill the window, cropping the overflow. */
+static float ease_out_cubic(float t)
+{
+    t = 1.0f - t;
+    return 1.0f - t * t * t;
+}
+
+/* Draw the picture (rect x,y,w,h in client pixels) blended into the
+   blurred backdrop over the whole client area. FALSE = not drawn. */
+static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
+                              UINT cw, UINT ch, const float *rect, float fade)
+{
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT full;
+    ID3D11ShaderResourceView *views[2];
+    float fa, ca, lod = 0.0f, mw, feather;
+    UINT fw = d->frame_width, fh = d->frame_height, lw, lh;
+
+    if (!d->ps_blur || !d->cb_blur || !src || !fw || !fh || !cw || !ch) return FALSE;
+    if (!d3d_bg_update(d, src)) return FALSE;
+
     fa = (float)fw / (float)fh;
     ca = (float)cw / (float)ch;
-    lod = 0.0f;
+    for (mw = (float)fw; mw > 48.0f; mw *= 0.5f) lod += 1.0f;   /* ~48 px wide mip */
+    lw = fw >> (UINT)lod; if (!lw) lw = 1;
+    lh = fh >> (UINT)lod; if (!lh) lh = 1;
+    /* Feather: about 6% of the picture's short side, at least 24 px. */
+    feather = (rect[2] < rect[3] ? rect[2] : rect[3]) * 0.06f;
+    if (feather < 24.0f) feather = 24.0f;
+
+    if (FAILED(d->ctx->lpVtbl->Map(d->ctx, (ID3D11Resource *)d->cb_blur, 0,
+                                   D3D11_MAP_WRITE_DISCARD, 0, &m)))
+        return FALSE;
     {
-        float mw = (float)fw;
-        while (mw > 48.0f) { mw *= 0.5f; lod += 1.0f; }   /* ~48 px wide mip */
-    }
-    if (SUCCEEDED(d->ctx->lpVtbl->Map(d->ctx, (ID3D11Resource *)d->cb_blur, 0,
-                                      D3D11_MAP_WRITE_DISCARD, 0, &m))) {
         float *c = (float *)m.pData;
-        c[0] = ca > fa ? 1.0f : ca / fa;
+        BOOL bars_x = rect[0] > 0.5f || rect[0] + rect[2] < (float)cw - 0.5f;
+        BOOL bars_y = rect[1] > 0.5f || rect[1] + rect[3] < (float)ch - 0.5f;
+        c[0] = ca > fa ? 1.0f : ca / fa;      /* cover */
         c[1] = ca > fa ? fa / ca : 1.0f;
         c[2] = lod;
-        c[3] = 0.55f;                          /* dim */
-        c[4] = 1.0f / (float)(fw >> (UINT)lod ? fw >> (UINT)lod : 1);
-        c[5] = 1.0f / (float)(fh >> (UINT)lod ? fh >> (UINT)lod : 1);
-        c[6] = c[7] = 0.0f;
+        c[3] = 0.6f;                          /* dim */
+        c[4] = 1.0f / (float)lw;
+        c[5] = 1.0f / (float)lh;
+        c[6] = fade;
+        c[7] = 0.0f;
+        c[8]  = rect[0] / (float)cw;
+        c[9]  = rect[1] / (float)ch;
+        c[10] = (rect[0] + rect[2]) / (float)cw;
+        c[11] = (rect[1] + rect[3]) / (float)ch;
+        /* No fade along edges that touch the window (no bars there). */
+        c[12] = bars_x ? feather / (float)cw : 1e-6f;
+        c[13] = bars_y ? feather / (float)ch : 1e-6f;
+        c[14] = c[15] = 0.0f;
         d->ctx->lpVtbl->Unmap(d->ctx, (ID3D11Resource *)d->cb_blur, 0);
     }
 
@@ -3018,13 +3063,18 @@ static void d3d_draw_backdrop(VmDisplayIdd *d, ID3D11ShaderResourceView *src, UI
     full.Width = (float)cw;
     full.Height = (float)ch;
     full.MaxDepth = 1.0f;
+    views[0] = src;
+    views[1] = d->bg_srv;
     d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &full);
     d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
     d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps_blur, NULL, 0);
     d->ctx->lpVtbl->PSSetConstantBuffers(d->ctx, 0, 1, &d->cb_blur);
-    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &d->bg_srv);
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 2, views);
     d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
     d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
+    views[0] = views[1] = NULL;
+    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 2, views);
+    return TRUE;
 }
 
 static void d3d_render_frame(VmDisplayIdd *d)
@@ -3107,28 +3157,72 @@ static void d3d_render_frame(VmDisplayIdd *d)
             D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     d->ctx->lpVtbl->IASetInputLayout(d->ctx, NULL);
 
-    /* Adaptive resolution: while the guest catches up with a new window
-       shape, fill the bars with a blurred copy of the picture. */
-    if (d->res_choice == RES_ADAPTIVE &&
-        (vp.Width + 1.5f < (float)rc.right || vp.Height + 1.5f < (float)rc.bottom)) {
-        ID3D11ShaderResourceView *src = d->frame_srv;
-        if (d->showing_video && d->vdec) src = vm_video_decoder_srv(d->vdec);
-        d3d_draw_backdrop(d, src, (UINT)rc.right, (UINT)rc.bottom);
-    }
-    d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
-
-    d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
-    d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
     {
         ID3D11ShaderResourceView *srv = d->frame_srv;
+        float target[4], shown[4];
+        ULONGLONG now = GetTickCount64();
+        BOOL bars;
         if (d->showing_video && d->vdec)
             srv = vm_video_decoder_srv(d->vdec);
-        d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &srv);
-    }
-    d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
 
-    /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
-    d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
+        /* Ease the shown picture rect toward where it belongs (~180 ms)
+           instead of jumping when the window or resolution changes. */
+        target[0] = vp.TopLeftX; target[1] = vp.TopLeftY;
+        target[2] = vp.Width;    target[3] = vp.Height;
+        if (!d->anim_valid || d->res_choice != RES_ADAPTIVE) {
+            memcpy(d->anim_rect, target, sizeof(target));
+            d->anim_valid = TRUE;
+            d->anim_active = FALSE;
+        } else {
+            float dt = (float)(now - d->anim_tick) / 1000.0f;
+            /* Frame-rate independent exponential approach (~60 ms time
+               constant): settles in about 200 ms. */
+            float k = dt > 0.5f ? 1.0f : 1.0f - expf(-dt / 0.06f);
+            int i;
+            BOOL moving = FALSE;
+            for (i = 0; i < 4; i++) {
+                float diff = target[i] - d->anim_rect[i];
+                if (diff > 0.5f || diff < -0.5f) {
+                    d->anim_rect[i] += diff * k;
+                    moving = TRUE;
+                } else {
+                    d->anim_rect[i] = target[i];
+                }
+            }
+            d->anim_active = moving;
+        }
+        d->anim_tick = now;
+        memcpy(shown, d->anim_rect, sizeof(shown));
+
+        /* Adaptive sizes are rounded (width to 8 px), so a few pixels of
+           bar are normal once settled: only real gaps get the backdrop. */
+        bars = d->res_choice == RES_ADAPTIVE &&
+               ((float)rc.right - shown[2] > 12.0f || (float)rc.bottom - shown[3] > 12.0f);
+        if (bars) {
+            float fade;
+            if (!d->bd_start) d->bd_start = now;
+            fade = (float)(now - d->bd_start) / 220.0f;             /* fade in */
+            if (fade >= 1.0f) fade = 1.0f; else d->anim_active = TRUE;
+            fade = ease_out_cubic(fade);
+            if (d3d_draw_adaptive(d, srv, (UINT)rc.right, (UINT)rc.bottom, shown, fade)) {
+                d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+                return;
+            }
+        } else {
+            d->bd_start = 0;
+        }
+
+        vp.TopLeftX = shown[0]; vp.TopLeftY = shown[1];
+        vp.Width = shown[2];    vp.Height = shown[3];
+        d->ctx->lpVtbl->RSSetViewports(d->ctx, 1, &vp);
+        d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
+        d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
+        d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &srv);
+        d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
+
+        /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
+        d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
+    }
 
     d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
 }
@@ -4408,7 +4502,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
-            if (d->frame_dirty)
+            if (d->frame_dirty || d->anim_active)
                 d3d_render_frame(d);
             idd_update_title(d, FALSE);
         } else if (wp == IDT_ADAPTIVE && d) {
