@@ -1533,6 +1533,29 @@ function renderDisplayTab(vm) {
         });
     }
 
+    var perf = !!vm.displayPerformance;
+    document.getElementById('vmd-stream-card').hidden = linux;
+    document.querySelectorAll('#view-vm [data-stream]').forEach(function(b) {
+        var on = (b.getAttribute('data-stream') === 'performance') === perf;
+        b.classList.toggle('active', on);
+        b.setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+    var snote = document.getElementById('vmd-stream-note');
+    var video = typeof vm.displayVideo === 'number' ? vm.displayVideo : -1;
+    if (perf && video === 1) {
+        snote.textContent = 'Active: the VM\u2019s GPU is encoding the picture.';
+    } else if (perf && drv >= 0 && drv < 3) {
+        snote.textContent = 'Needs the updated display driver: shut the VM down and update its guest components.';
+    } else if (perf && video === 2) {
+        snote.textContent = 'Not active: the VM\u2019s GPU has no hardware video encoder (GPU partitioning off?) or this PC cannot decode H.264. Showing exact pixels instead; the VM window\u2019s log has details.';
+    } else if (perf && video === 0) {
+        snote.textContent = 'Starting\u2026';
+    } else if (perf) {
+        snote.textContent = 'Applied when the VM window is open. Needs GPU partitioning so the VM has a hardware video encoder.';
+    } else {
+        snote.textContent = '';
+    }
+
     var rates = document.getElementById('vmd-rates');
     if (rates.getAttribute('data-sig') !== String(hz)) {
         rates.setAttribute('data-sig', String(hz));
@@ -1566,6 +1589,14 @@ function sendDisplayMode(vm, res, hz) {
     vm.displayHz = hz;
     renderVmDetail();
     sendCmd('setDisplayMode', { vmId: vm.id, resolution: res, hz: hz });
+}
+
+function setPerformanceMode(enabled) {
+    var vm = vms[vmIndexById(detailVmId)];
+    if (!vm) return;
+    vm.displayPerformance = enabled;   /* optimistic */
+    renderVmDetail();
+    sendCmd('setPerformanceMode', { vmId: vm.id, enabled: enabled });
 }
 
 /* ---- Settings ---- */

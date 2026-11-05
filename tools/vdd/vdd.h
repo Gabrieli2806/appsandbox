@@ -101,7 +101,8 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
  * cannot change resolution; older hosts never ask, so they never see ASVH. */
 #define VDD_HELLO_QUERY_MAGIC 0x51485341  /* "ASHQ" little-endian */
 #define VDD_HELLO_MAGIC     0x48565341  /* "ASVH" little-endian */
-#define VDD_PROTOCOL_VERSION 2
+/* 2: mode requests. 3: performance mode (GPU-encoded video, ASPF/ASPS/ASVE). */
+#define VDD_PROTOCOL_VERSION 3
 
 typedef struct _VDD_WIRE_HELLO {
     UINT32  magic;              /* VDD_HELLO_MAGIC */
@@ -115,6 +116,36 @@ typedef struct _VDD_WIRE_MODE_REQUEST {
     UINT32  height;
     UINT32  refresh;            /* Hz */
 } VDD_WIRE_MODE_REQUEST;
+
+/* Wire protocol: performance mode (protocol 3).
+ * Host -> guest ASPF (16 bytes, same shape as a mode request):
+ *   { magic, mode (0 = raw frames, 1 = H.264 video), kbps (0 = auto), flags }
+ *   flags bit 0 asks for a key frame (the host decoder restarted).
+ * Guest -> host ASPS: { magic, mode in use, codec, HRESULT of the last start }.
+ * Guest -> host ASVE: header + `size` bytes of one Annex-B access unit. */
+#define VDD_PERF_REQUEST_MAGIC  0x46505341  /* "ASPF" little-endian */
+#define VDD_PERF_STATUS_MAGIC   0x53505341  /* "ASPS" little-endian */
+#define VDD_VIDEO_MAGIC         0x45565341  /* "ASVE" little-endian */
+#define VDD_PERF_FLAG_KEYFRAME  0x1
+#define VDD_CODEC_H264          1
+#define VDD_VIDEO_FLAG_KEY      0x1
+
+typedef struct _VDD_WIRE_PERF_STATUS {
+    UINT32  magic;              /* VDD_PERF_STATUS_MAGIC */
+    UINT32  mode;               /* 0 raw, 1 video */
+    UINT32  codec;              /* VDD_CODEC_H264 when mode == 1 */
+    INT32   hresult;            /* why video could not start (mode 0) */
+} VDD_WIRE_PERF_STATUS;
+
+typedef struct _VDD_WIRE_VIDEO_HEADER {
+    UINT32  magic;              /* VDD_VIDEO_MAGIC */
+    UINT32  width;
+    UINT32  height;
+    UINT32  codec;              /* VDD_CODEC_H264 */
+    UINT32  flags;              /* VDD_VIDEO_FLAG_KEY */
+    UINT32  size;               /* bytes of bitstream that follow */
+    UINT64  seq;
+} VDD_WIRE_VIDEO_HEADER;
 #pragma pack(pop)
 
 /* ============================================================================
@@ -298,6 +329,15 @@ typedef struct _VDD_SWAP_PROC {
     PBYTE               pCursorShapeBuffer; /* buffer for cursor bitmap */
     UINT                cursorBufSize;      /* size of pCursorShapeBuffer (2x for MASKED_COLOR) */
     DWORD               lastShapeId;        /* last received shape ID */
+
+    /* Performance mode (GPU video). perfWanted is what the host asked for on
+       the current connection; pEncoder exists while video is being sent. */
+    struct VddEncoder*  pEncoder;
+    volatile LONG       perfWanted;         /* 0 raw, 1 H.264 */
+    volatile LONG       perfKbps;
+    volatile LONG       perfKeyReq;         /* host asked for a key frame */
+    BOOL                perfFailed;         /* encoder failed: raw until asked again */
+    UINT64              videoSeq;
 } VDD_SWAP_PROC;
 
 /* ============================================================================
@@ -345,6 +385,7 @@ typedef struct _VDD_DEVICE_CONTEXT {
     LUID                renderLuid;         /* adapter last requested, 0 = none */
     UINT                renderAttempts;
     VDD_MODE            pendingMode;
+    UINT                lastRefresh;        /* refresh of the last mode request (Hz) */
     volatile LONG       modeStage;          /* 0 idle, 1 update modes, 2 verify */
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,

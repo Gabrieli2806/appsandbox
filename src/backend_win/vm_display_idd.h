@@ -41,4 +41,14 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
    >= 2 = driver that accepts resolution / refresh changes. */
 int vm_display_idd_guest_driver(VmDisplayIdd *display);
 
+/* Performance mode (GPU-encoded video, for games) vs. quality mode (raw
+   frames). Saved per VM in display_settings.json; applied live when the
+   display window is open. */
+BOOL vm_display_idd_saved_performance(const wchar_t *vhdx_path);
+BOOL vm_display_idd_set_performance(VmDisplayIdd *display, const wchar_t *vhdx_path,
+                                    BOOL performance);
+/* 1 while the guest sends GPU video, 0 raw frames, 2 performance mode chosen
+   but unavailable, -1 not connected. */
+int vm_display_idd_video_active(VmDisplayIdd *display);
+
 #endif /* VM_DISPLAY_IDD_H */

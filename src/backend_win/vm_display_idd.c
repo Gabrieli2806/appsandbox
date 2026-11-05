@@ -31,6 +31,7 @@
 #include <stdarg.h>
 
 #include "vm_display_idd.h"
+#include "vm_video_decode.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
 #include "vm_clipboard.h"
@@ -127,7 +128,40 @@ typedef struct ModeRequest {
     UINT32 height;
     UINT32 refresh;
 } ModeRequest;
+
+/* Performance mode (guest driver protocol 3; must match tools/vdd/vdd.h).
+   Host -> guest ASPF { magic, mode, kbps, flags } (ModeRequest shape);
+   guest -> host ASPS { magic, mode, codec, hresult } and ASVE + bitstream. */
+#define PERF_REQUEST_MAGIC  0x46505341  /* "ASPF" */
+#define PERF_STATUS_MAGIC   0x53505341  /* "ASPS" */
+#define VIDEO_MAGIC         0x45565341  /* "ASVE" */
+#define PERF_FLAG_KEYFRAME  0x1
+#define VIDEO_FLAG_KEY      0x1
+#define VDD_PROTOCOL_VIDEO  3
+#define MAX_VIDEO_AU        (32u * 1024 * 1024)
+#define MAX_VIDEO_QUEUE     (64u * 1024 * 1024)
+
+typedef struct VideoHeader {
+    UINT32 magic;
+    UINT32 width;
+    UINT32 height;
+    UINT32 codec;
+    UINT32 flags;
+    UINT32 size;
+    UINT64 seq;
+} VideoHeader;
+
+/* One queued access unit, followed by `len` bytes. */
+typedef struct VideoQEntry {
+    UINT32 len;
+    UINT32 width;
+    UINT32 height;
+    UINT32 flags;
+} VideoQEntry;
 #pragma pack(pop)
+
+#define STREAM_QUALITY      0   /* raw frames (exact pixels) */
+#define STREAM_PERFORMANCE  1   /* GPU-encoded video (games) */
 
 /* Display resolution choices (system menu > Display). RES_ADAPTIVE follows
    the window's client size. */
@@ -153,6 +187,8 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
 #define WM_IDD_FRAME_CONNECTED  (WM_USER + 104)
 #define WM_IDD_SET_MODE         (WM_USER + 105)  /* wp = res_choice + 1, lp = Hz */
+#define WM_IDD_SET_STREAM       (WM_USER + 106)  /* wp = STREAM_* */
+#define WM_IDD_VIDEO_STATUS     (WM_USER + 107)  /* guest reported video on/off */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -282,6 +318,22 @@ struct VmDisplayIdd {
        0 older (no hello before the first frame), >= 2 from its hello. */
     volatile LONG  guest_driver;
     UINT           frames_since_connect;
+
+    /* Performance mode (GPU video). stream_mode is the user's choice,
+       video_active what the guest driver reported. Encoded access units are
+       queued under frame_cs (VideoQEntry + bytes, back to back) by the recv
+       thread and decoded on the window thread, which owns the D3D context. */
+    int            stream_mode;
+    volatile LONG  video_active;
+    volatile LONG  video_status_hr;
+    BYTE          *vq_buf;           /* filled by the recv thread */
+    UINT           vq_len, vq_cap;
+    BYTE          *vq_work;          /* being decoded by the window thread */
+    UINT           vq_work_cap;
+    BOOL           vq_wait_key;      /* drop until a key frame (queue overflow) */
+    VmVideoDecoder *vdec;
+    BOOL           vdec_unavailable; /* this PC cannot decode: stay raw */
+    BOOL           showing_video;    /* last picture drawn came from the decoder */
     UINT           req_width, req_height, req_refresh;  /* last mode requested */
 
     /* Frame rate shown in the title (frames received from the guest). */
@@ -387,6 +439,8 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_RES_ADAPTIVE   0x1100
 #define IDM_RES_BASE       0x1110
 #define IDM_HZ_BASE        0x1200
+#define IDM_STREAM_QUALITY 0x1300
+#define IDM_STREAM_PERF    0x1310
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -757,7 +811,7 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
 
 static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
                                       BOOL share_h2g, BOOL share_g2h,
-                                      int res_choice, UINT refresh_hz)
+                                      int res_choice, UINT refresh_hz, int stream_mode)
 {
     wchar_t path[MAX_PATH];
     char res[32];
@@ -773,9 +827,10 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
         strcpy_s(res, sizeof(res), "1920x1080");
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
     fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d,"
-               "\"resolution\":\"%s\",\"refreshHz\":%u}\n",
+               "\"resolution\":\"%s\",\"refreshHz\":%u,\"streamMode\":\"%s\"}\n",
             transmit_hotkeys ? 1 : 0, share_h2g ? 1 : 0, share_g2h ? 1 : 0,
-            res, refresh_hz ? refresh_hz : 60);
+            res, refresh_hz ? refresh_hz : 60,
+            stream_mode == STREAM_PERFORMANCE ? "performance" : "quality");
     fclose(f);
 }
 
@@ -785,7 +840,8 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
    the output params. */
 static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
                                                 BOOL *share_h2g, BOOL *share_g2h,
-                                                int *res_choice, UINT *refresh_hz)
+                                                int *res_choice, UINT *refresh_hz,
+                                                int *stream_mode)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
@@ -794,6 +850,7 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
     BOOL h2g = TRUE, g2h = TRUE;
     int res = RES_DEFAULT_PRESET;
     UINT hz = 60;
+    int stream = STREAM_QUALITY;
     const char *p;
 
     if (!vhdx_path || vhdx_path[0] == L'\0') goto out;
@@ -801,7 +858,8 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE, RES_DEFAULT_PRESET, 60);
+        idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE, RES_DEFAULT_PRESET, 60,
+                                  STREAM_QUALITY);
         goto out;
     }
     if (fgets(buf, sizeof(buf), f)) {
@@ -833,6 +891,8 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
                 for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
                     if (g_refresh_rates[i] == v) { hz = v; break; }
         }
+        if (strstr(buf, "\"streamMode\":\"performance\""))
+            stream = STREAM_PERFORMANCE;
     }
     fclose(f);
 
@@ -841,6 +901,7 @@ out:
     if (share_g2h) *share_g2h = g2h;
     if (res_choice) *res_choice = res;
     if (refresh_hz) *refresh_hz = hz;
+    if (stream_mode) *stream_mode = stream;
     return transmit;
 }
 
@@ -868,7 +929,7 @@ void vm_display_idd_saved_mode(const wchar_t *vhdx_path, wchar_t *res, size_t re
     if (vhdx_path && vhdx_path[0]) {
         idd_display_settings_path(vhdx_path, path, MAX_PATH);
         if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
-            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, &choice, &rate);
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, &choice, &rate, NULL);
     }
     if (res && res_chars) {
         if (choice == RES_ADAPTIVE)
@@ -885,7 +946,7 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
     int choice, i;
     BOOL hz_ok = FALSE;
     BOOL h2g = TRUE, g2h = TRUE, hotkeys;
-    int old_choice;
+    int old_choice, stream;
     UINT old_hz;
 
     if (!idd_res_choice_from_text(res, &choice)) return FALSE;
@@ -898,9 +959,51 @@ BOOL vm_display_idd_set_mode(VmDisplayIdd *display, const wchar_t *vhdx_path,
         return TRUE;
     }
     if (!vhdx_path || !vhdx_path[0]) return FALSE;
-    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &old_choice, &old_hz);
-    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz);
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &old_choice, &old_hz,
+                                                  &stream);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, stream);
     return TRUE;
+}
+
+BOOL vm_display_idd_saved_performance(const wchar_t *vhdx_path)
+{
+    int stream = STREAM_QUALITY;
+    wchar_t path[MAX_PATH];
+    if (vhdx_path && vhdx_path[0]) {
+        idd_display_settings_path(vhdx_path, path, MAX_PATH);
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES)
+            idd_display_settings_load_or_create(vhdx_path, NULL, NULL, NULL, NULL, &stream);
+    }
+    return stream == STREAM_PERFORMANCE;
+}
+
+BOOL vm_display_idd_set_performance(VmDisplayIdd *display, const wchar_t *vhdx_path,
+                                    BOOL performance)
+{
+    BOOL h2g = TRUE, g2h = TRUE, hotkeys;
+    int choice;
+    UINT hz;
+    int mode = performance ? STREAM_PERFORMANCE : STREAM_QUALITY;
+
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd)) {
+        PostMessageW(display->hwnd, WM_IDD_SET_STREAM, (WPARAM)mode, 0);
+        return TRUE;
+    }
+    if (!vhdx_path || !vhdx_path[0]) return FALSE;
+    hotkeys = idd_display_settings_load_or_create(vhdx_path, &h2g, &g2h, &choice, &hz, NULL);
+    idd_display_settings_save(vhdx_path, hotkeys, h2g, g2h, choice, hz, mode);
+    return TRUE;
+}
+
+/* 1 while the guest sends GPU video, 0 for raw frames, -1 not connected. */
+int vm_display_idd_video_active(VmDisplayIdd *display)
+{
+    if (!display || !display->open || !display->frame_connected) return -1;
+    if (display->video_active) return 1;
+    if (display->stream_mode == STREAM_PERFORMANCE &&
+        (display->video_status_hr < 0 || display->vdec_unavailable))
+        return 2;
+    return 0;
 }
 
 int vm_display_idd_guest_driver(VmDisplayIdd *display)
@@ -915,7 +1018,30 @@ static void idd_save_settings(VmDisplayIdd *d)
     idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
                               d->clip_share_host_to_guest,
                               d->clip_share_guest_to_host,
-                              d->res_choice, d->refresh_hz);
+                              d->res_choice, d->refresh_hz, d->stream_mode);
+}
+
+/* Tell the guest driver which stream to send (protocol 3 drivers only).
+   flags: PERF_FLAG_KEYFRAME asks for a key frame. */
+static void idd_send_perf(VmDisplayIdd *d, UINT32 flags)
+{
+    ModeRequest req;
+    BOOL ok = FALSE;
+    if (!d || d->guest_driver < VDD_PROTOCOL_VIDEO) return;
+    req.magic = PERF_REQUEST_MAGIC;
+    req.width = (d->stream_mode == STREAM_PERFORMANCE && !d->vdec_unavailable) ? 1 : 0;
+    req.height = 0;          /* kbit/s: 0 = the guest picks from size and refresh */
+    req.refresh = flags;
+    if (req.width && !(flags & PERF_FLAG_KEYFRAME))
+        InterlockedExchange(&d->video_status_hr, 0);
+    AcquireSRWLockExclusive(&d->frame_send_lock);
+    if (d->frame_socket != INVALID_SOCKET)
+        ok = send(d->frame_socket, (const char *)&req, (int)sizeof(req), 0) == (int)sizeof(req);
+    ReleaseSRWLockExclusive(&d->frame_send_lock);
+    if (!(flags & PERF_FLAG_KEYFRAME) || !ok)
+        idd_log(d, L"Stream mode %s requested (%s).",
+                req.width ? L"performance (GPU video)" : L"quality (raw frames)",
+                ok ? L"sent" : L"not connected");
 }
 
 /* ==================================================================
@@ -1021,6 +1147,10 @@ static void idd_update_display_menu(VmDisplayIdd *d)
     for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
         CheckMenuItem(sub, IDM_HZ_BASE + i * 0x10,
                       MF_BYCOMMAND | (d->refresh_hz == g_refresh_rates[i] ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sub, IDM_STREAM_QUALITY,
+                  MF_BYCOMMAND | (d->stream_mode == STREAM_QUALITY ? MF_CHECKED : MF_UNCHECKED));
+    CheckMenuItem(sub, IDM_STREAM_PERF,
+                  MF_BYCOMMAND | (d->stream_mode == STREAM_PERFORMANCE ? MF_CHECKED : MF_UNCHECKED));
 }
 
 /* Build the Display submenu (resolution + refresh rate). */
@@ -1044,6 +1174,12 @@ static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
         swprintf_s(label, 32, L"%u Hz", g_refresh_rates[i]);
         AppendMenuW(sub, MF_STRING, IDM_HZ_BASE + i * 0x10, label);
     }
+    /* Linux guests do not encode video yet. */
+    if (!d->guest_linux) {
+        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+        AppendMenuW(sub, MF_STRING, IDM_STREAM_QUALITY, L"Quality mode (exact pixels)");
+        AppendMenuW(sub, MF_STRING, IDM_STREAM_PERF, L"Performance mode (GPU video, games)");
+    }
     AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)sub, L"Display");
 }
 
@@ -1065,10 +1201,11 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
     d->fps_last_recv = recv;
     d->fps_tick = now;
 
-    swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS%s",
+    swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS%s%s",
                d->audio_muted ? L"\U0001F507 " : L"",
                d->vm_name, d->frame_width, d->frame_height,
                d->frame_connected ? d->fps_value : 0,
+               (d->frame_connected && d->video_active) ? L" - GPU video" : L"",
                (d->mode_supported && d->frame_connected && d->guest_driver == 0)
                    ? L" - old display driver (1920x1080 only)" : L"");
     SetWindowTextW(d->hwnd, title);
@@ -1145,7 +1282,8 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
         else
             swprintf_s(text, cap, L"%ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
         break;
-    case TB_FPS:     *icon = FALSE; swprintf_s(text, cap, L"%u FPS", d->frame_connected ? d->fps_value : 0); break;
+    case TB_FPS:     *icon = FALSE; swprintf_s(text, cap, L"%u FPS%s", d->frame_connected ? d->fps_value : 0,
+                              (d->frame_connected && d->video_active) ? L" \u00B7 GPU" : L""); break;
     case TB_CLIP:    wcscpy_s(text, cap, L"\xE77F"); *on = d->clip_share_host_to_guest && d->clip_share_guest_to_host; break;
     case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); *on = !d->audio_muted; break;
     case TB_KEYS:    wcscpy_s(text, cap, L"\xE765"); *on = d->transmit_hotkeys; break;
@@ -2174,10 +2312,17 @@ static BOOL d3d_init(VmDisplayIdd *d)
     scd.Windowed                           = TRUE;
     scd.SwapEffect                         = DXGI_SWAP_EFFECT_DISCARD;
 
+    /* Video support lets the performance mode decode on this device. */
     hr = D3D11CreateDeviceAndSwapChain(
-        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+        NULL, D3D_DRIVER_TYPE_HARDWARE, NULL,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         NULL, 0, D3D11_SDK_VERSION,
         &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
+    if (FAILED(hr))
+        hr = D3D11CreateDeviceAndSwapChain(
+            NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+            NULL, 0, D3D11_SDK_VERSION,
+            &scd, &d->swap_chain, &d->device, &feature_level, &d->ctx);
 
     if (FAILED(hr)) {
         ui_log(L"IDD: D3D11CreateDeviceAndSwapChain failed (0x%08X)", hr);
@@ -2370,6 +2515,84 @@ static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d)
     return TRUE;
 }
 
+static void idd_video_log(void *user, const wchar_t *msg)
+{
+    idd_log((VmDisplayIdd *)user, L"%s", msg);
+}
+
+/* Decode the queued access units on the window thread. Returns TRUE when a
+   new picture is ready. */
+static BOOL idd_decode_video(VmDisplayIdd *d)
+{
+    BYTE *work;
+    UINT len, off = 0;
+    BOOL got = FALSE, need_key = FALSE;
+
+    EnterCriticalSection(&d->frame_cs);
+    {
+        UINT cap = d->vq_cap;
+        work = d->vq_buf;
+        len = d->vq_len;
+        d->vq_buf = d->vq_work;          /* the recv thread fills the other buffer */
+        d->vq_cap = d->vq_work_cap;
+        d->vq_len = 0;
+        d->vq_work = work;
+        d->vq_work_cap = cap;
+    }
+    LeaveCriticalSection(&d->frame_cs);
+    if (!work || !len) return FALSE;
+
+    while (off + sizeof(VideoQEntry) <= len) {
+        VideoQEntry e;
+        const BYTE *au;
+        BOOL key;
+        int r;
+        memcpy(&e, work + off, sizeof(e));
+        au = work + off + sizeof(e);
+        off += (UINT)sizeof(e) + e.len;
+        if (off > len) break;
+        key = (e.flags & VIDEO_FLAG_KEY) != 0;
+
+        if (d->vdec_unavailable) continue;
+        if (d->vdec && (vm_video_decoder_width(d->vdec) != e.width ||
+                        vm_video_decoder_height(d->vdec) != e.height)) {
+            vm_video_decoder_destroy(d->vdec);
+            d->vdec = NULL;
+            d->showing_video = FALSE;
+        }
+        if (!d->vdec) {
+            if (!key) { need_key = TRUE; continue; }
+            d->vdec = vm_video_decoder_create(d->device, d->ctx, e.width, e.height,
+                                              idd_video_log, d);
+            if (!d->vdec) {
+                /* Windows N editions lack the H.264 decoder (Media Feature
+                   Pack). Fall back to raw frames for this session. */
+                d->vdec_unavailable = TRUE;
+                idd_log(d, L"This PC cannot decode H.264 video (on Windows N install the "
+                           L"Media Feature Pack). Using raw frames.");
+                idd_send_perf(d, 0);
+                continue;
+            }
+        }
+        r = vm_video_decoder_decode(d->vdec, au, e.len);
+        if (r < 0) {
+            vm_video_decoder_destroy(d->vdec);
+            d->vdec = NULL;
+            need_key = TRUE;
+            continue;
+        }
+        if (r > 0) got = TRUE;
+    }
+    if (need_key) {
+        EnterCriticalSection(&d->frame_cs);
+        d->vq_wait_key = TRUE;
+        LeaveCriticalSection(&d->frame_cs);
+        idd_send_perf(d, PERF_FLAG_KEYFRAME);
+    }
+    if (got) d->showing_video = TRUE;
+    return got;
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -2381,6 +2604,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     if (!d->device || !d->ctx || !d->swap_chain || !d->rtv)
         return;
+
+    /* Performance mode: decode every queued access unit (each one depends on
+       the previous) and show the last picture. */
+    if (d->vq_len && idd_decode_video(d))
+        frame_uploaded = TRUE;
 
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
@@ -2412,6 +2640,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
         d->frame_dirty = FALSE;
         LeaveCriticalSection(&d->frame_cs);
         frame_uploaded = TRUE;
+        d->showing_video = FALSE;
     }
 
     /* Compute letterboxed viewport within client area */
@@ -2445,7 +2674,12 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     d->ctx->lpVtbl->VSSetShader(d->ctx, d->vs, NULL, 0);
     d->ctx->lpVtbl->PSSetShader(d->ctx, d->ps, NULL, 0);
-    d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &d->frame_srv);
+    {
+        ID3D11ShaderResourceView *srv = d->frame_srv;
+        if (d->showing_video && d->vdec)
+            srv = vm_video_decoder_srv(d->vdec);
+        d->ctx->lpVtbl->PSSetShaderResources(d->ctx, 0, 1, &srv);
+    }
     d->ctx->lpVtbl->PSSetSamplers(d->ctx, 0, 1, &d->sampler);
 
     /* Draw fullscreen triangle (3 vertices, no vertex buffer) */
@@ -2456,6 +2690,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
 static void d3d_cleanup(VmDisplayIdd *d)
 {
+    if (d->vdec)       { vm_video_decoder_destroy(d->vdec);              d->vdec = NULL; }
     if (d->sampler)    { d->sampler->lpVtbl->Release(d->sampler);       d->sampler = NULL; }
     if (d->ps)         { d->ps->lpVtbl->Release(d->ps);                 d->ps = NULL; }
     if (d->vs)         { d->vs->lpVtbl->Release(d->vs);                 d->vs = NULL; }
@@ -2676,6 +2911,61 @@ static void clip_log_callback(const wchar_t *msg, void *user_data)
     idd_log(d, L"%s", msg);
 }
 
+/* Frame size for video pictures. Keeps frame_buf the size of the frame (the
+   raw path relies on that) and tells the rest of the viewer the new size.
+   Called with frame_cs held. */
+static BOOL idd_video_frame_size_locked(VmDisplayIdd *d, UINT w, UINT h)
+{
+    BYTE *nb;
+    if (w == d->frame_width && h == d->frame_height) return TRUE;
+    nb = (BYTE *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, (SIZE_T)w * 4 * h);
+    if (!nb) return FALSE;
+    if (d->frame_buf) HeapFree(GetProcessHeap(), 0, d->frame_buf);
+    d->frame_buf = nb;
+    d->frame_width = w;
+    d->frame_height = h;
+    d->frame_stride = w * 4;
+    idd_log(d, L"Resolution changed to %ux%u (video).", w, h);
+    return TRUE;
+}
+
+/* Queue one access unit for the window thread. Called with frame_cs held.
+   Returns FALSE when the queue overflowed (the caller asks for a key frame). */
+static BOOL idd_video_enqueue_locked(VmDisplayIdd *d, const VideoHeader *vh, const BYTE *data)
+{
+    VideoQEntry e;
+    UINT need = (UINT)sizeof(e) + vh->size;
+    BOOL key = (vh->flags & VIDEO_FLAG_KEY) != 0;
+
+    if (d->vq_wait_key && !key) return TRUE;   /* useless without its key frame */
+    if (key) d->vq_wait_key = FALSE;
+    if (d->vq_len + need > MAX_VIDEO_QUEUE) {
+        /* The window thread is not keeping up (window being dragged, etc.):
+           drop the backlog and restart from a key frame. */
+        d->vq_len = 0;
+        d->vq_wait_key = TRUE;
+        return FALSE;
+    }
+    if (d->vq_cap < d->vq_len + need) {
+        UINT cap = d->vq_cap ? d->vq_cap : 1024 * 1024;
+        BYTE *nb;
+        while (cap < d->vq_len + need) cap *= 2;
+        nb = d->vq_buf ? (BYTE *)HeapReAlloc(GetProcessHeap(), 0, d->vq_buf, cap)
+                       : (BYTE *)HeapAlloc(GetProcessHeap(), 0, cap);
+        if (!nb) { d->vq_len = 0; d->vq_wait_key = TRUE; return FALSE; }
+        d->vq_buf = nb;
+        d->vq_cap = cap;
+    }
+    e.len = vh->size;
+    e.width = vh->width;
+    e.height = vh->height;
+    e.flags = vh->flags;
+    memcpy(d->vq_buf + d->vq_len, &e, sizeof(e));
+    memcpy(d->vq_buf + d->vq_len + sizeof(e), data, vh->size);
+    d->vq_len += need;
+    return TRUE;
+}
+
 static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 {
     VmDisplayIdd *d = (VmDisplayIdd *)param;
@@ -2750,6 +3040,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         idd_log(d, L"Frame channel connected.");
         InterlockedExchange(&d->guest_driver, -1);
+        InterlockedExchange(&d->video_active, 0);
+        InterlockedExchange(&d->video_status_hr, 0);
+        EnterCriticalSection(&d->frame_cs);
+        d->vq_len = 0;
+        d->vq_wait_key = FALSE;
+        LeaveCriticalSection(&d->frame_cs);
         d->frames_since_connect = 0;
         /* Ask the guest driver whether it takes resolution changes (Windows
            guests only; older drivers never read this and just keep sending). */
@@ -2830,8 +3126,77 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 if (!recv_exact(s, rest, (int)sizeof(rest)))
                     break;
                 InterlockedExchange(&d->guest_driver, (LONG)rest[0]);
-                idd_log(d, L"Guest display driver: protocol %u (resolution changes supported).", rest[0]);
+                idd_log(d, L"Guest display driver: protocol %u (resolution changes supported%s).",
+                        rest[0], rest[0] >= VDD_PROTOCOL_VIDEO ? L", performance mode" : L"");
+                if (rest[0] >= VDD_PROTOCOL_VIDEO && d->stream_mode == STREAM_PERFORMANCE)
+                    idd_send_perf(d, PERF_FLAG_KEYFRAME);
                 if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
+                continue;
+            }
+
+            if (magic == PERF_STATUS_MAGIC) {
+                UINT32 rest[3];   /* mode, codec, hresult */
+                if (!recv_exact(s, rest, (int)sizeof(rest)))
+                    break;
+                InterlockedExchange(&d->video_active, rest[0] == 1 ? 1 : 0);
+                InterlockedExchange(&d->video_status_hr, (LONG)rest[2]);
+                if (rest[0] == 1)
+                    idd_log(d, L"Performance mode on: the guest GPU encodes H.264 video.");
+                else if ((LONG)rest[2] < 0)
+                    idd_log(d, L"Performance mode unavailable in the guest (0x%08X): no hardware "
+                               L"video encoder on its GPU. Showing raw frames.", rest[2]);
+                else
+                    idd_log(d, L"Quality mode: raw frames.");
+                PostMessageW(d->hwnd, WM_IDD_VIDEO_STATUS, 0, 0);
+                continue;
+            }
+
+            if (magic == VIDEO_MAGIC) {
+                VideoHeader vh;
+                BOOL ok;
+                vh.magic = magic;
+                if (!recv_exact(s, (BYTE *)&vh + sizeof(UINT32), sizeof(vh) - sizeof(UINT32)))
+                    break;
+                if (vh.width < 64 || vh.height < 64 || vh.width > MAX_FRAME_WIDTH ||
+                    vh.height > MAX_FRAME_HEIGHT || vh.size == 0 || vh.size > MAX_VIDEO_AU) {
+                    idd_log(d, L"Invalid video frame %ux%u (%u bytes), reconnecting.",
+                            vh.width, vh.height, vh.size);
+                    break;
+                }
+                if (vh.size > recv_buf_size) {
+                    BYTE *bigger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, vh.size);
+                    if (!bigger) break;
+                    recv_buf = bigger;
+                    recv_buf_size = vh.size;
+                }
+                if (!recv_exact(s, recv_buf, (int)vh.size))
+                    break;
+
+                EnterCriticalSection(&d->frame_cs);
+                if (!idd_video_frame_size_locked(d, vh.width, vh.height)) {
+                    LeaveCriticalSection(&d->frame_cs);
+                    break;
+                }
+                ok = idd_video_enqueue_locked(d, &vh, recv_buf);
+                d->recv_count++;
+                LeaveCriticalSection(&d->frame_cs);
+                if (!ok) {
+                    idd_log(d, L"Video backlog dropped, asking for a key frame.");
+                    idd_send_perf(d, PERF_FLAG_KEYFRAME);
+                }
+                if (!d->video_active) InterlockedExchange(&d->video_active, 1);
+                if (!d->frame_connected) {
+                    d->frame_connected = TRUE;
+                    PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
+                }
+                if (d->hwnd && IsWindow(d->hwnd))
+                    PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+                if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
+                    closesocket(input_s);
+                    input_s = INVALID_SOCKET;
+                }
+                if (input_s == INVALID_SOCKET)
+                    input_s = connect_input(d);
                 continue;
             }
 
@@ -3319,6 +3684,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                        id < IDM_HZ_BASE + ARRAYSIZE(g_refresh_rates) * 0x10) {
                 d->refresh_hz = g_refresh_rates[(id - IDM_HZ_BASE) / 0x10];
                 handled = TRUE;
+            } else if (id == IDM_STREAM_QUALITY || id == IDM_STREAM_PERF) {
+                PostMessageW(hwnd, WM_IDD_SET_STREAM,
+                             id == IDM_STREAM_PERF ? STREAM_PERFORMANCE : STREAM_QUALITY, 0);
+                return 0;
             }
             if (handled) {
                 idd_update_display_menu(d);
@@ -3586,6 +3955,31 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         } else if (wp == IDT_APPLY_MODE && d) {
             KillTimer(hwnd, IDT_APPLY_MODE);
             idd_apply_display_mode(d, TRUE);
+        }
+        return 0;
+
+    case WM_IDD_SET_STREAM:
+        /* Quality / performance, from the menu or the management UI. */
+        if (d) {
+            d->stream_mode = ((int)wp == STREAM_PERFORMANCE) ? STREAM_PERFORMANCE : STREAM_QUALITY;
+            d->vdec_unavailable = FALSE;      /* choosing it again retries */
+            InterlockedExchange(&d->video_status_hr, 0);
+            idd_update_display_menu(d);
+            idd_save_settings(d);
+            if (d->guest_driver >= 0 && d->guest_driver < VDD_PROTOCOL_VIDEO &&
+                d->stream_mode == STREAM_PERFORMANCE)
+                idd_log(d, L"Performance mode needs the updated guest display driver: "
+                           L"update the VM's guest components.");
+            idd_send_perf(d, PERF_FLAG_KEYFRAME);
+            idd_update_title(d, TRUE);
+            if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
+        }
+        return 0;
+
+    case WM_IDD_VIDEO_STATUS:
+        if (d) {
+            idd_update_title(d, TRUE);
+            if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
         }
         return 0;
 
@@ -3911,7 +4305,8 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        have one yet. The hook itself is installed later, on the window thread,
        once the window exists. */
     d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &h2g, &g2h,
-                                                              &d->res_choice, &d->refresh_hz);
+                                                              &d->res_choice, &d->refresh_hz,
+                                                              &d->stream_mode);
     d->clip_share_host_to_guest = h2g;
     d->clip_share_guest_to_host = g2h;
     d->guest_linux = (_wcsicmp(vm->os_type, L"Linux") == 0);
@@ -4005,6 +4400,8 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     }
 
     DeleteCriticalSection(&display->frame_cs);
+    if (display->vq_buf) HeapFree(GetProcessHeap(), 0, display->vq_buf);
+    if (display->vq_work) HeapFree(GetProcessHeap(), 0, display->vq_work);
 
     if (display->clipboard) {
         vm_clipboard_destroy(display->clipboard);

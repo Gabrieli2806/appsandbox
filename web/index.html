@@ -145,9 +145,20 @@
                 <div class="card">
                     <div class="card-head">
                         <h3>Refresh rate</h3>
-                        <p class="muted">More Hz allows more FPS in games; each frame costs CPU time to copy.</p>
+                        <p class="muted">More Hz allows more FPS in games. In quality mode each frame costs CPU time to copy; performance mode avoids that.</p>
                     </div>
                     <div class="segmented" role="group" aria-label="Refresh rate" id="vmd-rates"></div>
+                </div>
+                <div class="card" id="vmd-stream-card">
+                    <div class="card-head">
+                        <h3>Streaming mode</h3>
+                        <p class="muted">Performance compresses the picture on the VM's GPU (H.264), like Moonlight, so high resolutions and frame rates stay smooth. Quality sends exact, uncompressed pixels.</p>
+                    </div>
+                    <div class="segmented" role="group" aria-label="Streaming mode">
+                        <button type="button" data-stream="quality" onclick="setPerformanceMode(false)">Quality</button>
+                        <button type="button" data-stream="performance" onclick="setPerformanceMode(true)">Performance (games)</button>
+                    </div>
+                    <p class="muted small" id="vmd-stream-note"></p>
                 </div>
                 <p class="muted small">More display options (FPS counter, borderless fullscreen with F11, clipboard, audio) are in the VM window: right-click its title bar.</p>
             </div>

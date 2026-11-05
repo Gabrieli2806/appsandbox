@@ -413,6 +413,14 @@ static void build_vm_json(JsonBuilder *jb, int i)
             if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
                 driver = vm_display_idd_guest_driver(g_idd_displays[k]);
         jb_int(jb, L"displayDriver", driver);
+        {
+            int video = -1;
+            for (k = 0; k < ASB_MAX_VMS; k++)
+                if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
+                    video = vm_display_idd_video_active(g_idd_displays[k]);
+            jb_bool(jb, L"displayPerformance", vm_display_idd_saved_performance(v->vhdx_path));
+            jb_int(jb, L"displayVideo", video);
+        }
         jb_bool(jb, L"updatingTools", v->updating_tools);
         jb_bool(jb, L"guestToolsOutdated", asb_vm_guest_tools_outdated(asb_vm_get(i)));
     }
@@ -1411,6 +1419,23 @@ static void handle_webview2_message(const wchar_t *json)
                     display = g_idd_displays[i];
             if (!vm_display_idd_set_mode(display, v->vhdx_path, res, (UINT)hz))
                 ui_show_alert(L"That display mode is not available.");
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"setPerformanceMode") == 0) {
+        /* {vmId, enabled}: GPU video (games) vs. raw frames, per VM. */
+        int idx, i;
+        BOOL enabled = FALSE;
+        VmInstance *v;
+        VmDisplayIdd *display = NULL;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
+            json_get_bool(json, L"enabled", &enabled) &&
+            (v = asb_vm_instance(asb_vm_get(idx))) != NULL &&
+            _wcsicmp(v->os_type, L"Windows") == 0) {
+            for (i = 0; i < ASB_MAX_VMS; i++)
+                if (g_display_vm_ids[i] == v->unique_id && g_idd_displays[i] &&
+                    vm_display_idd_is_open(g_idd_displays[i]))
+                    display = g_idd_displays[i];
+            vm_display_idd_set_performance(display, v->vhdx_path, enabled);
         }
         send_vm_list();
     } else if (wcscmp(action, L"updateGuestTools") == 0) {

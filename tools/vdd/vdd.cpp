@@ -35,6 +35,8 @@ Environment:
 #include <d3dkmthk.h>  /* D3DKMTSetProcessSchedulingPriorityClass */
 #include <setupapi.h>  /* SetupDiGetClassDevs, SetupDiEnumDeviceInfo */
 #include "../transport/asb_transport.h"  /* ivshmem frame channel (Windows-VMs-on-Mac path only) */
+#include "vdd_encoder.h"  /* performance mode: hardware H.264 */
+#include <objbase.h>     /* CoInitializeEx */
 
 /* ========================================================================= */
 /*  File-based logging (persists across crashes, no debugger needed)         */
@@ -241,6 +243,7 @@ static void VddRequestMode(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height, UIN
     }
     ReleaseSRWLockExclusive(&ctx->modeLock);
 
+    ctx->lastRefresh = refresh;
     VddLog("ModeRequest: %ux%u@%u (%s)", width, height, refresh,
            known ? "already offered" : "added");
     if (replug && ctx->hModeTimer) {
@@ -418,16 +421,31 @@ static HRESULT VddGetOrCreateD3DDevice(VDD_DEVICE_CONTEXT* ctx, LUID adapterLuid
     ID3D11Device* pDevice = nullptr;
     ID3D11DeviceContext* pDevCtx = nullptr;
 
+    /* Video support lets the performance mode convert and encode frames on
+       this device; adapters without it still get a plain device. */
     hr = D3D11CreateDevice(
         pAdapter,
         D3D_DRIVER_TYPE_UNKNOWN,
         nullptr,
-        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT,
         levels, ARRAYSIZE(levels),
         D3D11_SDK_VERSION,
         &pDevice,
         nullptr,
         &pDevCtx);
+    if (FAILED(hr)) {
+        VddLog("GetOrCreateD3DDevice: no video support on this adapter (0x%08X)", hr);
+        hr = D3D11CreateDevice(
+            pAdapter,
+            D3D_DRIVER_TYPE_UNKNOWN,
+            nullptr,
+            D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+            levels, ARRAYSIZE(levels),
+            D3D11_SDK_VERSION,
+            &pDevice,
+            nullptr,
+            &pDevCtx);
+    }
 
     pAdapter->Release();
 
@@ -495,7 +513,13 @@ static DWORD WINAPI VddSwapChainThread(LPVOID lpParameter)
         }
     }
 
+    /* COM for the performance-mode encoder (Media Foundation). */
+    HRESULT hrCom = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+
     VddSwapChainRunCore(proc);
+
+    if (SUCCEEDED(hrCom))
+        CoUninitialize();
 
     /* Always delete the swap chain when the processing loop terminates, to
        kick the system to provide a new swap chain if necessary.  The D3D
@@ -749,6 +773,135 @@ static int VddSendFrame(VDD_SWAP_PROC* proc, const D3D11_MAPPED_SUBRESOURCE* map
     return 0;
 }
 
+/* ========================================================================= */
+/*  Performance mode (GPU-encoded video)                                     */
+/* ========================================================================= */
+
+/* Queue one encoded access unit. Unlike raw frames, a waiting video message
+   is never replaced (that would break the stream until the next key frame):
+   the new one is appended to it, and the capture loop skips encoding while
+   anything waits, so the backlog stays at about one frame. Called from the
+   encoder's event thread. */
+static void VddEncOut(void* user, const BYTE* data, UINT len, BOOL key, UINT width, UINT height)
+{
+    VDD_SWAP_PROC* proc = (VDD_SWAP_PROC*)user;
+    VDD_WIRE_VIDEO_HEADER h;
+    UINT need = (UINT)sizeof(h) + len;
+    int slot;
+    UINT off;
+
+    if (!proc->hClientConn || len == 0) return;
+    h.magic  = VDD_VIDEO_MAGIC;
+    h.width  = width;
+    h.height = height;
+    h.codec  = VDD_CODEC_H264;
+    h.flags  = key ? VDD_VIDEO_FLAG_KEY : 0;
+    h.size   = len;
+    h.seq    = ++proc->videoSeq;
+
+    EnterCriticalSection(&proc->queueLock);
+    if (proc->pendingSlot != -1 && proc->slotGen[proc->pendingSlot] == proc->connGen) {
+        slot = proc->pendingSlot;
+        off = proc->slotLen[slot];
+    } else {
+        slot = (proc->sendingSlot == 0) ? 1 : 0;
+        off = 0;
+    }
+    if (off + need > 64u * 1024 * 1024) {
+        /* The host stopped reading; start over from a key frame. */
+        off = 0;
+        InterlockedExchange(&proc->perfKeyReq, 1);
+    }
+    if (proc->slotCap[slot] < off + need) {
+        BYTE* nb = (BYTE*)realloc(proc->slotBuf[slot], off + need);
+        if (!nb) {
+            LeaveCriticalSection(&proc->queueLock);
+            InterlockedExchange(&proc->perfKeyReq, 1);
+            return;
+        }
+        proc->slotBuf[slot] = nb;
+        proc->slotCap[slot] = off + need;
+    }
+    memcpy(proc->slotBuf[slot] + off, &h, sizeof(h));
+    memcpy(proc->slotBuf[slot] + off + sizeof(h), data, len);
+    proc->slotLen[slot] = off + need;
+    proc->slotGen[slot] = proc->connGen;
+    proc->pendingSlot = slot;
+    LeaveCriticalSection(&proc->queueLock);
+    SetEvent(proc->hSendEvent);
+}
+
+static void VddEncLog(const char* fmt, ...)
+{
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(buf, sizeof(buf), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    VddLog("%s", buf);
+}
+
+static void VddSendPerfStatus(VDD_SWAP_PROC* proc, UINT mode, HRESULT hr)
+{
+    VDD_WIRE_PERF_STATUS st;
+    st.magic = VDD_PERF_STATUS_MAGIC;
+    st.mode = mode;
+    st.codec = mode ? VDD_CODEC_H264 : 0;
+    st.hresult = (INT32)hr;
+    if (proc->hClientConn)
+        VddSendMsg(proc, &st, (int)sizeof(st), NULL, 0);
+}
+
+static void VddPerfStop(VDD_SWAP_PROC* proc)
+{
+    if (proc->pEncoder) {
+        VddEncoderDestroy(proc->pEncoder);
+        proc->pEncoder = nullptr;
+    }
+}
+
+/* Make sure an encoder for width x height exists when the host wants video.
+   Returns TRUE when frames should go through the encoder. On failure the
+   host is told and raw frames continue. */
+static BOOL VddPerfEnsure(VDD_SWAP_PROC* proc, UINT width, UINT height)
+{
+    if (!proc->perfWanted || proc->perfFailed || !proc->hClientConn) {
+        if (proc->pEncoder) {
+            VddPerfStop(proc);
+            VddLog("Perf: video off, sending raw frames");
+            VddSendPerfStatus(proc, 0, S_OK);
+        }
+        return FALSE;
+    }
+    if (proc->pEncoder) {
+        if (VddEncoderFailed(proc->pEncoder)) {
+            VddPerfStop(proc);
+            proc->perfFailed = TRUE;
+            VddLog("Perf: encoder failed, back to raw frames");
+            VddSendPerfStatus(proc, 0, E_FAIL);
+            return FALSE;
+        }
+        if (VddEncoderWidth(proc->pEncoder) == width && VddEncoderHeight(proc->pEncoder) == height)
+            return TRUE;
+        VddPerfStop(proc);   /* new size: new encoder (starts with a key frame) */
+    }
+
+    UINT fps = proc->pContext && proc->pContext->lastRefresh ? proc->pContext->lastRefresh : 60;
+    VddEncoder* enc = nullptr;
+    HRESULT hr = VddEncoderCreate(proc->pDevice, proc->pDeviceContext, width, height, fps,
+                                  (UINT)proc->perfKbps, VddEncOut, proc, VddEncLog, &enc);
+    if (FAILED(hr) || !enc) {
+        proc->perfFailed = TRUE;
+        VddLog("Perf: no GPU video encoder (0x%08X), staying with raw frames", hr);
+        VddSendPerfStatus(proc, 0, FAILED(hr) ? hr : E_FAIL);
+        return FALSE;
+    }
+    proc->pEncoder = enc;
+    VddLog("Perf: GPU video on (%s, %ux%u)", VddEncoderName(enc), width, height);
+    VddSendPerfStatus(proc, 1, S_OK);
+    return TRUE;
+}
+
 /* Read a pending mode request from the host, if any. The host only ever
    sends VDD_WIRE_MODE_REQUEST messages on this channel. Returns FALSE when
    the connection is gone. */
@@ -775,6 +928,22 @@ static BOOL VddPollHostRequests(VDD_SWAP_PROC* proc)
             hello.version = VDD_PROTOCOL_VERSION;
             VddLog("HostRequest: hello query, answering protocol %u", hello.version);
             if (VddSendMsg(proc, &hello, (int)sizeof(hello), NULL, 0) != 0) return FALSE;
+            continue;
+        }
+        if (req.magic == VDD_PERF_REQUEST_MAGIC) {
+            /* width = mode, height = kbps, refresh = flags */
+            LONG mode = req.width == 1 ? 1 : 0;
+            if (mode != proc->perfWanted || req.height != (UINT32)proc->perfKbps) {
+                VddLog("HostRequest: performance mode %s (%u kbit/s)",
+                       mode ? "video" : "raw", req.height);
+                if (proc->pEncoder && req.height != (UINT32)proc->perfKbps)
+                    VddPerfStop(proc);   /* new bit rate: reopen */
+            }
+            InterlockedExchange(&proc->perfKbps, (LONG)req.height);
+            InterlockedExchange(&proc->perfWanted, mode);
+            proc->perfFailed = FALSE;    /* asking again retries a failed encoder */
+            if (req.refresh & VDD_PERF_FLAG_KEYFRAME)
+                InterlockedExchange(&proc->perfKeyReq, 1);
             continue;
         }
         if (req.magic != VDD_MODE_REQUEST_MAGIC) {
@@ -884,6 +1053,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 LeaveCriticalSection(&proc->sendLock);
                 proc->frameSeq = 0;
                 bSentFullFrame = FALSE;   /* new connection -> first frame is full (the reconnect trigger) */
+                /* Each connection starts with raw frames; the host asks for
+                   video again after the hello. */
+                VddPerfStop(proc);
+                InterlockedExchange(&proc->perfWanted, 0);
+                proc->perfFailed = FALSE;
                 VddLog("Frame: new client connection active");
             }
         }
@@ -932,6 +1106,16 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 break;
             }
 
+            /* Video: encode the last picture again (keeps the stream and the
+               host's frame counter alive; an unchanged picture is tiny). */
+            if (waitResult == WAIT_TIMEOUT && proc->pEncoder && proc->hClientConn &&
+                !VddFrameWaiting(proc)) {
+                BOOL key = InterlockedExchange(&proc->perfKeyReq, 0) != 0;
+                HRESULT ehr = VddEncoderRepeat(proc->pEncoder, key);
+                if (ehr != S_OK && key) InterlockedExchange(&proc->perfKeyReq, 1);
+                continue;
+            }
+
             /* On timeout with a connected client and a cached frame, resend
                the staging texture contents to keep the connection alive. */
             if (waitResult == WAIT_TIMEOUT && bHasFrame &&
@@ -971,7 +1155,24 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                         bHasFrame = FALSE;
                     }
 
-                    if (VddEnsureStaging(proc, sdesc.Width, sdesc.Height)) {
+                    if (VddPerfEnsure(proc, sdesc.Width, sdesc.Height)) {
+                        /* Performance mode: the frame stays on the GPU. While
+                           the sender still has a message waiting, skip this
+                           frame; the stream stays valid. */
+                        if (proc->pStagingTex) {    /* stale now; raw fallback recreates it */
+                            proc->pStagingTex->Release();
+                            proc->pStagingTex = nullptr;
+                        }
+                        proc->frameWidth = sdesc.Width;
+                        proc->frameHeight = sdesc.Height;
+                        bHasFrame = FALSE;
+                        bSentFullFrame = FALSE;     /* a raw fallback starts with a full frame */
+                        if (!VddFrameWaiting(proc)) {
+                            BOOL key = InterlockedExchange(&proc->perfKeyReq, 0) != 0;
+                            HRESULT ehr = VddEncoderEncode(proc->pEncoder, pTexture, key);
+                            if (ehr != S_OK && key) InterlockedExchange(&proc->perfKeyReq, 1);
+                        }
+                    } else if (VddEnsureStaging(proc, sdesc.Width, sdesc.Height)) {
                         proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
                         D3D11_MAPPED_SUBRESOURCE mapped = {};
@@ -1077,6 +1278,9 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
             break;
         }
     }
+
+    /* The encoder lives on this thread (COM) and calls back into proc. */
+    VddPerfStop(proc);
 }
 
 /* ========================================================================= */
