@@ -32,6 +32,7 @@
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "crypt32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
@@ -116,6 +117,7 @@ static BOOL detect_home_edition(void)
 
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void send_vm_list(void);
+static int vm_icon_version(const VmInstance *v);
 static void send_full_state(void);
 static void send_adapters(void);
 static void send_templates(void);
@@ -380,6 +382,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"id", id);
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
+    jb_int(jb, L"iconVersion", vm_icon_version(v));
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"running", v->running);
@@ -832,6 +835,143 @@ static void do_connect_idd(int idx)
    can close one without re-opening the other. */
 static void do_connect_vm(int idx);
 
+/* ---- Custom VM icons ----
+   Stored beside the VM's disk: icon.png (as chosen, shown in the UI) and
+   icon.ico (the same picture in an .ico wrapper, for the VM window,
+   taskbar and shortcuts). */
+
+#define VM_ICON_MAX_BYTES (1024 * 1024)
+
+static void vm_icon_file(const VmInstance *v, const wchar_t *name, wchar_t *out, size_t cap)
+{
+    wchar_t dir[MAX_PATH], *slash;
+    wcscpy_s(dir, MAX_PATH, v->vhdx_path);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = 0;
+    swprintf_s(out, cap, L"%s\\%s", dir, name);
+}
+
+/* Change counter for the UI: last write time of the icon, 0 = none. */
+static int vm_icon_version(const VmInstance *v)
+{
+    wchar_t path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA fa;
+    if (!v || !v->vhdx_path[0]) return 0;
+    vm_icon_file(v, L"icon.png", path, MAX_PATH);
+    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) {
+        vm_icon_file(v, L"icon.ico", path, MAX_PATH);
+        if (!GetFileAttributesExW(path, GetFileExInfoStandard, &fa)) return 0;
+    }
+    return (int)((fa.ftLastWriteTime.dwLowDateTime ^ fa.ftLastWriteTime.dwHighDateTime) & 0x7FFFFFFF) | 1;
+}
+
+static BYTE *read_small_file(const wchar_t *path, DWORD *len)
+{
+    HANDLE f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    DWORD size, got = 0;
+    BYTE *buf;
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    size = GetFileSize(f, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > VM_ICON_MAX_BYTES) { CloseHandle(f); return NULL; }
+    buf = (BYTE *)malloc(size);
+    if (buf && (!ReadFile(f, buf, size, &got, NULL) || got != size)) { free(buf); buf = NULL; }
+    CloseHandle(f);
+    *len = size;
+    return buf;
+}
+
+static BOOL write_file_all(const wchar_t *path, const void *a, DWORD alen, const void *b, DWORD blen)
+{
+    HANDLE f = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD w;
+    BOOL ok;
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    ok = WriteFile(f, a, alen, &w, NULL) && w == alen;
+    if (ok && b && blen) ok = WriteFile(f, b, blen, &w, NULL) && w == blen;
+    CloseHandle(f);
+    return ok;
+}
+
+/* Set the VM's icon from a .png or .ico file. */
+static BOOL vm_icon_set(const VmInstance *v, const wchar_t *src, wchar_t *err, size_t err_cap)
+{
+    wchar_t png[MAX_PATH], ico[MAX_PATH];
+    DWORD len = 0;
+    BYTE *data = read_small_file(src, &len);
+    BOOL ok = FALSE;
+    if (!data) {
+        swprintf_s(err, err_cap, L"Choose a PNG or ICO file of 1 MB or less.");
+        return FALSE;
+    }
+    vm_icon_file(v, L"icon.png", png, MAX_PATH);
+    vm_icon_file(v, L"icon.ico", ico, MAX_PATH);
+    if (len > 24 && memcmp(data, "\x89PNG\r\n\x1a\n", 8) == 0) {
+        /* PNG: keep it, and wrap it in a one-image .ico (Vista+ ICO may hold PNG). */
+        UINT w = ((UINT)data[16] << 24) | ((UINT)data[17] << 16) | ((UINT)data[18] << 8) | data[19];
+        UINT h = ((UINT)data[20] << 24) | ((UINT)data[21] << 16) | ((UINT)data[22] << 8) | data[23];
+        BYTE hdr[22];
+        ZeroMemory(hdr, sizeof(hdr));
+        hdr[2] = 1;                         /* type: icon */
+        hdr[4] = 1;                         /* one image */
+        hdr[6] = (BYTE)(w >= 256 ? 0 : w);  /* 0 means 256 or more */
+        hdr[7] = (BYTE)(h >= 256 ? 0 : h);
+        hdr[10] = 1;                        /* planes */
+        hdr[12] = 32;                       /* bit count */
+        memcpy(hdr + 14, &len, 4);          /* bytes in resource */
+        hdr[18] = 22;                       /* offset of the image */
+        ok = write_file_all(png, data, len, NULL, 0) && write_file_all(ico, hdr, 22, data, len);
+    } else if (len > 6 && data[0] == 0 && data[1] == 0 && data[2] == 1 && data[3] == 0) {
+        DeleteFileW(png);                   /* ICO: the UI shows it as is */
+        ok = write_file_all(ico, data, len, NULL, 0);
+    } else {
+        swprintf_s(err, err_cap, L"That file is not a PNG or ICO image.");
+    }
+    if (!ok && !err[0]) swprintf_s(err, err_cap, L"The icon could not be saved next to the VM's disk.");
+    free(data);
+    return ok;
+}
+
+/* Send the icon to the UI as a data URL. */
+static void vm_icon_post(const VmInstance *v)
+{
+    wchar_t path[MAX_PATH], id[ASB_VM_ID_TEXT_SIZE];
+    const wchar_t *mime = L"image/png";
+    DWORD len = 0, b64len = 0;
+    BYTE *data;
+    wchar_t *b64, *msg;
+    size_t cap;
+
+    asb_vm_id_format_w(v->unique_id, id);
+    vm_icon_file(v, L"icon.png", path, MAX_PATH);
+    data = read_small_file(path, &len);
+    if (!data) {
+        vm_icon_file(v, L"icon.ico", path, MAX_PATH);
+        data = read_small_file(path, &len);
+        mime = L"image/x-icon";
+    }
+    if (!data) {
+        wchar_t none[160];
+        swprintf_s(none, ARRAYSIZE(none), L"{\"type\":\"vmIcon\",\"vmId\":\"%s\",\"data\":\"\"}", id);
+        webview2_post(none);
+        return;
+    }
+    if (!CryptBinaryToStringW(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64len)) {
+        free(data);
+        return;
+    }
+    b64 = (wchar_t *)malloc(b64len * sizeof(wchar_t));
+    cap = b64len + 256;
+    msg = (wchar_t *)malloc(cap * sizeof(wchar_t));
+    if (b64 && msg && CryptBinaryToStringW(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64, &b64len)) {
+        swprintf_s(msg, cap, L"{\"type\":\"vmIcon\",\"vmId\":\"%s\",\"data\":\"data:%s;base64,%s\"}",
+                   id, mime, b64);
+        webview2_post(msg);
+    }
+    free(b64);
+    free(msg);
+    free(data);
+}
+
 /* ---- VM shortcuts (desktop / Start menu) ---- */
 
 #define IDT_LAUNCH_VM 0x4C56
@@ -901,7 +1041,7 @@ static void shortcut_file_name(const wchar_t *vm_name, wchar_t *out, size_t cap)
 /* Creates "<VM>.lnk" on the desktop or in Start menu > App Sandbox.
    Returns S_OK and the path in out_path. */
 static HRESULT create_vm_shortcut(const wchar_t *vm_name, BOOL start_menu,
-                                  wchar_t *out_path, size_t out_cap)
+                                  wchar_t *out_path, size_t out_cap, const VmInstance *vm_for_icon)
 {
     PWSTR folder = NULL;
     wchar_t exe[MAX_PATH], dir[MAX_PATH], args[400], file[260], desc[400], *slash;
@@ -948,6 +1088,12 @@ static HRESULT create_vm_shortcut(const wchar_t *vm_name, BOOL start_menu,
     {
         wchar_t icon[MAX_PATH];
         GetModuleFileNameW(NULL, icon, MAX_PATH);
+        if (vm_for_icon) {
+            wchar_t custom[MAX_PATH];
+            vm_icon_file(vm_for_icon, L"icon.ico", custom, MAX_PATH);
+            if (GetFileAttributesW(custom) != INVALID_FILE_ATTRIBUTES)
+                wcscpy_s(icon, MAX_PATH, custom);
+        }
         link->lpVtbl->SetIconLocation(link, icon, 0);
     }
     hr = link->lpVtbl->QueryInterface(link, &IID_IPersistFile, (void **)&pf);
@@ -1566,6 +1712,44 @@ static void handle_webview2_message(const wchar_t *json)
                 ui_show_alert(L"That display mode is not available.");
         }
         send_vm_list();
+    } else if (wcscmp(action, L"getVmIcon") == 0) {
+        int idx;
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL)
+            vm_icon_post(v);
+    } else if (wcscmp(action, L"setVmIcon") == 0 || wcscmp(action, L"clearVmIcon") == 0) {
+        int idx;
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            if (wcscmp(action, L"clearVmIcon") == 0) {
+                wchar_t path[MAX_PATH];
+                vm_icon_file(v, L"icon.png", path, MAX_PATH);
+                DeleteFileW(path);
+                vm_icon_file(v, L"icon.ico", path, MAX_PATH);
+                DeleteFileW(path);
+            } else {
+                OPENFILENAMEW ofn;
+                wchar_t file[MAX_PATH] = L"", err[256] = L"";
+                ZeroMemory(&ofn, sizeof(ofn));
+                ofn.lStructSize = sizeof(ofn);
+                ofn.hwndOwner = g_hwnd_main;
+                ofn.lpstrFilter = L"Images (*.png, *.ico)\0*.png;*.ico\0All Files\0*.*\0";
+                ofn.lpstrFile = file;
+                ofn.nMaxFile = MAX_PATH;
+                ofn.lpstrTitle = L"Choose an icon for this VM";
+                ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+                if (GetOpenFileNameW(&ofn) && !vm_icon_set(v, file, err, ARRAYSIZE(err)))
+                    ui_show_alert(err);
+            }
+            vm_icon_post(v);
+            {
+                int k;
+                for (k = 0; k < ASB_MAX_VMS; k++)
+                    if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
+                        vm_display_idd_icon_changed(g_idd_displays[k]);
+            }
+        }
+        send_vm_list();
     } else if (wcscmp(action, L"createShortcut") == 0) {
         /* {vmId, where: "desktop"|"start"} */
         int idx;
@@ -1575,7 +1759,7 @@ static void handle_webview2_message(const wchar_t *json)
         if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count() &&
             (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
             BOOL start_menu = wcscmp(where, L"start") == 0;
-            HRESULT hr = create_vm_shortcut(v->name, start_menu, path, ARRAYSIZE(path));
+            HRESULT hr = create_vm_shortcut(v->name, start_menu, path, ARRAYSIZE(path), v);
             if (SUCCEEDED(hr)) {
                 ui_log(L"Shortcut for \"%s\" created: %s", v->name, path);
                 swprintf_s(msg, ARRAYSIZE(msg), start_menu

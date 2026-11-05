@@ -201,6 +201,7 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define WM_IDD_VIDEO_STATUS     (WM_USER + 107)  /* guest reported video on/off; wp=1 prefs changed */
 #define WM_IDD_SET_CODEC        (WM_USER + 108)  /* wp = CODEC_* */
 #define WM_IDD_SET_BITRATE      (WM_USER + 109)  /* wp = Mbit/s, 0 = auto */
+#define WM_IDD_SET_ICON         (WM_USER + 110)  /* reload the VM's custom icon */
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
@@ -459,6 +460,8 @@ struct VmDisplayIdd {
     /* Threads */
     HANDLE         recv_thread;
     HANDLE         gamepad_thread;   /* forwards host controllers (XInput) */
+    HICON          custom_icon_big;  /* icon.ico beside the disk, if any */
+    HICON          custom_icon_small;
     HANDLE         window_thread;
 };
 
@@ -1251,6 +1254,41 @@ const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display)
 {
     if (!display || !display->open || !display->frame_connected || !display->video_active) return NULL;
     return display->video_codec == VM_VIDEO_CODEC_HEVC ? L"HEVC" : L"H.264";
+}
+
+void vm_display_idd_icon_changed(VmDisplayIdd *display)
+{
+    if (display && display->open && display->hwnd && IsWindow(display->hwnd))
+        PostMessageW(display->hwnd, WM_IDD_SET_ICON, 0, 0);
+}
+
+/* Window and taskbar icon: the VM's icon.ico if it has one, otherwise the
+   app icon. */
+static void idd_apply_icon(VmDisplayIdd *d)
+{
+    wchar_t path[MAX_PATH], *slash;
+    HICON big = NULL, small = NULL;
+    if (!d || !d->hwnd) return;
+    wcscpy_s(path, MAX_PATH, d->vhdx_path);
+    slash = wcsrchr(path, L'\\');
+    if (slash) {
+        wcscpy_s(slash + 1, MAX_PATH - (slash + 1 - path), L"icon.ico");
+        big = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXICON) * 2,
+                                GetSystemMetrics(SM_CYICON) * 2, LR_LOADFROMFILE);
+        small = (HICON)LoadImageW(NULL, path, IMAGE_ICON, GetSystemMetrics(SM_CXSMICON) * 2,
+                                  GetSystemMetrics(SM_CYSMICON) * 2, LR_LOADFROMFILE);
+    }
+    if (!big || !small) {
+        if (big) DestroyIcon(big);
+        if (small) DestroyIcon(small);
+        big = small = NULL;
+    }
+    SendMessageW(d->hwnd, WM_SETICON, ICON_BIG, (LPARAM)(big ? big : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
+    SendMessageW(d->hwnd, WM_SETICON, ICON_SMALL, (LPARAM)(small ? small : LoadIconW(d->hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX))));
+    if (d->custom_icon_big) DestroyIcon(d->custom_icon_big);
+    if (d->custom_icon_small) DestroyIcon(d->custom_icon_small);
+    d->custom_icon_big = big;
+    d->custom_icon_small = small;
 }
 
 /* VM window preferences changed (Settings): refresh title and toolbar. */
@@ -4190,6 +4228,8 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
+    idd_apply_icon(d);
+
     /* Game controllers (best effort; no thread, no controllers). */
     d->gamepad_thread = CreateThread(NULL, 0, idd_gamepad_thread_proc, d, 0, NULL);
 
@@ -4458,6 +4498,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             /* Clean up D3D11 */
             d3d_cleanup(d);
 
+            if (d->custom_icon_big)   { DestroyIcon(d->custom_icon_big);   d->custom_icon_big = NULL; }
+            if (d->custom_icon_small) { DestroyIcon(d->custom_icon_small); d->custom_icon_small = NULL; }
+
             /* Clean up guest cursor */
             if (d->guest_cursor) {
                 DestroyCursor(d->guest_cursor);
@@ -4597,6 +4640,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_update_title(d, TRUE);
             if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
         }
+        return 0;
+
+    case WM_IDD_SET_ICON:
+        if (d) idd_apply_icon(d);
         return 0;
 
     case WM_IDD_SET_CODEC:

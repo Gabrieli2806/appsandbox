@@ -155,6 +155,7 @@ window.onHostMessage = function(msg) {
         case 'prereqReboot':   onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
+        case 'vmIcon':         onVmIcon(msg); break;
     }
 };
 
@@ -1093,6 +1094,9 @@ function showVmMenu(vm, anchor) {
     if (!hostBridge.isMac) {
         item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
         item('Export…', !vm.running && !bld && !vm.isTemplate, function() { sendCmd('exportVm', { vmId: vm.id }); });
+        item('Change icon…', !vm.isTemplate, function() { sendCmd('setVmIcon', { vmId: vm.id }); });
+        if (vm.iconVersion)
+            item('Use default icon', true, function() { sendCmd('clearVmIcon', { vmId: vm.id }); });
         item('Create desktop shortcut', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'desktop' }); });
         item('Add to Start menu', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'start' }); });
     }
@@ -1143,7 +1147,8 @@ function buildVmCard(vm) {
 
     var top = el('div', 'vm-card-top');
     var tile = el('div', 'os-tile');
-    tile.innerHTML = osIcon(vm.osType);
+    tile.innerHTML = vmTileHtml(vm);
+    if (vmIcons[vm.id] && vmIcons[vm.id].data) tile.classList.add('has-icon');
     var names = el('div', 'vm-card-names');
     names.appendChild(el('h2', '', vm.name));
     names.appendChild(el('span', '', vm.osType + ' · ' + gpuLabel(vm)));
@@ -1254,6 +1259,7 @@ function renderVmTable() {
             vm.shuttingDown, vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort, vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.hasSnapshots,
+            vm.iconVersion || 0, (vmIcons[vm.id] && vmIcons[vm.id].data ? vmIcons[vm.id].data.length : 0),
             selectedSnap.get(vm.id) || 'current', vm.snapCurrent, vm.snapCurrentBranch,
             JSON.stringify(vm.snapshots || []), JSON.stringify(vm.baseBranches || [])
         ].join('|');
@@ -1773,6 +1779,37 @@ function updateVmList(next) {
     });
     vms = next;
     selectedVm = selectedId ? vmIndexById(selectedId) : -1;
+    requestVmIcons();
+}
+
+/* ---- Custom VM icons (icon.png / icon.ico beside the VM's disk) ---- */
+let vmIcons = {};   /* id -> { version, data } */
+
+function requestVmIcons() {
+    vms.forEach(function(vm) {
+        var v = vm.iconVersion || 0;
+        var have = vmIcons[vm.id];
+        if (!v) { if (have) delete vmIcons[vm.id]; return; }
+        if (have && have.version === v) return;
+        vmIcons[vm.id] = { version: v, data: have ? have.data : '' };
+        sendCmd('getVmIcon', { vmId: vm.id });
+    });
+}
+
+function onVmIcon(msg) {
+    var entry = vmIcons[msg.vmId] || { version: 0, data: '' };
+    entry.data = msg.data || '';
+    vmIcons[msg.vmId] = entry;
+    renderVmTable();
+    if (detailVmId === msg.vmId) renderVmDetail();
+}
+
+/* The tile content for a VM: its custom icon, or the OS glyph. */
+function vmTileHtml(vm) {
+    var ic = vmIcons[vm.id];
+    if (ic && ic.data && /^data:image\/(png|x-icon);base64,[A-Za-z0-9+\/=]+$/.test(ic.data))
+        return '<img class="vm-custom-icon" alt="" src="' + ic.data + '">';
+    return osIcon(vm.osType);
 }
 
 function vmIndexById(id) {

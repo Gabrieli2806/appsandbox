@@ -659,3 +659,7 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 .stream-options[hidden] { display: none; }
 .stream-option { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
 .stream-option select { min-width: 220px; }
+
+/* Custom VM icon in the card tile */
+.os-tile.has-icon { background: transparent; overflow: hidden; }
+.vm-custom-icon { width: 100%; height: 100%; object-fit: contain; border-radius: 10px; }

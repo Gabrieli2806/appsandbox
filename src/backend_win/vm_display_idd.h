@@ -63,5 +63,7 @@ BOOL vm_display_idd_hevc_supported(void);
 const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display);
 /* Settings > VM windows changed: refresh title and toolbar. */
 void vm_display_idd_prefs_changed(VmDisplayIdd *display);
+/* The VM's custom icon (icon.ico beside its disk) changed. */
+void vm_display_idd_icon_changed(VmDisplayIdd *display);
 
 #endif /* VM_DISPLAY_IDD_H */
