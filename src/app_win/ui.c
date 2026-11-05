@@ -383,6 +383,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_string(jb, L"name", v->name);
     jb_string(jb, L"osType", v->os_type);
     jb_int(jb, L"iconVersion", vm_icon_version(v));
+    jb_bool(jb, L"hasIso", v->image_path[0] != L'\0');
     asb_vm_disk_directory(asb_vm_get(i), disk_directory, MAX_PATH);
     jb_string(jb, L"diskDirectory", disk_directory);
     jb_bool(jb, L"running", v->running);
@@ -975,6 +976,17 @@ static void vm_icon_post(const VmInstance *v)
 /* ---- VM shortcuts (desktop / Start menu) ---- */
 
 #define IDT_LAUNCH_VM 0x4C56
+#define IDT_OPEN_CONSOLE 0x4C57
+/* Manual-install VM whose console opens once it is running. */
+static UINT64 g_console_vm_id;
+static int    g_console_tries;
+
+static void open_console_when_running(UINT64 vm_id)
+{
+    g_console_vm_id = vm_id;
+    g_console_tries = 0;
+    if (g_hwnd_main) SetTimer(g_hwnd_main, IDT_OPEN_CONSOLE, 1000, NULL);
+}
 static wchar_t g_launch_vm[256];
 static int     g_launch_tries;
 
@@ -1115,6 +1127,12 @@ static void do_connect_vm(int idx)
     vm = asb_vm_instance(asb_vm_get(idx));
     if (!vm || !vm->running) return;
     asb_vm_set_display_suppressed((AsbVm)vm, FALSE);
+    /* Manual-install VMs: the Hyper-V basic console over RDP (no App Sandbox
+       display driver in the guest). */
+    if (_wcsicmp(vm->os_type, L"Other") == 0) {
+        do_connect_rdp(idx);
+        return;
+    }
     /* Direct ISO->VHDX flow boots straight into the configured rootfs with
        IDD live from the start, so the RDP fallback window is no longer
        needed. do_connect_rdp() + vm_display.c stay on disk as reference
@@ -1480,7 +1498,9 @@ static void handle_webview2_message(const wchar_t *json)
         json_get_string(json, L"osType", os_buf, 32);
         json_get_string(json, L"imagePath", img_buf, MAX_PATH);
         json_get_string(json, L"templateName", tpl_buf, 256);
-        if (!json_get_string(json, L"adminUser", user_buf, ARRAYSIZE(user_buf))) {
+        /* Manual install ("Other"): no account is created. */
+        BOOL manual_os = _wcsicmp(os_buf, L"Other") == 0;
+        if (!manual_os && !json_get_string(json, L"adminUser", user_buf, ARRAYSIZE(user_buf))) {
             const wchar_t *error = !json_has_key(json, L"adminUser")
                 ? L"Username is required."
                 : user_buf[0]
@@ -1491,7 +1511,7 @@ static void handle_webview2_message(const wchar_t *json)
             ui_show_alert(error);
             return;
         }
-        if (!json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
+        if (!manual_os && !json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
             const wchar_t *error = !json_has_key(json, L"adminPass")
                 ? L"Password is required."
                 : pass_buf[0]
@@ -1547,6 +1567,13 @@ static void handle_webview2_message(const wchar_t *json)
             }
         }
         asb_vm_create(&cfg);
+        if (manual_os) {
+            int k;
+            for (k = 0; k < asb_vm_count(); k++) {
+                VmInstance *cv = asb_vm_instance(asb_vm_get(k));
+                if (cv && _wcsicmp(cv->name, name_buf) == 0) { open_console_when_running(cv->unique_id); break; }
+            }
+        }
         SecureZeroMemory(pass_buf, sizeof(pass_buf));
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {
@@ -1563,6 +1590,11 @@ static void handle_webview2_message(const wchar_t *json)
             json_get_int(json, L"branchIndex", &bi);
             json_get_string(json, L"branchName", bname, 128);
             asb_vm_start(asb_vm_get(idx), si, bi, bname);
+            {
+                VmInstance *sv = asb_vm_instance(asb_vm_get(idx));
+                if (sv && _wcsicmp(sv->os_type, L"Other") == 0)
+                    open_console_when_running(sv->unique_id);   /* no display driver to auto-open */
+            }
             send_vm_list();
         }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
@@ -1711,6 +1743,11 @@ static void handle_webview2_message(const wchar_t *json)
             if (!vm_display_idd_set_mode(display, v->vhdx_path, res, (UINT)hz))
                 ui_show_alert(L"That display mode is not available.");
         }
+        send_vm_list();
+    } else if (wcscmp(action, L"ejectIso") == 0) {
+        int idx;
+        if (json_vm_index(json, &idx) && asb_vm_eject_iso(asb_vm_get(idx)) == E_ACCESSDENIED)
+            ui_show_alert(L"Shut the VM down first; the installer ISO is removed for the next start.");
         send_vm_list();
     } else if (wcscmp(action, L"getVmIcon") == 0) {
         int idx;
@@ -2130,6 +2167,17 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == IDT_LAUNCH_VM) { launch_vm_tick(hwnd); return 0; }
+        if (wp == IDT_OPEN_CONSOLE) {
+            VmInstance *v = asb_find_vm_by_id(g_console_vm_id);
+            int idx = v ? asb_vm_index((AsbVm)v) : -1;
+            if (!v || ++g_console_tries > 60) {
+                KillTimer(hwnd, IDT_OPEN_CONSOLE);
+            } else if (v->running && !v->starting) {
+                KillTimer(hwnd, IDT_OPEN_CONSOLE);
+                do_connect_vm(idx);
+            }
+            return 0;
+        }
         break;
 
     case WM_COPYDATA: {

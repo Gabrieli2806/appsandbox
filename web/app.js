@@ -83,7 +83,7 @@ if (hostBridge.isMac) {
  * Windows host: macOS unavailable (Apple Virtualization is Mac-only).
  * macOS host:   Linux unavailable (Windows IS supported — QEMU+ivshmem). */
 {
-    var unavailable = hostBridge.isMac ? ['Linux'] : ['macOS'];
+    var unavailable = hostBridge.isMac ? ['Linux', 'Other'] : ['macOS'];
     unavailable.forEach(function(v) {
         var opt = document.querySelector('#os-type option[value="' + v + '"]');
         if (opt) opt.remove();
@@ -95,6 +95,13 @@ function applyOsTypeUI() {
     var osType = document.getElementById('os-type').value;
     var isWindows = osType === 'Windows';
     var isLinux = osType === 'Linux';
+    var isManual = osType === 'Other';
+    modal.querySelectorAll('.needs-agent').forEach(function(el) { el.style.display = isManual ? 'none' : ''; });
+    document.getElementById('manual-note').hidden = !isManual;
+    if (isManual) {
+        var net = document.getElementById('net-mode');
+        if (net && net.value === '1') net.value = '3';   /* Internal: DHCP for any OS */
+    }
     var selected = currentTemplates.find(function(t) { return t.name === document.getElementById('template-select').value; });
     if (selected && selected.osType !== osType) selectTemplate('', templateDefaultLabel());
     modal.querySelectorAll('.templates-supported').forEach(function(el) {
@@ -113,7 +120,7 @@ function applyOsTypeUI() {
        guest on EITHER host (a Windows-on-Mac VM uses it too), hidden otherwise. */
     for (var w = 0; w < needsWindows.length; w++) needsWindows[w].style.display = isWindows ? '' : 'none';
     /* ISO picker shows for both Windows and Linux now. */
-    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux || osType === 'macOS') ? '' : 'none';
+    for (var j = 0; j < needsIso.length; j++) needsIso[j].style.display = (isWindows || isLinux || isManual || osType === 'macOS') ? '' : 'none';
     document.getElementById('image-path').placeholder = osType === 'macOS' ? 'Latest macOS restore image (or select IPSW)...' : 'Path to ISO...';
     /* Linux distribution dropdown is dormant — kept in the DOM but always
        hidden so the cloud-image code path can be revived without
@@ -538,12 +545,15 @@ function createValidationError(isTemplate) {
         return 'Templates require a Windows or macOS guest.';
     if (isTemplate && document.getElementById('template-select').value)
         return 'Select an OS image to build a new template.';
+    if (osType === 'Other' && isTemplate) return 'Manual-install VMs cannot be templates.';
     var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
-        validateDiskDirectory(document.getElementById('disk-directory').value.trim()) ||
-        validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
-        validatePassword(document.getElementById('admin-pass').value);
+        validateDiskDirectory(document.getElementById('disk-directory').value.trim());
+    if (!error && osType !== 'Other')
+        error = validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
+                validatePassword(document.getElementById('admin-pass').value);
     if (error) return error;
-    if (document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
+    if (osType !== 'Other' &&
+        document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
         return 'Passwords do not match.';
 
     var numericFields = [
@@ -710,6 +720,8 @@ function validateVmName(name) {
     } else if (osType === 'Linux') {
         if (name.length > 63) return 'VM name cannot exceed 63 characters (Linux hostname limit).';
         if (/[A-Z]/.test(name)) return 'Linux hostname must be lowercase.';
+    } else if (osType === 'Other') {
+        if (name.length > 63) return 'VM name cannot exceed 63 characters.';
     } else { /* Windows */
         if (name.length > 15) return 'VM name cannot exceed 15 characters (NetBIOS limit).';
     }
@@ -1094,6 +1106,8 @@ function showVmMenu(vm, anchor) {
     if (!hostBridge.isMac) {
         item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
         item('Export…', !vm.running && !bld && !vm.isTemplate, function() { sendCmd('exportVm', { vmId: vm.id }); });
+        if (vm.osType === 'Other' && vm.hasIso)
+            item('Remove installer ISO', !vm.running && !bld, function() { sendCmd('ejectIso', { vmId: vm.id }); });
         item('Change icon…', !vm.isTemplate, function() { sendCmd('setVmIcon', { vmId: vm.id }); });
         if (vm.iconVersion)
             item('Use default icon', true, function() { sendCmd('clearVmIcon', { vmId: vm.id }); });

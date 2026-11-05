@@ -270,6 +270,8 @@ ASB_API BOOL asb_get_auto_update_guest_tools(void);
 
 /* VM window preferences: stats (resolution, FPS, codec) in the title bar and
    the floating toolbar. Both on by default; saved with asb_save(). */
+/* Remove the installer ISO from a stopped VM (next start boots its disk). */
+ASB_API HRESULT asb_vm_eject_iso(AsbVm vm);
 ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar);
 ASB_API BOOL asb_get_viewer_title_stats(void);
 ASB_API BOOL asb_get_viewer_toolbar(void);

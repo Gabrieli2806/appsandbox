@@ -488,6 +488,8 @@ static DWORD WINAPI idd_probe_thread_proc(LPVOID param)
 
 static void idd_probe_start(VmInstance *vm)
 {
+    /* Manual-install VMs have no App Sandbox display driver. */
+    if (vm && _wcsicmp(vm->os_type, L"Other") == 0) return;
     /* The probe exists only to AUTO-OPEN the display in the GUI: it posts
        WM_VM_IDD_READY to g_idd_probe_hwnd when the VDD comes up. With no hwnd
        (the headless daemon) there is nothing to notify, and auto-opening a window
@@ -3427,7 +3429,10 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             }
         }
     }
-    {
+    /* "Other" = manual install: the user installs any OS from its ISO by
+       hand, so there is no account to create. */
+    BOOL manual = effective_os && _wcsicmp(effective_os, L"Other") == 0;
+    if (!manual) {
         const wchar_t *error = asb_validate_username(effective_os, config->username,
                                                     config->name, config->is_template);
         if (!error) error = asb_validate_password(effective_os, config->password);
@@ -3445,12 +3450,12 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     wcscpy_s(cfg.name, 256, config->name);
     if (effective_os) wcscpy_s(cfg.os_type, 32, effective_os);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
-    {
+    if (!manual) {
         size_t user_length;
         const wchar_t *user = trimmed_username(config->username, &user_length);
         wcsncpy_s(cfg.admin_user, ARRAYSIZE(cfg.admin_user), user, user_length);
+        wcscpy_s(cfg.admin_pass, ARRAYSIZE(cfg.admin_pass), config->password ? config->password : L"");
     }
-    wcscpy_s(cfg.admin_pass, ARRAYSIZE(cfg.admin_pass), config->password);
     cfg.ram_mb = config->ram_mb;
     cfg.hdd_gb = config->hdd_gb;
     cfg.cpu_cores = config->cpu_cores;
@@ -3481,6 +3486,25 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
        reject them, and we don't ship a MOK enrollment flow. */
     if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
         cfg.test_mode = TRUE;
+    }
+
+    /* Manual install: no guest agent, so no GPU driver copy, SSH or
+       App Sandbox display driver. Secure Boot stays off (most non-Windows
+       installers are not signed for it). The ISO is required. */
+    if (manual) {
+        cfg.gpu_mode = GPU_NONE;
+        cfg.gpu_id[0] = L'\0';
+        cfg.ssh_enabled = FALSE;
+        cfg.ssh_deploy_key = FALSE;
+        cfg.test_mode = FALSE;
+        if (config->is_template || from_template) {
+            asb_alert(L"Manual-install VMs cannot use or create templates.");
+            return E_INVALIDARG;
+        }
+        if (cfg.image_path[0] == L'\0') {
+            asb_alert(L"Choose the installer ISO for a manual install.");
+            return E_INVALIDARG;
+        }
     }
 
     if (is_template_create && from_template) {
@@ -3918,8 +3942,11 @@ build_failed:
       snapshot_init(&SNAP_AT(g_vm_count), sd); }
     g_vm_count++;
 
+    /* A manual-install VM has nothing for App Sandbox to provision: it is
+       "installed" from the start (the user installs the OS in its window). */
+    if (manual) inst->install_complete = TRUE;
     if (!is_template_create)
-        vm_save_state_json(cfg.vhdx_path, FALSE);
+        vm_save_state_json(cfg.vhdx_path, manual);
 
     /* Auto-start */
     asb_log(L"Starting VM \"%s\"...", cfg.name);
@@ -4792,6 +4819,21 @@ ASB_API void asb_set_auto_update_guest_tools(BOOL enabled)
 ASB_API BOOL asb_get_auto_update_guest_tools(void)
 {
     return g_auto_update_tools;
+}
+
+/* Detach the installer ISO (manual-install VMs keep it attached until the
+   user removes it). Takes effect at the next start; the VM must be off. */
+ASB_API HRESULT asb_vm_eject_iso(AsbVm vm)
+{
+    VmInstance *inst = asb_vm_instance(vm);
+    if (!inst) return E_INVALIDARG;
+    if (inst->running || inst->starting) return E_ACCESSDENIED;
+    if (!inst->image_path[0]) return S_FALSE;
+    asb_log(L"Installer ISO removed from \"%s\".", inst->name);
+    inst->image_path[0] = L'\0';
+    save_vm_list();
+    asb_events_changed();
+    return S_OK;
 }
 
 ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar)

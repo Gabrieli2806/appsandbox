@@ -570,6 +570,8 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
 void vm_agent_start(VmInstance *instance)
 {
+    /* Manual-install VMs have no App Sandbox guest agent. */
+    if (instance && _wcsicmp(instance->os_type, L"Other") == 0) return;
     AgentConn *conn;
     WSADATA wsa;
 

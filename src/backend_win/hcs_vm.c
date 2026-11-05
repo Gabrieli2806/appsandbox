@@ -1141,6 +1141,23 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             L"\"HorizontalResolution\":1024,"
             L"\"VerticalResolution\":768"
         L"},");
+    /* Manual-install VMs ("Other") have no App Sandbox display driver: their
+       screen is the Hyper-V basic console, served on \\.\pipe\<name>.BasicSession
+       to this user (vm_display.c connects to it with RDP). Works from UEFI
+       on, with no guest software. */
+    if (_wcsicmp(config->os_type, L"Other") == 0) {
+        wchar_t sid[128], pipe[MAX_PATH], pipe_esc[MAX_PATH * 2];
+        if (get_current_user_sid_string(sid, ARRAYSIZE(sid))) {
+            swprintf_s(pipe, MAX_PATH, L"\\\\.\\pipe\\%s.BasicSession", config->name);
+            escape_json_path(pipe, pipe_esc, ARRAYSIZE(pipe_esc));
+            swprintf_s(video_section, 2048,
+                L"\"VideoMonitor\":{"
+                    L"\"HorizontalResolution\":1920,"
+                    L"\"VerticalResolution\":1080,"
+                    L"\"ConnectionOptions\":{\"AccessSids\":[\"%s\"],\"NamedPipe\":\"%s\"}"
+                L"},", sid, pipe_esc);
+        }
+    }
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
        for Linux VMs. systemd's StandardOutput=journal+console writes
@@ -1681,6 +1698,19 @@ HRESULT hcs_stop_vm(VmInstance *instance)
         return S_OK;
     }
 
+    /* No agent (e.g. a manual-install VM): ask Hyper-V to shut the guest
+       down through its integration services; guests without them ignore it. */
+    if (pfnShutDown) {
+        HCS_OPERATION op = pfnCreateOp(NULL, NULL);
+        if (op) {
+            HRESULT hr = pfnShutDown(instance->handle, op, NULL);
+            hr = hcs_exec_and_wait(hr, op);
+            if (SUCCEEDED(hr)) {
+                ui_log(L"Shutdown requested through Hyper-V. Waiting for VM to exit...");
+                return S_OK;
+            }
+        }
+    }
     ui_log(L"Guest agent unavailable. Use Force Stop to terminate the VM.");
     return HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED);
 }

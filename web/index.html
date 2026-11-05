@@ -300,6 +300,7 @@
                     <option value="Windows" selected>Windows</option>
                     <option value="Linux">Linux</option>
                     <option value="macOS">macOS</option>
+                    <option value="Other">Other (manual install)</option>
                 </select>
             </div>
 
@@ -349,8 +350,8 @@
                 <span class="host-info" id="host-cpu"></span>
             </div>
 
-            <label for="gpu-mode">GPU:</label>
-            <div class="form-row">
+            <label for="gpu-mode" class="needs-agent">GPU:</label>
+            <div class="form-row needs-agent">
                 <select id="gpu-mode">
                     <option value="0">None</option>
                     <option value="1" selected>Default GPU</option>
@@ -369,14 +370,14 @@
                 <select id="net-adapter"></select>
             </div>
 
-            <label>Username:</label>
-            <div class="cred-row">
+            <label class="needs-agent">Username:</label>
+            <div class="cred-row needs-agent">
                 <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" required>
                 <span class="field-warn" id="admin-user-warn"></span>
             </div>
 
-            <label>Password:</label>
-            <div class="cred-row">
+            <label class="needs-agent">Password:</label>
+            <div class="cred-row needs-agent">
                 <input type="password" id="admin-pass" value="test123" required>
                 <label>Confirm:</label>
                 <input type="password" id="admin-confirm" value="test123" required>
@@ -384,12 +385,13 @@
                 <span class="field-warn" id="admin-pass-warn"></span>
             </div>
 
-            <label>Options:</label>
-            <div class="form-row">
+            <label class="needs-agent">Options:</label>
+            <div class="form-row needs-agent">
                 <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test Mode</label>
                 <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
                 <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
+            <p class="muted small manual-note" id="manual-note" hidden>Manual install: App Sandbox boots the ISO into an empty disk and opens the VM's console; you install the OS yourself. There is no GPU acceleration, shared clipboard, audio or adaptive resolution (those need App Sandbox's guest components). Secure Boot is off. With NAT, set the IP address shown in the VM's details by hand; Internal or External networking hands out addresses automatically. When the OS is installed, shut the VM down and choose "Remove installer ISO".</p>
         </div>
         </div>
         <div class="modal-buttons">

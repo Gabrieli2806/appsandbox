@@ -140,6 +140,19 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
   `drivers\ViGEmBus_setup.exe` ships with the guest components (not bundled
   by CI yet — third-party binary, needs an explicit decision).
 
+## 6b. Manual-install VMs (os type "Other")
+
+For OSes App Sandbox cannot provision: an empty disk plus the ISO, no
+account, no guest agent, GPU, SSH or display driver (`asb_vm_create` forces
+them off; `vm_agent_start` / `idd_probe_start` return early). The screen is
+the Hyper-V basic console: `hcs_vm.c` adds `VideoMonitor.ConnectionOptions`
+(`\\.\pipe\<name>.BasicSession`, ACL = current user) and `ui.c`
+`do_connect_vm` routes these VMs to the RDP viewer (`vm_display.c`). Secure
+Boot is skipped. `install_complete` is TRUE from creation. The ISO stays
+attached until "Remove installer ISO" (`asb_vm_eject_iso`). Shutdown falls
+back to `HcsShutDownComputeSystem`. Not yet: headless API create for
+"Other", import of "Other" exports, Secure Boot option.
+
 ## 7. UI ↔ C
 
 `web/app.js` → `sendCmd(action, data)` → `on_webview2_message` →
