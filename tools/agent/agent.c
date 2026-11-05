@@ -1599,6 +1599,10 @@ static void apply_pending_vdd_update(void)
     if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
 
     agent_log("VDD update: package staged by the host, installing.");
+    /* Remove the marker first: if the install crashes or hangs this service,
+       the next start must not try again in a loop. The host log shows how to
+       retry (Update guest components). */
+    DeleteFileW(marker);
     GetSystemDirectoryW(sys_dir, MAX_PATH);
     swprintf_s(cer, MAX_PATH, L"%s\\drivers\\AppSandboxVDD.cer", dir);
     if (GetFileAttributesW(cer) != INVALID_FILE_ATTRIBUTES) {
@@ -1621,8 +1625,26 @@ static void apply_pending_vdd_update(void)
         _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
                     "display driver update: devcon failed to launch (%lu)", GetLastError());
     }
-    if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
-        agent_log("VDD update: enable (exit %lu): %.200s", exit_code, output);
+    {
+        /* devcon exit codes: 0 done, 1 done but a restart is needed (the old
+           driver file was still in use), 2 failed. */
+        DWORD update_code = exit_code;
+        if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code))
+            agent_log("VDD update: enable (exit %lu): %.200s", exit_code, output);
+        if (update_code == 1) {
+            wchar_t restart[MAX_PATH + 96];
+            _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                        "display driver update installed; restarting the VM in 15 seconds to finish it.");
+            agent_log("VDD update: restart required, restarting in 15 s.");
+            swprintf_s(restart, ARRAYSIZE(restart),
+                       L"\"%s\\shutdown.exe\" /r /t 15 /d p:2:4 /c \"App Sandbox: finishing the display driver update\"",
+                       sys_dir);
+            run_logged(restart, "VDD update: restart");
+        } else if (update_code == 0) {
+            _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+                        "display driver updated.");
+        }
+    }
     {
         /* Flatten line breaks for the one-line host log. */
         char *c;
@@ -1633,9 +1655,6 @@ static void apply_pending_vdd_update(void)
         g_vdd_update_note[0] = '\0';
     }
 
-    /* Remove the marker either way: retrying a failing install on every boot
-       would only repeat the failure. The host log shows how to retry. */
-    DeleteFileW(marker);
 }
 
 /* ---- Controllers: ViGEmBus (virtual Xbox 360 pads) ----

@@ -134,6 +134,7 @@ struct VmClipboardData {
 
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
+    UINT64           recv_budget;          /* bytes still accepted in this guest->host transfer */
 };
 
 /* ---- Logging ---- */
@@ -257,7 +258,11 @@ static void clip_remove_dir_recursive(const wchar_t *dir)
         wchar_t path[MAX_PATH];
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
         swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
+            /* A junction/link: remove the link itself, never its target. */
+            if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(path);
+            else DeleteFileW(path);
+        } else if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
             clip_remove_dir_recursive(path);
         else
             DeleteFileW(path);
@@ -284,13 +289,46 @@ static void clip_ensure_parent_dir(const wchar_t *file_path)
     CreateDirectoryW(dir, NULL);
 }
 
-static BOOL clip_path_is_safe(const wchar_t *rel_path)
+/* A relative path from the guest: plain components only. No "..", no
+   drive or stream syntax (':'), no wildcards or other characters Windows
+   reserves, no trailing dots/spaces, no device names (CON, NUL, COM1...). */
+static BOOL clip_component_is_safe(const wchar_t *c, size_t n)
 {
-    if (wcsstr(rel_path, L"..")) return FALSE;
-    if (rel_path[0] == L'\\' || rel_path[0] == L'/') return FALSE;
-    if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
+    static const wchar_t *const reserved[] = {
+        L"CON", L"PRN", L"AUX", L"NUL",
+        L"COM1", L"COM2", L"COM3", L"COM4", L"COM5", L"COM6", L"COM7", L"COM8", L"COM9",
+        L"LPT1", L"LPT2", L"LPT3", L"LPT4", L"LPT5", L"LPT6", L"LPT7", L"LPT8", L"LPT9"
+    };
+    size_t i, base = n;
+    if (n == 0 || n > 255) return FALSE;
+    if ((n == 1 && c[0] == L'.') || (n == 2 && c[0] == L'.' && c[1] == L'.')) return FALSE;
+    if (c[n - 1] == L'.' || c[n - 1] == L' ') return FALSE;
+    for (i = 0; i < n; i++) {
+        if (c[i] < 32 || wcschr(L"<>:\"/|?*", c[i])) return FALSE;
+        if (c[i] == L'.' && base == n) base = i;
+    }
+    for (i = 0; i < ARRAYSIZE(reserved); i++)
+        if (wcslen(reserved[i]) == base && _wcsnicmp(c, reserved[i], base) == 0) return FALSE;
     return TRUE;
 }
+
+static BOOL clip_path_is_safe(const wchar_t *rel_path)
+{
+    const wchar_t *start = rel_path, *p;
+    if (!rel_path[0] || rel_path[0] == L'\\') return FALSE;
+    if (wcslen(rel_path) > MAX_PATH - 50) return FALSE;
+    for (p = rel_path; ; p++) {
+        if (*p == L'\\' || *p == L'\0') {
+            if (!clip_component_is_safe(start, (size_t)(p - start))) return FALSE;
+            if (*p == L'\0') break;
+            start = p + 1;
+        }
+    }
+    return TRUE;
+}
+
+/* Most a guest may send in one copy (all files together). */
+#define CLIP_MAX_TRANSFER_BYTES (16ULL * 1024 * 1024 * 1024)
 
 /* ---- File transfer: host->guest (send files from host clipboard) ---- */
 
@@ -845,6 +883,33 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
     if (!clip_recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
     rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
 
+    /* Accept files only while guest->host sharing is on, within the
+       per-copy budget, and only if the host disk keeps 1 GB free; anything
+       else is read off the wire and dropped. */
+    {
+        BOOL accept = clip->sync_enabled && clip->share_guest_to_host;
+        ULARGE_INTEGER free_bytes;
+        if (accept && !fi.is_directory) {
+            if (fi.file_size > clip->recv_budget) {
+                accept = FALSE;
+                clip_log(clip, L"Clipboard: file from the VM dropped (copy exceeds the size limit).");
+            } else if (GetDiskFreeSpaceExW(clip->temp_dir, &free_bytes, NULL, NULL) &&
+                       free_bytes.QuadPart < fi.file_size + 1024ULL * 1024 * 1024) {
+                accept = FALSE;
+                clip_log(clip, L"Clipboard: file from the VM dropped (not enough free disk space).");
+            } else {
+                clip->recv_budget -= fi.file_size;
+            }
+        }
+        if (!accept) {
+            BYTE skip[4096];
+            UINT64 rem = fi.file_size;
+            while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
+              if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; }
+            return TRUE;
+        }
+    }
+
     if (!clip_path_is_safe(rel_path)) {
         BYTE skip[4096];
         UINT64 rem = fi.file_size;
@@ -862,21 +927,33 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
         HANDLE hFile;
         clip_ensure_parent_dir(full_path);
         hFile = CreateFileW(full_path, GENERIC_WRITE, 0, NULL,
-                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (hFile != INVALID_HANDLE_VALUE) {
             UINT64 remaining = fi.file_size;
+            BOOL write_ok = TRUE;
             BYTE *chunk = (BYTE *)HeapAlloc(GetProcessHeap(), 0, CLIP_FILE_CHUNK);
             if (!chunk) { CloseHandle(hFile); return FALSE; }
             while (remaining > 0) {
                 DWORD to_read = remaining > CLIP_FILE_CHUNK ? CLIP_FILE_CHUNK : (DWORD)remaining;
-                DWORD written;
+                DWORD written = 0;
                 if (!clip_recv_exact(s, chunk, (int)to_read)) {
                     HeapFree(GetProcessHeap(), 0, chunk);
                     CloseHandle(hFile);
+                    DeleteFileW(full_path);
                     return FALSE;
                 }
-                WriteFile(hFile, chunk, to_read, &written, NULL);
+                /* Keep reading the stream after a write error (disk full),
+                   but stop writing and drop the partial file. */
+                if (write_ok && (!WriteFile(hFile, chunk, to_read, &written, NULL) || written != to_read))
+                    write_ok = FALSE;
                 remaining -= to_read;
+            }
+            if (!write_ok) {
+                CloseHandle(hFile);
+                DeleteFileW(full_path);
+                clip_log(clip, L"Clipboard: could not write a file from the VM (disk full?).");
+                HeapFree(GetProcessHeap(), 0, chunk);
+                return TRUE;
             }
             HeapFree(GetProcessHeap(), 0, chunk);
             CloseHandle(hFile);
@@ -935,6 +1012,7 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
     switch (hdr->msg_type) {
 
     case CLIP_MSG_FORMAT_LIST: {
+        clip->recv_budget = CLIP_MAX_TRANSFER_BYTES;   /* a new copy from the guest */
         BYTE *buf;
         UINT32 count, i;
         int off;
@@ -1145,7 +1223,11 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
     clip->push_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
     GetTempPathW(MAX_PATH, tmp);
-    swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip", tmp);
+    /* One folder per VM: two running VMs must not clear each other's
+       transfers. */
+    swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip-%08lX%04X", tmp,
+               runtime_id ? runtime_id->Data1 : GetCurrentProcessId(),
+               runtime_id ? runtime_id->Data2 : 0);
     CreateDirectoryW(clip->temp_dir, NULL);
 
     /* Initial writer connection */

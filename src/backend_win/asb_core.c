@@ -14,6 +14,8 @@
 #include "hcn_network.h"
 #include "disk_util.h"
 #include "d3dlayers.h"
+#include <aclapi.h>
+#include <sddl.h>
 #include "snapshot.h"
 #include "guest_tools.h"
 
@@ -590,6 +592,38 @@ static void get_config_path(wchar_t *out, size_t out_len)
    public-key line in pubkey_out (newline-trimmed). ed25519 keeps the public key
    short enough to fit the agent's command buffer. The private key stays host-side
    so clients can connect with `ssh -i id_appsandbox`. Returns TRUE on success. */
+/* Restrict a path holding secrets (the SSH private key) to SYSTEM,
+   Administrators and the user running App Sandbox, without inheriting the
+   ProgramData default that lets every local user read. */
+static void restrict_to_owner(const wchar_t *path, BOOL dir)
+{
+    HANDLE token = NULL;
+    BYTE buf[256];
+    DWORD len = 0;
+    LPWSTR sid = NULL;
+    wchar_t sddl[512], tmp[MAX_PATH];
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE;
+
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return;
+    if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len))
+        ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &sid);
+    CloseHandle(token);
+    if (!sid) return;
+    swprintf_s(sddl, ARRAYSIZE(sddl), dir ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)"
+                                          : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)", sid);
+    LocalFree(sid);
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL)) return;
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl) {
+        wcscpy_s(tmp, MAX_PATH, path);
+        SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                              NULL, NULL, dacl, NULL);
+    }
+    LocalFree(sd);
+}
+
 static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 {
     wchar_t base[MAX_PATH], ssh_dir[MAX_PATH], priv[MAX_PATH], pub[MAX_PATH];
@@ -609,6 +643,7 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
         swprintf_s(dir1, MAX_PATH, L"%s\\AppSandbox", base);
         CreateDirectoryW(dir1, NULL);
         CreateDirectoryW(ssh_dir, NULL);
+        restrict_to_owner(ssh_dir, TRUE);
         DeleteFileW(priv);   /* avoid ssh-keygen's interactive overwrite prompt on a partial key */
         GetSystemDirectoryW(sysdir, MAX_PATH);
         swprintf_s(keygen, MAX_PATH, L"%s\\OpenSSH\\ssh-keygen.exe", sysdir);
@@ -637,6 +672,9 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
         }
         asb_log(L"ssh key: generated AppSandbox keypair at %s", priv);
     }
+    /* Also tightens keys made by older versions. */
+    restrict_to_owner(ssh_dir, TRUE);
+    restrict_to_owner(priv, FALSE);
 
     if (_wfopen_s(&f, pub, L"r") != 0 || !f) {
         asb_log(L"ssh key: cannot read public key %s", pub);

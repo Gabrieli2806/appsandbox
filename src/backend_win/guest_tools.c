@@ -233,20 +233,48 @@ static BOOL volume_hibernated(const wchar_t *vol)
     HANDLE f;
     swprintf_s(path, MAX_PATH, L"%shiberfil.sys", vol);
     f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+                    NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
     if (f == INVALID_HANDLE_VALUE) return FALSE;
     ReadFile(f, sig, sizeof(sig), &got, NULL);
     CloseHandle(f);
     return got == sizeof(sig) && _strnicmp(sig, "HIBR", 4) == 0;
 }
 
+/* The VM's disk is mounted on the host with this process's administrator
+   rights, and its contents are controlled by the guest. A junction or
+   symbolic link planted in the guest (e.g. Windows\AppSandbox -> C:\Windows)
+   would resolve to the HOST's paths. Refuse every reparse point on the way
+   to what we write. Missing components are fine (they are created). */
+static BOOL guest_path_safe(const wchar_t *vol, const wchar_t *rel)
+{
+    wchar_t path[MAX_PATH], part[MAX_PATH], *ctx = NULL, *tok;
+    DWORD a;
+    wcscpy_s(path, MAX_PATH, vol);                /* "\\?\Volume{...}\" */
+    wcscpy_s(part, MAX_PATH, rel);
+    for (tok = wcstok_s(part, L"\\", &ctx); tok; tok = wcstok_s(NULL, L"\\", &ctx)) {
+        size_t n = wcslen(path);
+        if (n && path[n - 1] != L'\\') wcscat_s(path, MAX_PATH, L"\\");
+        wcscat_s(path, MAX_PATH, tok);
+        a = GetFileAttributesW(path);
+        if (a == INVALID_FILE_ATTRIBUTES) continue;
+        if (a & FILE_ATTRIBUTE_REPARSE_POINT) return FALSE;
+    }
+    return TRUE;
+}
+
 static BOOL copy_into(const wchar_t *src_dir, const wchar_t *name, const wchar_t *dst_dir,
                       wchar_t *err, size_t err_cap)
 {
     wchar_t src[MAX_PATH], dst[MAX_PATH];
+    DWORD a;
     swprintf_s(src, MAX_PATH, L"%s\\%s", src_dir, name);
     swprintf_s(dst, MAX_PATH, L"%s\\%s", dst_dir, name);
     if (GetFileAttributesW(src) == INVALID_FILE_ATTRIBUTES) return TRUE;  /* optional helper */
+    a = GetFileAttributesW(dst);
+    if (a != INVALID_FILE_ATTRIBUTES && (a & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY))) {
+        swprintf_s(err, err_cap, L"%s in the VM is a link or folder; the update was refused for safety.", name);
+        return FALSE;
+    }
     SetFileAttributesW(dst, FILE_ATTRIBUTE_NORMAL);
     if (!CopyFileW(src, dst, FALSE)) {
         swprintf_s(err, err_cap, L"Could not copy %s into the VM (error %lu).", name, GetLastError());
@@ -317,9 +345,20 @@ HRESULT guest_tools_update(VmInstance *vm, wchar_t *err, size_t err_cap)
         goto done;
     }
 
+    if (!guest_path_safe(vol, L"Windows\\AppSandbox\\drivers\\" VDD_PENDING_MARKER)) {
+        wcscpy_s(err, err_cap, L"The VM's App Sandbox folder contains a link (junction or symbolic link); "
+                               L"the update was refused for safety. Remove the link inside the VM.");
+        hr = E_ACCESSDENIED;
+        goto done;
+    }
     swprintf_s(app_dir, MAX_PATH, L"%sWindows\\AppSandbox", vol);
     swprintf_s(drv_dir, MAX_PATH, L"%s\\drivers", app_dir);
     CreateDirectoryW(drv_dir, NULL);
+    if (!guest_path_safe(vol, L"Windows\\AppSandbox\\drivers")) {   /* re-check after creating */
+        wcscpy_s(err, err_cap, L"The VM's App Sandbox folder contains a link; the update was refused.");
+        hr = E_ACCESSDENIED;
+        goto done;
+    }
 
     for (i = 0; i < (int)ARRAYSIZE(g_guest_bins); i++)
         if (!copy_into(res, g_guest_bins[i], app_dir, err, err_cap)) goto done;
@@ -331,7 +370,9 @@ HRESULT guest_tools_update(VmInstance *vm, wchar_t *err, size_t err_cap)
 
     swprintf_s(marker, MAX_PATH, L"%s\\%s", drv_dir, VDD_PENDING_MARKER);
     {
-        HANDLE m = CreateFileW(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+        /* FILE_FLAG_OPEN_REPARSE_POINT: never follow a link planted as the marker. */
+        HANDLE m = CreateFileW(marker, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                               FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (m == INVALID_HANDLE_VALUE) {
             swprintf_s(err, err_cap, L"Could not schedule the display driver update (error %lu).", GetLastError());
             goto done;

@@ -137,7 +137,7 @@ static BOOL load_dlls(void)
 {
     if (g_dlls_loaded) return TRUE;
 
-    g_rdpbase = LoadLibraryW(L"RdpBase.dll");
+    g_rdpbase = LoadLibraryExW(L"RdpBase.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_rdpbase) {
         ui_log(L"Error: Failed to load RdpBase.dll (0x%08X)", GetLastError());
         return FALSE;
@@ -149,7 +149,7 @@ static BOOL load_dlls(void)
         return FALSE;
     }
 
-    g_atl = LoadLibraryW(L"atl.dll");
+    g_atl = LoadLibraryExW(L"atl.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_atl) {
         ui_log(L"Error: Failed to load atl.dll (0x%08X)", GetLastError());
         return FALSE;

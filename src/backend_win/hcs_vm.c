@@ -149,6 +149,27 @@ static void escape_json_path(const wchar_t *in, wchar_t *out, size_t out_size)
    ConnectionOptions.AccessSids array. Returns TRUE on success.
    OpenProcessToken -> GetTokenInformation(TokenUser) -> ConvertSidToStringSidW.
    Caches the result since the process user can't change at runtime. */
+/* Replace a disk file's DACL with SYSTEM + Administrators full access plus
+   whatever the folder passes down, so GrantVmAccess can add the VM's own
+   account again. (A NULL DACL would mean Everyone: Full Control.) */
+static void reset_disk_dacl(const wchar_t *path)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE;
+    wchar_t tmp[MAX_PATH];
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            L"D:(A;;FA;;;SY)(A;;FA;;;BA)", SDDL_REVISION_1, &sd, NULL))
+        return;
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl) {
+        wcscpy_s(tmp, MAX_PATH, path);
+        SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
+                              DACL_SECURITY_INFORMATION | UNPROTECTED_DACL_SECURITY_INFORMATION,
+                              NULL, NULL, dacl, NULL);
+    }
+    LocalFree(sd);
+}
+
 static BOOL get_current_user_sid_string(wchar_t *out, size_t out_chars)
 {
     static wchar_t cached[128] = {0};
@@ -661,7 +682,7 @@ BOOL hcs_init(void)
 {
     g_ui_thread_id = GetCurrentThreadId();
 
-    g_hcs_dll = LoadLibraryW(L"computecore.dll");
+    g_hcs_dll = LoadLibraryExW(L"computecore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_hcs_dll)
         return FALSE;
 
@@ -1367,9 +1388,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
         grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
         if (FAILED(grant_hr)) {
             ui_log(L"GrantVmAccess failed on VHDX (0x%08X), resetting DACL...", grant_hr);
-            { wchar_t tmp[MAX_PATH]; wcscpy_s(tmp, MAX_PATH, config->vhdx_path);
-            SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL); }
+            reset_disk_dacl(config->vhdx_path);
             grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
@@ -1462,9 +1481,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
         grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
         if (FAILED(grant_hr)) {
             ui_log(L"GrantVmAccess failed on VHDX (0x%08X), resetting DACL...", grant_hr);
-            { wchar_t tmp[MAX_PATH]; wcscpy_s(tmp, MAX_PATH, config->vhdx_path);
-            SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
-                DACL_SECURITY_INFORMATION, NULL, NULL, NULL, NULL); }
+            reset_disk_dacl(config->vhdx_path);
             grant_hr = pfnGrantAccess(config->name, config->vhdx_path);
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);

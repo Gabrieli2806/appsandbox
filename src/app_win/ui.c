@@ -749,8 +749,18 @@ static void ui_log_post(const wchar_t *msg)
 static void ui_show_alert(const wchar_t *message)
 {
     if (GetCurrentThreadId() == g_ui_thread_id) {
-        wchar_t buf[1024];
-        swprintf_s(buf, 1024, L"{\"type\":\"alert\",\"message\":\"%s\"}", message);
+        /* Escape the text: messages can contain VM names and paths. */
+        wchar_t buf[2048], esc[1800];
+        size_t i, n = 0;
+        for (i = 0; message[i] && n + 7 < ARRAYSIZE(esc); i++) {
+            wchar_t c = message[i];
+            if (c == L'"' || c == L'\\') { esc[n++] = L'\\'; esc[n++] = c; }
+            else if (c == L'\n') { esc[n++] = L'\\'; esc[n++] = L'n'; }
+            else if (c < 32) { swprintf_s(esc + n, ARRAYSIZE(esc) - n, L"\\u%04x", c); n += 6; }
+            else esc[n++] = c;
+        }
+        esc[n] = 0;
+        swprintf_s(buf, ARRAYSIZE(buf), L"{\"type\":\"alert\",\"message\":\"%s\"}", esc);
         webview2_post(buf);
     } else if (g_hwnd_main) {
         size_t len = wcslen(message) + 1;
