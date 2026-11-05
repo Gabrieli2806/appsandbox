@@ -7,6 +7,7 @@
 #include "ui.h"
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 
 #pragma comment(lib, "ws2_32.lib")
 
@@ -43,6 +44,18 @@ void vm_agent_set_hwnd(HWND hwnd)
 
 /* ---- Per-VM connection state ---- */
 
+/* Longest line accepted from the agent, including the terminating NUL. The
+   Windows agent's longest line is "log:" plus a 1023-character message, so
+   every line it sends fits; longer lines are discarded (see recv_line). */
+#define AGENT_LINE_MAX 2048
+
+/* How long a tagged command waits for its reply before the connection is
+   treated as dead and re-established. The agent handles commands one at a
+   time and can be busy for a while (devcon runs, netsh calls, restarting its
+   helpers on idd_connect); other lines (heartbeat, log:, gpu_copy_*, ...) are
+   still read and handled while waiting. */
+#define AGENT_REPLY_TIMEOUT_MS 30000
+
 typedef struct AgentConn {
     /* Stable VM identifier; survives g_vms[] compaction. The actual
        VmInstance* is resolved via asb_find_vm_by_id() at each use. */
@@ -52,10 +65,16 @@ typedef struct AgentConn {
     volatile BOOL  stop;
     /* Command synchronization */
     volatile BOOL  cmd_pending;
+    volatile LONG  cmd_gen;      /* Bumped by vm_agent_send for every queued command */
     HANDLE         cmd_done;     /* Event: signaled when response is ready */
     char           cmd[64];
-    char           rsp[256];
+    char           rsp[AGENT_LINE_MAX];
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
+    /* Why the current connection dropped, for the host log. Not logged when
+       it ended normally (os_shutdown, service_stopping, vm_agent_stop). */
+    wchar_t        drop_reason[160];
+    BOOL           drop_expected;    /* agent announced os_shutdown / service_stopping */
+    BOOL           overlong_logged;  /* an over-long line was reported on this connection */
 } AgentConn;
 
 #define MAX_AGENTS 16
@@ -98,19 +117,38 @@ static void free_conn(AgentConn *conn)
 
 /* ---- Line I/O ---- */
 
-/* Read a single line (up to \n) from socket. Returns length, 0 on close, -1 on error. */
-static int recv_line(SOCKET s, char *buf, int buf_size)
+/* Read one line (up to \n) from the socket into buf, without the line end
+   (\r is dropped). Returns 1 when a line was read (buf may be empty), 0 when
+   the peer closed the socket, -1 on a socket error (WSAGetLastError() has
+   the code). A line that does not fit in buf is read up to its \n and
+   discarded: buf comes back empty and *discarded is set, so no part of it is
+   handled as a line of its own. */
+static int recv_line(SOCKET s, char *buf, int buf_size, BOOL *discarded)
 {
     int pos = 0;
-    while (pos < buf_size - 1) {
+    BOOL overflow = FALSE;
+
+    if (discarded) *discarded = FALSE;
+    for (;;) {
         char c;
         int n = recv(s, &c, 1, 0);
-        if (n <= 0) return n;
+        if (n <= 0) {
+            buf[overflow ? 0 : pos] = '\0';
+            return n;
+        }
         if (c == '\n') break;
-        if (c != '\r') buf[pos++] = c;
+        if (c == '\r') continue;
+        if (pos < buf_size - 1)
+            buf[pos++] = c;
+        else
+            overflow = TRUE;
+    }
+    if (overflow) {
+        pos = 0;
+        if (discarded) *discarded = TRUE;
     }
     buf[pos] = '\0';
-    return pos;
+    return 1;
 }
 
 static int send_line(SOCKET s, const char *msg)
@@ -121,6 +159,60 @@ static int send_line(SOCKET s, const char *msg)
     if (n <= 0) return n;
     n = send(s, "\n", 1, 0);
     return n;
+}
+
+/* Remember why the connection is about to drop; agent_thread_proc logs it
+   after "Agent offline". */
+static void set_drop_reason(AgentConn *conn, const wchar_t *fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf_s(conn->drop_reason, ARRAYSIZE(conn->drop_reason), _TRUNCATE, fmt, ap);
+    va_end(ap);
+}
+
+/* recv_line on a connected agent socket: reports over-long lines once per
+   connection and records why a failed read drops the connection. Same
+   return values as recv_line. */
+static int read_agent_line(AgentConn *conn, VmInstance *vm, SOCKET s,
+                           char *buf, int buf_size)
+{
+    BOOL discarded;
+    int n = recv_line(s, buf, buf_size, &discarded);
+
+    if (n == 0) {
+        set_drop_reason(conn, L"the agent closed the connection");
+    } else if (n < 0) {
+        set_drop_reason(conn, L"receive error %d", WSAGetLastError());
+    } else if (discarded && !conn->overlong_logged) {
+        conn->overlong_logged = TRUE;
+        ui_log(L"Agent for \"%s\" sent a line longer than %d bytes; "
+               L"ignoring over-long lines on this connection.",
+               vm->name, buf_size - 1);
+    }
+    return n;
+}
+
+/* Wait up to timeout_ms for data (or the peer's close) on the agent socket.
+   Returns 1 when readable, 0 on timeout, -1 on a socket error (recorded as
+   the drop reason). */
+static int wait_readable(AgentConn *conn, SOCKET s, DWORD timeout_ms)
+{
+    fd_set rfds;
+    struct timeval tv;
+    int ret;
+
+    FD_ZERO(&rfds);
+    FD_SET(s, &rfds);
+    tv.tv_sec = (long)(timeout_ms / 1000);
+    tv.tv_usec = (long)((timeout_ms % 1000) * 1000);
+
+    ret = select(0, &rfds, NULL, NULL, &tv);
+    if (ret < 0) {
+        set_drop_reason(conn, L"waiting for data failed (error %d)", WSAGetLastError());
+        return -1;
+    }
+    return ret > 0 ? 1 : 0;
 }
 
 /* ---- RuntimeId lookup ---- */
@@ -329,35 +421,65 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
     return 0;
 }
 
-/* Send a tagged command and wait for the tagged response.
-   Processes any interleaved async messages while waiting.
-   Returns: response length on success, 0 on close, -1 on error. */
-static int send_tagged_cmd(SOCKET s, VmInstance *vm, unsigned int *seq,
+/* Send a tagged command and wait up to AGENT_REPLY_TIMEOUT_MS for the tagged
+   response. Processes any interleaved async messages while waiting.
+   Returns: 1 on success (response, tag stripped, in rsp; may be empty),
+   0 on close, -1 on error, reply timeout or stop request. On 0/-1 the
+   connection must be dropped; conn->drop_reason says why. */
+static int send_tagged_cmd(AgentConn *conn, SOCKET s, VmInstance *vm,
                            const char *cmd, char *rsp, int rsp_size)
 {
     char tagged[512];
     char prefix[32];
     int pfx_len, n;
+    ULONGLONG deadline;
 
-    (*seq)++;
-    sprintf_s(tagged, sizeof(tagged), "%u:%s", *seq, cmd);
-    sprintf_s(prefix, sizeof(prefix), "%u:", *seq);
+    conn->cmd_seq++;
+    sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, cmd);
+    sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
     pfx_len = (int)strlen(prefix);
 
-    if (send_line(s, tagged) <= 0) return -1;
+    if (send_line(s, tagged) <= 0) {
+        set_drop_reason(conn, L"sending %S failed (error %d)", cmd, WSAGetLastError());
+        return -1;
+    }
 
+    deadline = GetTickCount64() + AGENT_REPLY_TIMEOUT_MS;
     for (;;) {
-        n = recv_line(s, rsp, rsp_size);
+        ULONGLONG now = GetTickCount64();
+        int rc;
+
+        /* vm_agent_stop also closes the socket; leave without a reason. */
+        if (conn->stop) return -1;
+
+        if (now >= deadline) {
+            ui_log(L"Agent for \"%s\" did not answer %S within %d s; reconnecting.",
+                   vm->name, cmd, AGENT_REPLY_TIMEOUT_MS / 1000);
+            set_drop_reason(conn, L"no reply to %S within %d s",
+                            cmd, AGENT_REPLY_TIMEOUT_MS / 1000);
+            return -1;
+        }
+
+        /* Wait in short slices so a stop request is noticed promptly. */
+        n = wait_readable(conn, s, (deadline - now < 200) ? (DWORD)(deadline - now) : 200);
+        if (n < 0) return -1;
+        if (n == 0) continue;
+
+        n = read_agent_line(conn, vm, s, rsp, rsp_size);
         if (n <= 0) return n;
 
         if (strncmp(rsp, prefix, pfx_len) == 0) {
             /* Tagged response - strip prefix */
             memmove(rsp, rsp + pfx_len, strlen(rsp + pfx_len) + 1);
-            return (int)strlen(rsp);
+            return 1;
         }
 
-        /* Untagged = async message, process inline */
-        process_async_message(vm, s, rsp);
+        /* Untagged = async message, process inline. os_shutdown and
+           service_stopping keep the wait going (the socket closes soon) but
+           make that drop a normal one. */
+        rc = process_async_message(vm, s, rsp);
+        if (rc == 1 || rc == 2)
+            conn->drop_expected = TRUE;
     }
 }
 
@@ -373,7 +495,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
        cleanly. Pointer freshness is now guaranteed for the body of
        each iteration; we never stash a stale &g_vms[idx]. */
     while (!conn->stop && (vm = asb_find_vm_by_id(conn->vm_id)) != NULL) {
-        char buf[256];
+        char buf[AGENT_LINE_MAX];
         int n;
         SOCKET s;
 
@@ -388,9 +510,12 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         }
 
         conn->sock = s;
+        conn->drop_reason[0] = L'\0';
+        conn->drop_expected = FALSE;
+        conn->overlong_logged = FALSE;
 
         /* Wait for hello from agent */
-        n = recv_line(s, buf, sizeof(buf));
+        n = recv_line(s, buf, sizeof(buf), NULL);
         if (n <= 0 || strcmp(buf, "hello") != 0) {
             closesocket(s);
             conn->sock = INVALID_SOCKET;
@@ -416,11 +541,11 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             char ip_cmd[64];
             sprintf_s(ip_cmd, sizeof(ip_cmd), "set_ip:%s/24:%s.1",
                        vm->nat_ip, hcn_nat_subnet_base());
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, ip_cmd, buf, sizeof(buf));
+            n = send_tagged_cmd(conn, s, vm, ip_cmd, buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"NAT IP config for \"%s\": %S", vm->name, buf);
         } else if (vm->network_mode == NET_EXTERNAL || vm->network_mode == NET_INTERNAL) {
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "set_dhcp", buf, sizeof(buf));
+            n = send_tagged_cmd(conn, s, vm, "set_dhcp", buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             ui_log(L"DHCP network config for \"%s\": %S", vm->name, buf);
         }
@@ -457,7 +582,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         /* Request SSH install/enable if configured */
         if (vm->ssh_enabled) {
-            n = send_tagged_cmd(s, vm, &conn->cmd_seq, "ssh_enable", buf, sizeof(buf));
+            n = send_tagged_cmd(conn, s, vm, "ssh_enable", buf, sizeof(buf));
             if (n <= 0) goto disconnected;
             if (strcmp(buf, "ssh_ready") == 0) {
                 vm->ssh_state = 2;
@@ -478,60 +603,47 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         /* Connected - read loop */
         while (!conn->stop) {
-            fd_set rfds;
-            struct timeval tv;
             int ret;
 
             /* Check for pending command first */
             if (conn->cmd_pending) {
-                char tagged[512];
-                conn->cmd_seq++;
-                sprintf_s(tagged, sizeof(tagged), "%u:%s", conn->cmd_seq, conn->cmd);
-                if (send_line(s, tagged) <= 0) break;
-                /* Read lines until we get our tagged response */
-                for (;;) {
-                    n = recv_line(s, conn->rsp, sizeof(conn->rsp));
-                    if (n <= 0) {
-                        conn->rsp[0] = '\0';
-                        conn->cmd_pending = FALSE;
-                        SetEvent(conn->cmd_done);
-                        goto disconnected;
-                    }
-                    /* Check for our sequence tag */
-                    {
-                        char prefix[32];
-                        int pfx_len;
-                        sprintf_s(prefix, sizeof(prefix), "%u:", conn->cmd_seq);
-                        pfx_len = (int)strlen(prefix);
-                        if (strncmp(conn->rsp, prefix, pfx_len) == 0) {
-                            /* Tagged response - strip prefix */
-                            memmove(conn->rsp, conn->rsp + pfx_len, strlen(conn->rsp + pfx_len) + 1);
-                            break;
-                        }
-                    }
-                    /* Untagged = async message, process inline */
-                    process_async_message(vm, s, conn->rsp);
+                /* Work on a copy: a caller that gave up waiting may queue a
+                   newer command into conn->cmd while this one is in flight. */
+                char cmd[sizeof(conn->cmd)];
+                LONG gen = conn->cmd_gen;
+                memcpy(cmd, conn->cmd, sizeof(cmd));
+                cmd[sizeof(cmd) - 1] = '\0';
+
+                /* Send it and read lines until we get our tagged response */
+                n = send_tagged_cmd(conn, s, vm, cmd, conn->rsp, sizeof(conn->rsp));
+                if (n <= 0) {
+                    conn->rsp[0] = '\0';
+                    conn->cmd_pending = FALSE;
+                    SetEvent(conn->cmd_done);
+                    goto disconnected;
                 }
-                conn->cmd_pending = FALSE;
-                SetEvent(conn->cmd_done);
+                /* A newer command queued meanwhile stays pending and is sent
+                   on the next pass; only this command's request completes. */
+                if (conn->cmd_gen == gen) {
+                    conn->cmd_pending = FALSE;
+                    SetEvent(conn->cmd_done);
+                }
                 continue;
             }
 
             /* Wait for data with 200ms timeout */
-            FD_ZERO(&rfds);
-            FD_SET(s, &rfds);
-            tv.tv_sec = 0;
-            tv.tv_usec = 200000;
-
-            ret = select(0, &rfds, NULL, NULL, &tv);
+            ret = wait_readable(conn, s, 200);
             if (ret < 0) break;
             if (ret == 0) continue; /* timeout - loop back to check cmd_pending/stop */
 
-            n = recv_line(s, buf, sizeof(buf));
+            n = read_agent_line(conn, vm, s, buf, sizeof(buf));
             if (n <= 0) break; /* connection lost */
 
             { int rc = process_async_message(vm, s, buf);
-              if (rc == 1 || rc == 2) break;   /* os_shutdown or service_stopping - reconnect loop will retry */
+              if (rc == 1 || rc == 2) {   /* os_shutdown or service_stopping - reconnect loop will retry */
+                  conn->drop_expected = TRUE;
+                  break;
+              }
             }
         }
 
@@ -549,6 +661,10 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
                 closesocket(old);
         }
         ui_log(L"Agent offline for \"%s\".", vm->name);
+        /* Say why, unless the agent announced it (os_shutdown,
+           service_stopping) or the host stopped the connection. */
+        if (!conn->stop && !conn->drop_expected && conn->drop_reason[0])
+            ui_log(L"Agent connection for \"%s\" dropped: %s.", vm->name, conn->drop_reason);
         notify_agent_status(vm);
 
         /* Wake up any blocked command sender */
@@ -636,7 +752,11 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
     /* Hand the command to the connection thread (it owns the socket and is the
        sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
        so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). */
+       per VM only one caller exists (shutdown). A caller that gives up waiting
+       does not stop the connection thread waiting for that reply (up to
+       AGENT_REPLY_TIMEOUT_MS); a command queued meanwhile bumps cmd_gen, stays
+       pending and is sent once that reply is in. */
+    InterlockedIncrement(&conn->cmd_gen);
     ResetEvent(conn->cmd_done);
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
     conn->cmd_pending = TRUE;
@@ -653,7 +773,9 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 
     /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
-       SetEvent()s cmd_done with an empty rsp on recv<=0, so we return FALSE. */
+       SetEvent()s cmd_done with an empty rsp when the connection drops (closed,
+       socket error, or no reply within AGENT_REPLY_TIMEOUT_MS), so we return
+       FALSE. */
     if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
         ui_log(L"Agent: command \"%S\" timed out", command);
         conn->cmd_pending = FALSE;
