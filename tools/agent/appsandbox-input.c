@@ -70,38 +70,99 @@ static void switch_to_input_desktop(void)
     }
 }
 
-/* ---- Screen size for absolute mouse moves ----
+/* ---- Where the AppSandbox display sits on the guest desktop ----
  *
- * The host sends positions in guest pixels; MOUSEEVENTF_ABSOLUTE wants them
- * normalised to the primary display. GetSystemMetrics(SM_CX/CYSCREEN) is
- * cached per process and this helper has no window to receive
- * WM_DISPLAYCHANGE, so after the resolution changed it kept the old size and
- * the guest pointer drifted away from the host's. Read the live mode from the
- * display driver instead, re-checked at most every 250 ms (moves arrive at
- * hundreds per second) and right after a display mode request. */
+ * The host sends positions in pixels of the frames it receives, i.e. of the
+ * AppSandbox VDD monitor. SendInput's absolute coordinates are normalised to
+ * the primary monitor (or, with MOUSEEVENTF_VIRTUALDESK, to the whole
+ * desktop), so the helper needs that monitor's live rectangle:
+ *  - GetSystemMetrics is cached per process and this helper has no window to
+ *    get WM_DISPLAYCHANGE, so it kept the size from before a mode change;
+ *  - when another display is attached too (e.g. Hyper-V Video came back),
+ *    the VDD monitor is not at (0,0) and may not be primary.
+ * So read every attached display's current mode and position from the
+ * display driver, re-checked at most every 250 ms (moves arrive at hundreds
+ * per second) and right after a display mode request. */
+typedef struct {
+    LONG x, y, w, h;          /* VDD monitor, desktop coordinates */
+    LONG vx, vy, vw, vh;      /* bounding box of every attached display */
+} DisplayLayout;
+
 static volatile LONG g_screen_stale = 1;
 
-static void primary_screen_size(int *w, int *h)
+static BOOL is_vdd_display(const wchar_t *device)
 {
-    static int cached_w = 1920, cached_h = 1080;
-    static ULONGLONG checked;
-    ULONGLONG now = GetTickCount64();
-    if (InterlockedExchange(&g_screen_stale, 0) || now - checked >= 250) {
+    DISPLAY_DEVICEW mon;
+    ZeroMemory(&mon, sizeof(mon));
+    mon.cb = sizeof(mon);
+    return EnumDisplayDevicesW(device, 0, &mon, 0) && wcsstr(mon.DeviceID, L"ASB0001") != NULL;
+}
+
+static void read_layout(DisplayLayout *out)
+{
+    DISPLAY_DEVICEW dd;
+    DWORD i;
+    BOOL have_vdd = FALSE, have_any = FALSE;
+    LONG left = 0, top = 0, right = 0, bottom = 0;
+    LONG px = 0, py = 0, pw = 0, ph = 0;    /* primary, as a fallback */
+
+    for (i = 0; ; i++) {
         DEVMODEW dm;
+        LONG x, y, w, h;
+        ZeroMemory(&dd, sizeof(dd));
+        dd.cb = sizeof(dd);
+        if (!EnumDisplayDevicesW(NULL, i, &dd, 0)) break;
+        if (!(dd.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)) continue;
         ZeroMemory(&dm, sizeof(dm));
         dm.dmSize = sizeof(dm);
-        if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) &&
-            dm.dmPelsWidth > 1 && dm.dmPelsHeight > 1) {
-            cached_w = (int)dm.dmPelsWidth;
-            cached_h = (int)dm.dmPelsHeight;
-        } else {
-            int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
-            if (sw > 1 && sh > 1) { cached_w = sw; cached_h = sh; }
+        if (!EnumDisplaySettingsW(dd.DeviceName, ENUM_CURRENT_SETTINGS, &dm) ||
+            dm.dmPelsWidth < 2 || dm.dmPelsHeight < 2) continue;
+        x = dm.dmPosition.x; y = dm.dmPosition.y;
+        w = (LONG)dm.dmPelsWidth; h = (LONG)dm.dmPelsHeight;
+        if (!have_any) { left = x; top = y; right = x + w; bottom = y + h; have_any = TRUE; }
+        else {
+            if (x < left) left = x;
+            if (y < top) top = y;
+            if (x + w > right) right = x + w;
+            if (y + h > bottom) bottom = y + h;
         }
-        checked = now;
+        if (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) { px = x; py = y; pw = w; ph = h; }
+        if (!have_vdd && is_vdd_display(dd.DeviceName)) {
+            out->x = x; out->y = y; out->w = w; out->h = h;
+            have_vdd = TRUE;
+        }
     }
-    *w = cached_w;
-    *h = cached_h;
+    if (!have_any) {
+        int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+        if (sw < 2 || sh < 2) { sw = 1920; sh = 1080; }
+        out->x = out->y = 0; out->w = sw; out->h = sh;
+        out->vx = out->vy = 0; out->vw = sw; out->vh = sh;
+        return;
+    }
+    if (!have_vdd) {
+        if (pw < 2) { px = left; py = top; pw = right - left; ph = bottom - top; }
+        out->x = px; out->y = py; out->w = pw; out->h = ph;
+    }
+    out->vx = left; out->vy = top; out->vw = right - left; out->vh = bottom - top;
+}
+
+static void display_layout(DisplayLayout *out)
+{
+    static DisplayLayout cached = { 0, 0, 1920, 1080, 0, 0, 1920, 1080 };
+    static ULONGLONG checked;
+    static LONG last_logged_x = 0x7FFFFFFF, last_logged_w = 0;
+    ULONGLONG now = GetTickCount64();
+    if (InterlockedExchange(&g_screen_stale, 0) || now - checked >= 250) {
+        read_layout(&cached);
+        checked = now;
+        if (cached.x != last_logged_x || cached.w != last_logged_w) {
+            input_log("Display layout: AppSandbox display %ldx%ld at (%ld,%ld), desktop %ldx%ld at (%ld,%ld).",
+                      cached.w, cached.h, cached.x, cached.y, cached.vw, cached.vh, cached.vx, cached.vy);
+            last_logged_x = cached.x;
+            last_logged_w = cached.w;
+        }
+    }
+    *out = cached;
 }
 
 /* ---- Input injection ---- */
@@ -115,12 +176,17 @@ static void inject_input(const InputPacket *pkt)
 
     switch (pkt->type) {
     case INPUT_MOUSE_MOVE: {
-        int screen_w, screen_h;
-        primary_screen_size(&screen_w, &screen_h);
+        /* Host coordinates are pixels of the AppSandbox display; place them
+           on that display wherever it sits on the desktop. */
+        DisplayLayout lay;
+        LONGLONG px, py;
+        display_layout(&lay);
+        px = (LONGLONG)lay.x - lay.vx + (pkt->param1 < (UINT32)lay.w ? pkt->param1 : (UINT32)lay.w - 1);
+        py = (LONGLONG)lay.y - lay.vy + (pkt->param2 < (UINT32)lay.h ? pkt->param2 : (UINT32)lay.h - 1);
         inp.type = INPUT_MOUSE;
-        inp.mi.dx = (LONG)(pkt->param1 * 65535 / (UINT32)(screen_w - 1));
-        inp.mi.dy = (LONG)(pkt->param2 * 65535 / (UINT32)(screen_h - 1));
-        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
+        inp.mi.dx = (LONG)(px * 65535 / (lay.vw > 1 ? lay.vw - 1 : 1));
+        inp.mi.dy = (LONG)(py * 65535 / (lay.vh > 1 ? lay.vh - 1 : 1));
+        inp.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
         result = SendInput(1, &inp, sizeof(INPUT));
         if (result == 0)
             input_log("SendInput(MOUSE_MOVE) failed: %lu", GetLastError());
@@ -413,8 +479,11 @@ static void handle_conn(AsbConn *c)
             if (mouse_version != INPUT_MOUSE_VERSION || pkt.param2 || pkt.param3) continue;
             switch_to_input_desktop();
             if (GetPhysicalCursorPos(&point)) {
-                reply.param1 = (UINT32)point.x;
-                reply.param2 = (UINT32)point.y;
+                /* Report it in AppSandbox-display pixels, like the host's moves. */
+                DisplayLayout lay;
+                display_layout(&lay);
+                reply.param1 = (UINT32)(point.x - lay.x);
+                reply.param2 = (UINT32)(point.y - lay.y);
             }
             if (send_full(c, &reply, (int)sizeof(reply)) != (int)sizeof(reply))
                 break;
