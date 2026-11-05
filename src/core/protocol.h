@@ -19,6 +19,7 @@
 #define INPUT_MOUSE_POSITION_QUERY 10
 #define INPUT_MOUSE_POSITION_REPLY 11
 #define INPUT_MOUSE_VERSION   1
+#define INPUT_SET_DISPLAY     12
 
 #define INPUT_BTN_LEFT        0
 #define INPUT_BTN_RIGHT       1
@@ -38,6 +39,10 @@
  * POSITION_QUERY: param1 = request ID, param2/param3 = 0.
  * POSITION_REPLY: param1/param2 = physical guest-screen X/Y, param3 = request ID.
  * Both coordinates are INT32_MIN if the cursor position cannot be read.
+ * SET_DISPLAY: param1/param2 = width/height, param3 = refresh in Hz. Windows
+ * guests switch the AppSandbox virtual display to that mode (the host first
+ * asks the VDD to offer it on the frame channel). No reply; older helpers
+ * ignore the packet.
  */
 #pragma pack(push, 1)
 typedef struct {

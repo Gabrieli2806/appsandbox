@@ -106,7 +106,38 @@ typedef struct AudioFrameHeader {
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+/* Largest frame the guest may send (8K BGRA). The receive buffer grows on
+   demand up to this size. */
+#define MAX_FRAME_WIDTH     7680
+#define MAX_FRAME_HEIGHT    4320
+#define MAX_FRAME_DATA_SIZE ((UINT)MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4)
+
+/* Mode request sent to the guest VDD on the frame channel (host -> guest).
+   Must match VDD_WIRE_MODE_REQUEST in tools/vdd/vdd.h. */
+#define MODE_REQUEST_MAGIC  0x524D5341  /* "ASMR" little-endian */
+#pragma pack(push, 1)
+typedef struct ModeRequest {
+    UINT32 magic;
+    UINT32 width;
+    UINT32 height;
+    UINT32 refresh;
+} ModeRequest;
+#pragma pack(pop)
+
+/* Display resolution choices (system menu > Display). RES_ADAPTIVE follows
+   the window's client size. */
+#define RES_ADAPTIVE        (-1)
+typedef struct { UINT w, h; } ResPreset;
+static const ResPreset g_res_presets[] = {
+    { 1280,  720 }, { 1600,  900 }, { 1920, 1080 }, { 1920, 1200 },
+    { 2560, 1440 }, { 3440, 1440 }, { 3840, 2160 },
+};
+#define RES_DEFAULT_PRESET  2   /* 1920x1080, the previous fixed mode */
+static const UINT g_refresh_rates[] = { 60, 120, 144 };
+
+/* Wait after the last window resize before asking the guest for a new size,
+   so a drag produces one mode change instead of dozens. */
+#define ADAPTIVE_DEBOUNCE_MS 400
 
 /* ---- Window messages ---- */
 
@@ -115,10 +146,13 @@ typedef struct AudioFrameHeader {
 #define WM_IDD_FOCUS            (WM_USER + 101)
 #define WM_IDD_INPUT_READY      (WM_USER + 102)
 #define WM_IDD_CURSOR_CHANGED   (WM_USER + 103)
+#define WM_IDD_FRAME_CONNECTED  (WM_USER + 104)
 
 /* Timer for Present cadence when no frames arrive */
 #define IDT_PRESENT     2001
-#define PRESENT_MS      16   /* ~60 fps */
+#define PRESENT_MS      16   /* fallback repaint; frames themselves repaint immediately */
+#define IDT_ADAPTIVE    2002 /* debounce adaptive resolution after resizes */
+#define IDT_APPLY_MODE  2003 /* re-apply the chosen mode after the frame channel connects */
 
 /* Debug log window */
 #define IDC_LOG_LIST      3001
@@ -202,6 +236,7 @@ struct VmDisplayIdd {
     ID3D11RenderTargetView  *rtv;
     ID3D11Texture2D         *frame_tex;
     ID3D11ShaderResourceView *frame_srv;
+    UINT                     tex_width, tex_height;   /* size of frame_tex */
     ID3D11VertexShader      *vs;
     ID3D11PixelShader       *ps;
     ID3D11SamplerState      *sampler;
@@ -216,6 +251,24 @@ struct VmDisplayIdd {
 
     UINT           render_count;     /* number of renders (for one-shot logging) */
     volatile UINT  recv_count;       /* number of frames received over HvSocket */
+
+    /* Frame channel socket, shared with the window thread for mode requests.
+       frame_send_lock guards it against the recv thread closing it. */
+    volatile SOCKET frame_socket;
+    SRWLOCK        frame_send_lock;
+
+    /* Display mode (persisted in display_settings.json). res_choice is an
+       index into g_res_presets or RES_ADAPTIVE. Mode changes are only sent to
+       Windows guests (the Linux guest has its own display path). */
+    int            res_choice;
+    UINT           refresh_hz;
+    BOOL           mode_supported;
+    UINT           req_width, req_height, req_refresh;  /* last mode requested */
+
+    /* Frame rate shown in the title (frames received from the guest). */
+    UINT           fps_value;
+    UINT           fps_last_recv;
+    ULONGLONG      fps_tick;
 
     /* Input forwarding */
     volatile SOCKET input_socket;   /* input socket for keyboard/mouse forwarding */
@@ -303,6 +356,11 @@ static const wchar_t *IDD_LOG_CLASS     = L"AppSandboxIddLog";
 #define IDM_CLIP_H2G       0x1030
 #define IDM_CLIP_G2H       0x1040
 #define IDM_BORDERLESS_FULLSCREEN 0x1050
+/* Display submenu: adaptive, presets at IDM_RES_BASE + i*0x10, refresh rates
+   at IDM_HZ_BASE + i*0x10 (system menu IDs keep the low 4 bits clear). */
+#define IDM_RES_ADAPTIVE   0x1100
+#define IDM_RES_BASE       0x1110
+#define IDM_HZ_BASE        0x1200
 static BOOL g_idd_class_registered;
 static WNDPROC g_orig_listbox_proc;
 static SRWLOCK g_mouse_capture_lock = SRWLOCK_INIT;
@@ -661,15 +719,26 @@ static void idd_display_settings_path(const wchar_t *vhdx_path, wchar_t *out, si
 }
 
 static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_hotkeys,
-                                      BOOL share_h2g, BOOL share_g2h)
+                                      BOOL share_h2g, BOOL share_g2h,
+                                      int res_choice, UINT refresh_hz)
 {
     wchar_t path[MAX_PATH];
+    char res[32];
     FILE *f;
     if (!vhdx_path || vhdx_path[0] == L'\0') return;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
+    if (res_choice == RES_ADAPTIVE)
+        strcpy_s(res, sizeof(res), "adaptive");
+    else if (res_choice >= 0 && res_choice < (int)ARRAYSIZE(g_res_presets))
+        sprintf_s(res, sizeof(res), "%ux%u", g_res_presets[res_choice].w,
+                  g_res_presets[res_choice].h);
+    else
+        strcpy_s(res, sizeof(res), "1920x1080");
     if (_wfopen_s(&f, path, L"w") != 0 || !f) return;
-    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d}\n",
-            transmit_hotkeys ? 1 : 0, share_h2g ? 1 : 0, share_g2h ? 1 : 0);
+    fprintf(f, "{\"transmitKeyboardHotkeys\":%d,\"shareHostToGuest\":%d,\"shareGuestToHost\":%d,"
+               "\"resolution\":\"%s\",\"refreshHz\":%u}\n",
+            transmit_hotkeys ? 1 : 0, share_h2g ? 1 : 0, share_g2h ? 1 : 0,
+            res, refresh_hz ? refresh_hz : 60);
     fclose(f);
 }
 
@@ -678,20 +747,24 @@ static void idd_display_settings_save(const wchar_t *vhdx_path, BOOL transmit_ho
    transmit-hotkeys value; the two clipboard flags are written back through
    the output params. */
 static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
-                                                BOOL *share_h2g, BOOL *share_g2h)
+                                                BOOL *share_h2g, BOOL *share_g2h,
+                                                int *res_choice, UINT *refresh_hz)
 {
     wchar_t path[MAX_PATH];
     FILE *f;
-    char buf[256];
+    char buf[512];
     BOOL transmit = FALSE;
     BOOL h2g = TRUE, g2h = TRUE;
+    int res = RES_DEFAULT_PRESET;
+    UINT hz = 60;
+    const char *p;
 
-    if (!vhdx_path || vhdx_path[0] == L'\0') return FALSE;
+    if (!vhdx_path || vhdx_path[0] == L'\0') goto out;
     idd_display_settings_path(vhdx_path, path, MAX_PATH);
 
     if (_wfopen_s(&f, path, L"r") != 0 || !f) {
         /* Lazy creation: file doesn't exist yet (new or pre-existing VM). */
-        idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE);
+        idd_display_settings_save(vhdx_path, FALSE, TRUE, TRUE, RES_DEFAULT_PRESET, 60);
         goto out;
     }
     if (fgets(buf, sizeof(buf), f)) {
@@ -702,13 +775,189 @@ static BOOL idd_display_settings_load_or_create(const wchar_t *vhdx_path,
             h2g = strstr(buf, "\"shareHostToGuest\":1") != NULL;
         if (strstr(buf, "\"shareGuestToHost\""))
             g2h = strstr(buf, "\"shareGuestToHost\":1") != NULL;
+        /* Display mode: missing or unknown values keep 1920x1080 @ 60 Hz. */
+        p = strstr(buf, "\"resolution\":\"");
+        if (p) {
+            unsigned int w = 0, h = 0;
+            p += 14;
+            if (strncmp(p, "adaptive\"", 9) == 0) {
+                res = RES_ADAPTIVE;
+            } else if (sscanf_s(p, "%ux%u", &w, &h) == 2) {
+                int i;
+                for (i = 0; i < (int)ARRAYSIZE(g_res_presets); i++)
+                    if (g_res_presets[i].w == w && g_res_presets[i].h == h) { res = i; break; }
+            }
+        }
+        p = strstr(buf, "\"refreshHz\":");
+        if (p) {
+            unsigned int v = 0;
+            int i;
+            if (sscanf_s(p + 12, "%u", &v) == 1)
+                for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
+                    if (g_refresh_rates[i] == v) { hz = v; break; }
+        }
     }
     fclose(f);
 
 out:
     if (share_h2g) *share_h2g = h2g;
     if (share_g2h) *share_g2h = g2h;
+    if (res_choice) *res_choice = res;
+    if (refresh_hz) *refresh_hz = hz;
     return transmit;
+}
+
+/* Save every per-VM display setting from the live display state. */
+static void idd_save_settings(VmDisplayIdd *d)
+{
+    idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
+                              d->clip_share_host_to_guest,
+                              d->clip_share_guest_to_host,
+                              d->res_choice, d->refresh_hz);
+}
+
+/* ==================================================================
+ * Display mode (resolution / refresh rate)
+ *
+ * Two steps, both owned by this window:
+ *   1. ask the guest VDD to offer the mode (frame channel, ModeRequest);
+ *      a size it does not list yet makes it re-plug its monitor;
+ *   2. ask the input helper in the guest's session to switch to it
+ *      (INPUT_SET_DISPLAY), which retries until the mode is offered.
+ * ================================================================== */
+
+/* The mode the current choice asks for. Adaptive uses the render area in
+   physical pixels (the process is per-monitor DPI aware), rounded to what
+   the VDD accepts. */
+static BOOL idd_target_mode(VmDisplayIdd *d, UINT *w, UINT *h, UINT *hz)
+{
+    *hz = d->refresh_hz ? d->refresh_hz : 60;
+    if (d->res_choice == RES_ADAPTIVE) {
+        RECT rc;
+        HWND target = d->render_hwnd ? d->render_hwnd : d->hwnd;
+        if (!target || !GetClientRect(target, &rc) || rc.right <= 0 || rc.bottom <= 0)
+            return FALSE;
+        *w = (UINT)rc.right & ~7u;
+        *h = (UINT)rc.bottom & ~1u;
+        if (*w < 640) *w = 640;
+        if (*h < 480) *h = 480;
+        if (*w > MAX_FRAME_WIDTH) *w = MAX_FRAME_WIDTH;
+        if (*h > MAX_FRAME_HEIGHT) *h = MAX_FRAME_HEIGHT;
+        return TRUE;
+    }
+    if (d->res_choice < 0 || d->res_choice >= (int)ARRAYSIZE(g_res_presets))
+        d->res_choice = RES_DEFAULT_PRESET;
+    *w = g_res_presets[d->res_choice].w;
+    *h = g_res_presets[d->res_choice].h;
+    return TRUE;
+}
+
+/* Send the chosen mode to the guest. force re-sends even when it matches the
+   last request (after the frame channel reconnects). */
+static void idd_apply_display_mode(VmDisplayIdd *d, BOOL force)
+{
+    UINT w, h, hz;
+    ModeRequest req;
+    BOOL vdd_ok = FALSE, input_ok;
+
+    if (!d || !d->mode_supported) return;
+    if (!idd_target_mode(d, &w, &h, &hz)) return;
+    if (!force && w == d->req_width && h == d->req_height && hz == d->req_refresh)
+        return;
+
+    req.magic = MODE_REQUEST_MAGIC;
+    req.width = w;
+    req.height = h;
+    req.refresh = hz;
+    AcquireSRWLockExclusive(&d->frame_send_lock);
+    if (d->frame_socket != INVALID_SOCKET)
+        vdd_ok = send(d->frame_socket, (const char *)&req, (int)sizeof(req), 0) == (int)sizeof(req);
+    ReleaseSRWLockExclusive(&d->frame_send_lock);
+
+    AcquireSRWLockExclusive(&d->input_lock);
+    input_ok = send_input_locked(d, INPUT_SET_DISPLAY, w, h, hz);
+    ReleaseSRWLockExclusive(&d->input_lock);
+
+    if (vdd_ok && input_ok) {
+        d->req_width = w;
+        d->req_height = h;
+        d->req_refresh = hz;
+    }
+    idd_log(d, L"Display mode %ux%u @ %u Hz requested (driver %s, session %s).",
+            w, h, hz, vdd_ok ? L"ok" : L"not connected", input_ok ? L"ok" : L"not connected");
+}
+
+/* Radio checks in the Display submenu. */
+static void idd_update_display_menu(VmDisplayIdd *d)
+{
+    HMENU sysmenu, sub = NULL;
+    int i, count;
+    if (!d || !d->hwnd) return;
+    sysmenu = GetSystemMenu(d->hwnd, FALSE);
+    if (!sysmenu) return;
+    count = GetMenuItemCount(sysmenu);
+    for (i = 0; i < count; i++) {
+        HMENU h = GetSubMenu(sysmenu, i);
+        if (h && GetMenuState(h, IDM_RES_ADAPTIVE, MF_BYCOMMAND) != (UINT)-1) { sub = h; break; }
+    }
+    if (!sub) return;
+    CheckMenuItem(sub, IDM_RES_ADAPTIVE,
+                  MF_BYCOMMAND | (d->res_choice == RES_ADAPTIVE ? MF_CHECKED : MF_UNCHECKED));
+    for (i = 0; i < (int)ARRAYSIZE(g_res_presets); i++)
+        CheckMenuItem(sub, IDM_RES_BASE + i * 0x10,
+                      MF_BYCOMMAND | (d->res_choice == i ? MF_CHECKED : MF_UNCHECKED));
+    for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++)
+        CheckMenuItem(sub, IDM_HZ_BASE + i * 0x10,
+                      MF_BYCOMMAND | (d->refresh_hz == g_refresh_rates[i] ? MF_CHECKED : MF_UNCHECKED));
+}
+
+/* Build the Display submenu (resolution + refresh rate). */
+static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
+{
+    HMENU sub;
+    int i;
+    if (!d->mode_supported) return;
+    sub = CreatePopupMenu();
+    if (!sub) return;
+    AppendMenuW(sub, MF_STRING, IDM_RES_ADAPTIVE, L"Adaptive (fit window)");
+    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+    for (i = 0; i < (int)ARRAYSIZE(g_res_presets); i++) {
+        wchar_t label[64];
+        swprintf_s(label, 64, L"%u x %u", g_res_presets[i].w, g_res_presets[i].h);
+        AppendMenuW(sub, MF_STRING, IDM_RES_BASE + i * 0x10, label);
+    }
+    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+    for (i = 0; i < (int)ARRAYSIZE(g_refresh_rates); i++) {
+        wchar_t label[32];
+        swprintf_s(label, 32, L"%u Hz", g_refresh_rates[i]);
+        AppendMenuW(sub, MF_STRING, IDM_HZ_BASE + i * 0x10, label);
+    }
+    AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)sub, L"Display");
+}
+
+/* Window title: name, guest resolution and the frame rate received from the
+   guest. Refreshed at most twice a second. */
+static void idd_update_title(VmDisplayIdd *d, BOOL force)
+{
+    ULONGLONG now = GetTickCount64();
+    wchar_t title[320];
+    UINT recv;
+
+    if (!d || !d->hwnd) return;
+    if (!force && d->fps_tick && now - d->fps_tick < 500) return;
+
+    recv = d->recv_count;
+    if (d->fps_tick && now > d->fps_tick)
+        d->fps_value = (UINT)(((ULONGLONG)(recv - d->fps_last_recv) * 1000 + (now - d->fps_tick) / 2)
+                              / (now - d->fps_tick));
+    d->fps_last_recv = recv;
+    d->fps_tick = now;
+
+    swprintf_s(title, ARRAYSIZE(title), L"%s%s - %ux%u - %u FPS",
+               d->audio_muted ? L"\U0001F507 " : L"",
+               d->vm_name, d->frame_width, d->frame_height,
+               d->frame_connected ? d->fps_value : 0);
+    SetWindowTextW(d->hwnd, title);
 }
 
 /* ==================================================================
@@ -1460,6 +1709,8 @@ static BOOL d3d_init(VmDisplayIdd *d)
     ZeroMemory(&td, sizeof(td));
     td.Width              = DEFAULT_WIDTH;
     td.Height             = DEFAULT_HEIGHT;
+    d->tex_width          = DEFAULT_WIDTH;
+    d->tex_height         = DEFAULT_HEIGHT;
     td.MipLevels          = 1;
     td.ArraySize          = 1;
     td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -1569,6 +1820,59 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
     }
 }
 
+/* Re-create the frame texture when the guest resolution changed. Called with
+   frame_cs held (frame_width/height are updated by the recv thread under it). */
+static BOOL d3d_ensure_frame_texture(VmDisplayIdd *d)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC srv_desc;
+    ID3D11Texture2D *tex = NULL;
+    ID3D11ShaderResourceView *srv = NULL;
+    HRESULT hr;
+
+    if (d->frame_tex && d->tex_width == d->frame_width && d->tex_height == d->frame_height)
+        return TRUE;
+    if (d->frame_width == 0 || d->frame_height == 0) return FALSE;
+
+    ZeroMemory(&td, sizeof(td));
+    td.Width              = d->frame_width;
+    td.Height             = d->frame_height;
+    td.MipLevels          = 1;
+    td.ArraySize          = 1;
+    td.Format             = DXGI_FORMAT_B8G8R8A8_UNORM;
+    td.SampleDesc.Count   = 1;
+    td.Usage              = D3D11_USAGE_DYNAMIC;
+    td.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    td.CPUAccessFlags     = D3D11_CPU_ACCESS_WRITE;
+    hr = d->device->lpVtbl->CreateTexture2D(d->device, &td, NULL, &tex);
+    if (FAILED(hr)) {
+        ui_log(L"IDD: CreateTexture2D %ux%u failed (0x%08X)", d->frame_width, d->frame_height, hr);
+        return FALSE;
+    }
+
+    ZeroMemory(&srv_desc, sizeof(srv_desc));
+    srv_desc.Format                    = DXGI_FORMAT_B8G8R8A8_UNORM;
+    srv_desc.ViewDimension             = D3D11_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels       = 1;
+    hr = d->device->lpVtbl->CreateShaderResourceView(d->device, (ID3D11Resource *)tex,
+                                                     &srv_desc, &srv);
+    if (FAILED(hr)) {
+        tex->lpVtbl->Release(tex);
+        ui_log(L"IDD: CreateShaderResourceView %ux%u failed (0x%08X)",
+               d->frame_width, d->frame_height, hr);
+        return FALSE;
+    }
+
+    if (d->frame_srv) d->frame_srv->lpVtbl->Release(d->frame_srv);
+    if (d->frame_tex) d->frame_tex->lpVtbl->Release(d->frame_tex);
+    d->frame_tex  = tex;
+    d->frame_srv  = srv;
+    d->tex_width  = d->frame_width;
+    d->tex_height = d->frame_height;
+    idd_log(d, L"Frame texture now %ux%u.", d->tex_width, d->tex_height);
+    return TRUE;
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -1584,6 +1888,11 @@ static void d3d_render_frame(VmDisplayIdd *d)
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
         EnterCriticalSection(&d->frame_cs);
+        if (!d3d_ensure_frame_texture(d)) {
+            d->frame_dirty = FALSE;
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
@@ -1595,7 +1904,7 @@ static void d3d_render_frame(VmDisplayIdd *d)
             if (copy_stride > d->frame_stride)
                 copy_stride = d->frame_stride;
 
-            for (row = 0; row < d->frame_height && row < DEFAULT_HEIGHT; row++) {
+            for (row = 0; row < d->frame_height && row < d->tex_height; row++) {
                 memcpy((BYTE *)mapped.pData + row * mapped.RowPitch,
                        d->frame_buf + row * d->frame_stride,
                        copy_stride);
@@ -1623,14 +1932,10 @@ static void d3d_render_frame(VmDisplayIdd *d)
         vp.MaxDepth = 1.0f;
     }
 
-    /* Refresh the title once per uploaded frame (~frame rate). */
-    if (frame_uploaded && d->hwnd) {
-        wchar_t title[256];
-        swprintf_s(title, 256, L"%s%s Display %ux%u recv=%u",
-                   d->audio_muted ? L"\U0001F507 " : L"",
-                   d->vm_name, d->frame_width, d->frame_height, d->recv_count);
-        SetWindowTextW(d->hwnd, title);
-    }
+    /* Title with resolution and FPS (self-throttled to twice a second;
+       setting it per frame was measurable at high frame rates). */
+    if (frame_uploaded)
+        idd_update_title(d, FALSE);
     d->render_count++;
 
     d->ctx->lpVtbl->OMSetRenderTargets(d->ctx, 1, &d->rtv, NULL);
@@ -1882,8 +2187,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    /* Allocate receive buffer for frame pixel data */
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    /* Receive buffer for frame pixel data: starts at 1080p and grows when the
+       guest switches to a larger mode (up to MAX_FRAME_DATA_SIZE). */
+    UINT recv_buf_size = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_buf_size);
     if (!recv_buf) {
         ui_log(L"IDD recv: failed to allocate receive buffer");
         return 1;
@@ -1945,6 +2252,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         }
 
         idd_log(d, L"Frame channel connected.");
+        AcquireSRWLockExclusive(&d->frame_send_lock);
+        d->frame_socket = s;
+        ReleaseSRWLockExclusive(&d->frame_send_lock);
+        PostMessageW(d->hwnd, WM_IDD_FRAME_CONNECTED, 0, 0);
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
 
@@ -2022,7 +2333,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Sanity checks */
             if (hdr.width == 0 || hdr.height == 0 ||
-                hdr.width > 7680 || hdr.height > 4320 ||
+                hdr.width > MAX_FRAME_WIDTH || hdr.height > MAX_FRAME_HEIGHT ||
                 hdr.stride < hdr.width * 4) {
                 idd_log(d, L"Invalid frame dimensions %ux%u stride %u.",
                        hdr.width, hdr.height, hdr.stride);
@@ -2051,6 +2362,15 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             }
 
             /* Read pixel data */
+            if (data_size > recv_buf_size) {
+                BYTE *bigger = (BYTE *)HeapReAlloc(GetProcessHeap(), 0, recv_buf, data_size);
+                if (!bigger) {
+                    idd_log(d, L"Cannot grow receive buffer to %u bytes, reconnecting.", data_size);
+                    break;
+                }
+                recv_buf = bigger;
+                recv_buf_size = data_size;
+            }
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
                     break;
@@ -2162,6 +2482,9 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
+        AcquireSRWLockExclusive(&d->frame_send_lock);
+        d->frame_socket = INVALID_SOCKET;
+        ReleaseSRWLockExclusive(&d->frame_send_lock);
         closesocket(s);
         idd_log(d, L"Frame channel disconnected, reconnecting...");
 
@@ -2172,11 +2495,12 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             idd_log(d, L"Input socket flagged dead, will reconnect.");
         }
 
-        /* Wait before reconnecting frame channel */
+        /* Wait before reconnecting frame channel. Kept short: a display mode
+           change re-plugs the guest monitor and drops this channel. */
         {
             int wait;
-            for (wait = 0; wait < 3000 && !d->stop; wait += 500)
-                Sleep(500);
+            for (wait = 0; wait < 1000 && !d->stop; wait += 250)
+                Sleep(250);
         }
     }
 
@@ -2216,11 +2540,16 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
 
-    /* Compute outer window size so the client area is exactly 1920x1080 */
+    /* Outer window size so the client area matches the chosen resolution
+       (1920x1080 in adaptive mode; the guest then follows the window). */
     {
         DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
         RECT wr = { 0, 0, 1920, 1080 };
+        if (d->res_choice >= 0 && d->res_choice < (int)ARRAYSIZE(g_res_presets)) {
+            wr.right  = (LONG)g_res_presets[d->res_choice].w;
+            wr.bottom = (LONG)g_res_presets[d->res_choice].h;
+        }
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
 
         d->hwnd = CreateWindowExW(
@@ -2250,6 +2579,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
             AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
             AppendMenuW(sysmenu, MF_STRING, IDM_BORDERLESS_FULLSCREEN, L"Toggle Borderless Fullscreen\tF11");
+            idd_add_display_menu(d, sysmenu);
             AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
@@ -2261,6 +2591,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
             CheckMenuItem(sysmenu, IDM_CLIP_G2H,
                           MF_BYCOMMAND | (d->clip_share_guest_to_host ? MF_CHECKED : MF_UNCHECKED));
         }
+        idd_update_display_menu(d);
     }
 
     /* Bring the display window to the foreground on open */
@@ -2423,6 +2754,28 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     switch (msg) {
     case WM_SYSCOMMAND:
+        if (d && d->mode_supported) {
+            UINT id = (UINT)(wp & 0xFFF0);
+            BOOL handled = FALSE;
+            if (id == IDM_RES_ADAPTIVE) {
+                d->res_choice = RES_ADAPTIVE;
+                handled = TRUE;
+            } else if (id >= IDM_RES_BASE &&
+                       id < IDM_RES_BASE + ARRAYSIZE(g_res_presets) * 0x10) {
+                d->res_choice = (int)((id - IDM_RES_BASE) / 0x10);
+                handled = TRUE;
+            } else if (id >= IDM_HZ_BASE &&
+                       id < IDM_HZ_BASE + ARRAYSIZE(g_refresh_rates) * 0x10) {
+                d->refresh_hz = g_refresh_rates[(id - IDM_HZ_BASE) / 0x10];
+                handled = TRUE;
+            }
+            if (handled) {
+                idd_update_display_menu(d);
+                idd_save_settings(d);
+                idd_apply_display_mode(d, TRUE);
+                return 0;
+            }
+        }
         if (d && (wp & 0xFFF0) == IDM_BORDERLESS_FULLSCREEN) {
             idd_toggle_borderless_fullscreen(d, hwnd);
             return 0;
@@ -2455,9 +2808,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 idd_flush_held_keys(d);
             }
             idd_update_kbd_hook(d);
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
-                                      d->clip_share_host_to_guest,
-                                      d->clip_share_guest_to_host);
+            idd_save_settings(d);
             idd_log(d, d->transmit_hotkeys
                         ? L"Transmit Keyboard Hotkeys: ON."
                         : L"Transmit Keyboard Hotkeys: OFF.");
@@ -2474,9 +2825,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 vm_clipboard_set_share_directions(d->clipboard,
                                                   d->clip_share_host_to_guest,
                                                   d->clip_share_guest_to_host);
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
-                                      d->clip_share_host_to_guest,
-                                      d->clip_share_guest_to_host);
+            idd_save_settings(d);
             idd_log(d, d->clip_share_host_to_guest
                         ? L"Share host clipboard with guest: ON."
                         : L"Share host clipboard with guest: OFF.");
@@ -2493,9 +2842,7 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 vm_clipboard_set_share_directions(d->clipboard,
                                                   d->clip_share_host_to_guest,
                                                   d->clip_share_guest_to_host);
-            idd_display_settings_save(d->vhdx_path, d->transmit_hotkeys,
-                                      d->clip_share_host_to_guest,
-                                      d->clip_share_guest_to_host);
+            idd_save_settings(d);
             idd_log(d, d->clip_share_guest_to_host
                         ? L"Share guest clipboard with host: ON."
                         : L"Share guest clipboard with host: OFF.");
@@ -2604,8 +2951,10 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         AdjustWindowRectEx(&wr, style, FALSE, exstyle);
         mmi->ptMinTrackSize.x = wr.right - wr.left;
         mmi->ptMinTrackSize.y = wr.bottom - wr.top;
-        /* Max: native frame size */
-        if (d && d->frame_width > 0 && d->frame_height > 0) {
+        /* Max: native frame size (adaptive mode resizes freely; the guest
+           follows the window instead). */
+        if (d && d->res_choice != RES_ADAPTIVE &&
+            d->frame_width > 0 && d->frame_height > 0) {
             wr.left = 0; wr.top = 0;
             wr.right = (LONG)d->frame_width; wr.bottom = (LONG)d->frame_height;
             AdjustWindowRectEx(&wr, style, FALSE, exstyle);
@@ -2628,6 +2977,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 ReleaseSRWLockExclusive(&g_mouse_capture_lock);
             }
             idd_update_relative_mouse(d);
+            /* Adaptive: ask the guest for the new size once resizing settles. */
+            if (d->res_choice == RES_ADAPTIVE && wp != SIZE_MINIMIZED)
+                SetTimer(hwnd, IDT_ADAPTIVE, ADAPTIVE_DEBOUNCE_MS, NULL);
         }
         return 0;
 
@@ -2645,6 +2997,8 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (d) {
             d->input_sizing = msg == WM_ENTERSIZEMOVE;
             idd_update_relative_mouse(d);
+            if (msg == WM_EXITSIZEMOVE && d->res_choice == RES_ADAPTIVE)
+                SetTimer(hwnd, IDT_ADAPTIVE, 100, NULL);
         }
         break;
 
@@ -2662,7 +3016,22 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
             if (d->frame_dirty)
                 d3d_render_frame(d);
+            idd_update_title(d, FALSE);
+        } else if (wp == IDT_ADAPTIVE && d) {
+            /* Still dragging: wait for the drag to end. */
+            if (d->input_sizing) return 0;
+            KillTimer(hwnd, IDT_ADAPTIVE);
+            idd_apply_display_mode(d, FALSE);
+        } else if (wp == IDT_APPLY_MODE && d) {
+            KillTimer(hwnd, IDT_APPLY_MODE);
+            idd_apply_display_mode(d, TRUE);
         }
+        return 0;
+
+    case WM_IDD_FRAME_CONNECTED:
+        /* The guest driver (re)started, e.g. after a reboot or a monitor
+           re-plug: give the input helper a moment, then re-send the mode. */
+        if (d) SetTimer(hwnd, IDT_APPLY_MODE, 1500, NULL);
         return 0;
 
     case WM_IDD_FRAME_READY:
@@ -2961,9 +3330,13 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
        the defaults (hotkeys off, clipboard sharing on) if this VM doesn't
        have one yet. The hook itself is installed later, on the window thread,
        once the window exists. */
-    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &h2g, &g2h);
+    d->transmit_hotkeys = idd_display_settings_load_or_create(vm->vhdx_path, &h2g, &g2h,
+                                                              &d->res_choice, &d->refresh_hz);
     d->clip_share_host_to_guest = h2g;
     d->clip_share_guest_to_host = g2h;
+    d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0);
+    d->frame_socket = INVALID_SOCKET;
+    InitializeSRWLock(&d->frame_send_lock);
 
     /* Initialize frame buffer at default resolution */
     d->frame_width  = DEFAULT_WIDTH;

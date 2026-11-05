@@ -38,12 +38,21 @@ Environment:
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
+/* Default (and, on a macOS host, only) mode. */
 #define VDD_WIDTH            1920
 #define VDD_HEIGHT           1080
+#define VDD_REFRESH          60
 #define VDD_BPP              4          /* BGRA 8-bit */
-#define VDD_STRIDE           (VDD_WIDTH * VDD_BPP)
-#define VDD_PIXEL_BYTES      (VDD_STRIDE * VDD_HEIGHT)
 #define VDD_MAX_DIRTY_RECTS  64
+
+/* Limits for modes the host may request. The host viewer rejects frames
+   larger than 7680x4320, so never offer more than that. */
+#define VDD_MIN_WIDTH        640
+#define VDD_MIN_HEIGHT       480
+#define VDD_MAX_WIDTH        7680
+#define VDD_MAX_HEIGHT       4320
+#define VDD_MIN_REFRESH      30
+#define VDD_MAX_REFRESH      240
 
 /* ============================================================================
  *  Wire protocol: ASFR frame header (sent over HvSocket to host)
@@ -80,18 +89,40 @@ typedef struct _VDD_WIRE_CURSOR_HEADER {
     UINT32  cursor_type;        /* 1=MASKED_COLOR, 2=ALPHA */
     UINT32  shape_data_size;    /* bytes of shape data following header (0 if !shape_updated) */
 } VDD_WIRE_CURSOR_HEADER;
+/* Wire protocol: ASMR mode request (host -> guest on the same frame channel).
+ * The host asks for a resolution/refresh. If the mode is not in the list yet
+ * the driver adds it and re-plugs the virtual monitor; the guest agent then
+ * applies the mode in the interactive session (set_display command). */
+#define VDD_MODE_REQUEST_MAGIC 0x524D5341  /* "ASMR" little-endian */
+
+typedef struct _VDD_WIRE_MODE_REQUEST {
+    UINT32  magic;              /* VDD_MODE_REQUEST_MAGIC */
+    UINT32  width;
+    UINT32  height;
+    UINT32  refresh;            /* Hz */
+} VDD_WIRE_MODE_REQUEST;
 #pragma pack(pop)
 
 /* ============================================================================
- *  Supported resolutions and refresh rates (single mode for this driver)
+ *  Supported resolutions and refresh rates
  * ============================================================================ */
 struct ResolutionEntry {
     UINT width;
     UINT height;
 };
 
+/* Presets offered at every supported refresh rate. Custom sizes requested by
+   the host (adaptive window sizing) are added at runtime. */
 static const ResolutionEntry g_SupportedResolutions[] = {
+    { 1280,  720 },
+    { 1366,  768 },
+    { 1600,  900 },
     { 1920, 1080 },
+    { 1920, 1200 },
+    { 2560, 1080 },
+    { 2560, 1440 },
+    { 3440, 1440 },
+    { 3840, 2160 },
 };
 
 static const UINT g_NumResolutions = ARRAYSIZE(g_SupportedResolutions);
@@ -103,6 +134,8 @@ struct RefreshRateEntry {
 
 static const RefreshRateEntry g_SupportedRefreshRates[] = {
     { 60, 1 },
+    { 120, 1 },
+    { 144, 1 },
 };
 
 static const UINT g_NumRefreshRates = ARRAYSIZE(g_SupportedRefreshRates);
@@ -159,9 +192,10 @@ static const BYTE VDD_EDID[] = {
     0x00, 0x00, 0x00, 0xFC, 0x00,
     'A', 'p', 'p', 'S', 'a', 'n', 'd', 'b', 'o', 'x', 'V', 'D', 'D',
 
-    /* Descriptor #3: Monitor range limits */
+    /* Descriptor #3: Monitor range limits
+       V 24-240 Hz, H 30-255 kHz, max pixel clock 2550 MHz (covers 4K@144). */
     0x00, 0x00, 0x00, 0xFD, 0x00,
-    0x38, 0x4C, 0x1E, 0x51, 0x11, 0x00, 0x0A,
+    0x18, 0xF0, 0x1E, 0xFF, 0xFF, 0x00, 0x0A,
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 
     /* Descriptor #4: Dummy (zero) */
@@ -175,6 +209,20 @@ static const BYTE VDD_EDID[] = {
     /* Checksum placeholder - computed at runtime */
     0x00
 };
+
+/* ============================================================================
+ *  Mode list
+ * ============================================================================ */
+typedef struct _VDD_MODE {
+    UINT width;
+    UINT height;
+    UINT refresh;
+} VDD_MODE;
+
+#define VDD_MAX_CUSTOM_MODES 8
+#define VDD_MAX_MODES ((sizeof(g_SupportedResolutions) / sizeof(g_SupportedResolutions[0])) * \
+                       (sizeof(g_SupportedRefreshRates) / sizeof(g_SupportedRefreshRates[0])) + \
+                       VDD_MAX_CUSTOM_MODES)
 
 /* ============================================================================
  *  Swap chain processor state (heap-allocated per AssignSwapChain)
@@ -202,6 +250,18 @@ typedef struct _VDD_SWAP_PROC {
     volatile BOOL       bStopNetwork;
     UINT64              frameSeq;
 
+    /* Owning device context (for mode requests from the host). */
+    struct _VDD_DEVICE_CONTEXT* pContext;
+
+    /* Current frame geometry (follows the swap chain surface). */
+    UINT                frameWidth;
+    UINT                frameHeight;
+
+    /* Contiguous send buffer: header + rects + pixels go out in one send
+       instead of one send per row. Grown on demand. */
+    BYTE*               pSendBuf;
+    UINT                sendBufSize;
+
     /* Hardware cursor */
     IDDCX_MONITOR       hMonitor;           /* needed for QueryHardwareCursor */
     HANDLE              hCursorEvent;       /* signaled when cursor data changes */
@@ -226,9 +286,23 @@ typedef struct _VDD_DEVICE_CONTEXT {
     ID3D11DeviceContext* pCachedCtx;
     LUID                cachedDeviceLuid;
 
-    /* Monitor mode list */
-    DISPLAYCONFIG_VIDEO_SIGNAL_INFO modes[2]; /* 1920x1080@60 (monitor + target) */
+    /* Mode list offered to the OS (monitor and target modes are the same
+       list). Presets x refresh rates, plus recent custom modes. */
+    SRWLOCK             modeLock;
+    VDD_MODE            modes[VDD_MAX_MODES];
     UINT                modeCount;
+    UINT                preferredMode;      /* index into modes[] */
+    BOOL                legacySingleMode;   /* macOS host: only 1920x1080@60 */
+
+    /* Recent custom modes (ring), kept so returning to a size does not need
+       another monitor re-plug. */
+    VDD_MODE            customModes[VDD_MAX_CUSTOM_MODES];
+    UINT                customCount;
+    UINT                customNext;
+
+    /* Re-plugs the monitor after a new custom mode was added. Runs on a WDF
+       thread, like the recovery timer. */
+    WDFTIMER            hModeTimer;
 
     /* Recovery: if no AssignSwapChain arrives within 5s of Unassign,
        depart and re-arrive the monitor to force DWM re-engagement.
@@ -261,6 +335,13 @@ struct RecoveryTimerContext
 };
 
 WDF_DECLARE_CONTEXT_TYPE(RecoveryTimerContext);
+
+struct ModeTimerContext
+{
+    VDD_DEVICE_CONTEXT* pContext;
+};
+
+WDF_DECLARE_CONTEXT_TYPE(ModeTimerContext);
 
 /* ============================================================================
  *  IddCx Callback declarations

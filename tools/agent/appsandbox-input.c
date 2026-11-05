@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <wchar.h>
 
 #pragma comment(lib, "user32.lib")
 
@@ -246,6 +247,88 @@ static int send_full(AsbConn *c, const void *buf, int len)
     return sent;
 }
 
+/* ---- Display mode changes (INPUT_SET_DISPLAY) ----
+ *
+ * The switch itself runs in appsandbox-displays.exe --set, which waits for
+ * the driver to offer the mode (it may be re-plugging the monitor) and can
+ * take seconds, so it runs on a worker thread. While it runs only the newest
+ * request is kept: dragging the window edge sends many. */
+static CRITICAL_SECTION g_display_cs;
+static HANDLE g_display_event;
+static UINT32 g_display_w, g_display_h, g_display_hz;
+static BOOL   g_display_pending;
+
+static void run_display_switch(UINT32 w, UINT32 h, UINT32 hz)
+{
+    wchar_t exe[MAX_PATH], cmd[MAX_PATH + 64], *slash;
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    DWORD exit_code = 1;
+
+    GetModuleFileNameW(NULL, exe, MAX_PATH);
+    slash = wcsrchr(exe, L'\\');
+    if (slash) *(slash + 1) = L'\0';
+    wcscat_s(exe, MAX_PATH, L"appsandbox-displays.exe");
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\" --set %u %u %u", exe, w, h, hz);
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.lpDesktop = L"WinSta0\\Default";
+    ZeroMemory(&pi, sizeof(pi));
+    if (!CreateProcessW(exe, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW,
+                        NULL, NULL, &si, &pi)) {
+        input_log("SetDisplay: cannot start displays helper (%lu).", GetLastError());
+        return;
+    }
+    if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT) {
+        TerminateProcess(pi.hProcess, 1);
+        WaitForSingleObject(pi.hProcess, 1000);
+    }
+    GetExitCodeProcess(pi.hProcess, &exit_code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    input_log("SetDisplay: %ux%u@%u -> %s (exit %lu).", w, h, hz,
+              exit_code == 0 ? "applied" : "failed", exit_code);
+}
+
+static DWORD WINAPI display_thread_proc(LPVOID param)
+{
+    (void)param;
+    for (;;) {
+        UINT32 w, h, hz;
+        WaitForSingleObject(g_display_event, INFINITE);
+        EnterCriticalSection(&g_display_cs);
+        if (!g_display_pending) { LeaveCriticalSection(&g_display_cs); continue; }
+        w = g_display_w; h = g_display_h; hz = g_display_hz;
+        g_display_pending = FALSE;
+        LeaveCriticalSection(&g_display_cs);
+        run_display_switch(w, h, hz);
+    }
+}
+
+static void queue_display_mode(const InputPacket *pkt)
+{
+    static HANDLE thread;
+    if (pkt->param1 < 640 || pkt->param2 < 480 || pkt->param1 > 7680 ||
+        pkt->param2 > 4320 || pkt->param3 < 30 || pkt->param3 > 240) {
+        input_log("SetDisplay: rejected %ux%u@%u.", pkt->param1, pkt->param2, pkt->param3);
+        return;
+    }
+    /* Only the connection thread calls this, so lazy init needs no lock. */
+    if (!g_display_event) {
+        InitializeCriticalSection(&g_display_cs);
+        g_display_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+        if (!g_display_event) return;
+        thread = CreateThread(NULL, 0, display_thread_proc, NULL, 0, NULL);
+        if (!thread) { CloseHandle(g_display_event); g_display_event = NULL; return; }
+    }
+    EnterCriticalSection(&g_display_cs);
+    g_display_w = pkt->param1; g_display_h = pkt->param2; g_display_hz = pkt->param3;
+    g_display_pending = TRUE;
+    LeaveCriticalSection(&g_display_cs);
+    SetEvent(g_display_event);
+}
+
 /* ---- Handle one host connection ---- */
 
 static void handle_conn(AsbConn *c)
@@ -317,6 +400,8 @@ static void handle_conn(AsbConn *c)
         } else if (pkt.type == INPUT_KEY_PHYSICAL) {
             if (keyboard_version >= INPUT_KEYBOARD_VERSION)
                 inject_physical_key(&pkt, &keys);
+        } else if (pkt.type == INPUT_SET_DISPLAY) {
+            queue_display_mode(&pkt);
         } else {
             inject_input(&pkt);
         }
