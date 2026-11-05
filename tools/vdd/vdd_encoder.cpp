@@ -27,6 +27,14 @@
 #include <string.h>
 
 #include "vdd_encoder.h"
+#include "ThirdParty/nvenc/nvEncodeAPI.h"   /* NVIDIA Video Codec SDK header (MIT) */
+
+/* ---- NVENC, loaded at run time ----
+   In GPU-PV guests the NVIDIA driver is not installed the normal way, so its
+   Media Foundation encoder is never registered; the NVENC API itself
+   (nvEncodeAPI64.dll, the path Sunshine and OBS use) works. */
+typedef NVENCSTATUS (NVENCAPI *PFN_NvEncodeAPICreateInstance)(NV_ENCODE_API_FUNCTION_LIST*);
+typedef NVENCSTATUS (NVENCAPI *PFN_NvEncodeAPIGetMaxSupportedVersion)(uint32_t*);
 
 /* ---- Media Foundation, loaded at run time ---- */
 
@@ -144,6 +152,14 @@ struct VddEncoder {
     LONGLONG                qpcFreq;
     UINT64                  framesIn, framesOut;
     BOOL                    pendingKey;
+
+    /* NVENC backend (preferred; Media Foundation is the fallback) */
+    BOOL                    nvenc;
+    HMODULE                 nvDll;
+    NV_ENCODE_API_FUNCTION_LIST nv;
+    void*                   nvEnc;
+    NV_ENC_OUTPUT_PTR       nvBits;
+    NV_ENC_REGISTERED_PTR   nvReg[VDD_ENC_RING];
 };
 
 static void EncLog(VddEncoder* e, const char* fmt, ...)
@@ -600,6 +616,211 @@ static HRESULT OpenEncoder(VddEncoder* e)
     return S_OK;
 }
 
+/* ---- NVENC backend ---- */
+
+static HMODULE LoadNvEncode(VddEncoder* e)
+{
+    HMODULE h = LoadLibraryExW(L"nvEncodeAPI64.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (h) return h;
+    /* GPU-PV guests: the host's driver folder is mapped under HostDriverStore. */
+    wchar_t sys[MAX_PATH], pat[MAX_PATH], path[MAX_PATH];
+    WIN32_FIND_DATAW fd;
+    if (!GetSystemDirectoryW(sys, MAX_PATH)) return NULL;
+    swprintf_s(pat, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\nv*", sys);
+    HANDLE f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    do {
+        if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
+        swprintf_s(path, MAX_PATH, L"%s\\HostDriverStore\\FileRepository\\%s\\nvEncodeAPI64.dll",
+                   sys, fd.cFileName);
+        h = LoadLibraryExW(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+        if (h) {
+            char a[MAX_PATH];
+            WideCharToMultiByte(CP_UTF8, 0, path, -1, a, sizeof(a), NULL, NULL);
+            EncLog(e, "Encoder: NVENC from %s", a);
+            break;
+        }
+    } while (FindNextFileW(f, &fd));
+    FindClose(f);
+    return h;
+}
+
+static void CloseNvenc(VddEncoder* e)
+{
+    if (e->nvEnc) {
+        for (UINT i = 0; i < VDD_ENC_RING; i++)
+            if (e->nvReg[i]) { e->nv.nvEncUnregisterResource(e->nvEnc, e->nvReg[i]); e->nvReg[i] = nullptr; }
+        if (e->nvBits) { e->nv.nvEncDestroyBitstreamBuffer(e->nvEnc, e->nvBits); e->nvBits = nullptr; }
+        e->nv.nvEncDestroyEncoder(e->nvEnc);
+        e->nvEnc = nullptr;
+    }
+    if (e->nvDll) { FreeLibrary(e->nvDll); e->nvDll = nullptr; }
+    e->nvenc = FALSE;
+}
+
+static HRESULT OpenNvenc(VddEncoder* e)
+{
+    NVENCSTATUS st;
+    e->nvDll = LoadNvEncode(e);
+    if (!e->nvDll) {
+        EncLog(e, "Encoder: NVENC not present (not an NVIDIA GPU, or its driver files are missing)");
+        return E_NOTIMPL;
+    }
+    PFN_NvEncodeAPICreateInstance create =
+        (PFN_NvEncodeAPICreateInstance)(void*)GetProcAddress(e->nvDll, "NvEncodeAPICreateInstance");
+    PFN_NvEncodeAPIGetMaxSupportedVersion maxver =
+        (PFN_NvEncodeAPIGetMaxSupportedVersion)(void*)GetProcAddress(e->nvDll, "NvEncodeAPIGetMaxSupportedVersion");
+    if (!create || !maxver) { CloseNvenc(e); return E_NOTIMPL; }
+
+    uint32_t have = 0;
+    maxver(&have);
+    uint32_t need = (NVENCAPI_MAJOR_VERSION << 4) | NVENCAPI_MINOR_VERSION;
+    if (have < need) {
+        EncLog(e, "Encoder: NVIDIA driver too old for NVENC API %u.%u (has %u.%u)",
+               NVENCAPI_MAJOR_VERSION, NVENCAPI_MINOR_VERSION, have >> 4, have & 0xF);
+        CloseNvenc(e);
+        return E_NOTIMPL;
+    }
+    memset(&e->nv, 0, sizeof(e->nv));
+    e->nv.version = NV_ENCODE_API_FUNCTION_LIST_VER;
+    st = create(&e->nv);
+    if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NvEncodeAPICreateInstance failed (%d)", (int)st); CloseNvenc(e); return E_FAIL; }
+
+    NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS op = {};
+    op.version = NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS_VER;
+    op.deviceType = NV_ENC_DEVICE_TYPE_DIRECTX;
+    op.device = e->device;
+    op.apiVersion = NVENCAPI_VERSION;
+    st = e->nv.nvEncOpenEncodeSessionEx(&op, &e->nvEnc);
+    if (st != NV_ENC_SUCCESS) {
+        EncLog(e, "Encoder: NVENC session on this GPU failed (%d)", (int)st);
+        e->nvEnc = nullptr;
+        CloseNvenc(e);
+        return E_FAIL;
+    }
+
+    NV_ENC_PRESET_CONFIG pc = {};
+    pc.version = NV_ENC_PRESET_CONFIG_VER;
+    pc.presetCfg.version = NV_ENC_CONFIG_VER;
+    st = e->nv.nvEncGetEncodePresetConfigEx(e->nvEnc, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P3_GUID,
+                                            NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &pc);
+    if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NVENC preset failed (%d)", (int)st); CloseNvenc(e); return E_FAIL; }
+
+    NV_ENC_CONFIG cfg = pc.presetCfg;
+    cfg.version = NV_ENC_CONFIG_VER;
+    cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
+    cfg.gopLength = NVENC_INFINITE_GOPLENGTH;          /* key frames only on request */
+    cfg.frameIntervalP = 1;                            /* no B-frames */
+    cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
+    cfg.rcParams.averageBitRate = e->kbps * 1000;
+    cfg.rcParams.maxBitRate = e->kbps * 1000;
+    /* About two frames of buffer: low latency without starving big frames. */
+    cfg.rcParams.vbvBufferSize = (uint32_t)((UINT64)e->kbps * 1000 * 2 / e->fps);
+    cfg.rcParams.vbvInitialDelay = cfg.rcParams.vbvBufferSize;
+    NV_ENC_CONFIG_H264* h = &cfg.encodeCodecConfig.h264Config;
+    h->idrPeriod = NVENC_INFINITE_GOPLENGTH;
+    h->repeatSPSPPS = 1;
+    h->h264VUIParameters.videoSignalTypePresentFlag = 1;
+    h->h264VUIParameters.videoFormat = NV_ENC_VUI_VIDEO_FORMAT_UNSPECIFIED;
+    h->h264VUIParameters.videoFullRangeFlag = 0;
+    h->h264VUIParameters.colourDescriptionPresentFlag = 1;
+    h->h264VUIParameters.colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    h->h264VUIParameters.transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
+    h->h264VUIParameters.colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
+
+    NV_ENC_INITIALIZE_PARAMS ip = {};
+    ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
+    ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
+    ip.presetGUID = NV_ENC_PRESET_P3_GUID;
+    ip.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
+    ip.encodeWidth = e->width;
+    ip.encodeHeight = e->height;
+    ip.darWidth = e->width;
+    ip.darHeight = e->height;
+    ip.maxEncodeWidth = e->width;
+    ip.maxEncodeHeight = e->height;
+    ip.frameRateNum = e->fps;
+    ip.frameRateDen = 1;
+    ip.enablePTD = 1;
+    ip.encodeConfig = &cfg;
+    st = e->nv.nvEncInitializeEncoder(e->nvEnc, &ip);
+    if (st != NV_ENC_SUCCESS) {
+        EncLog(e, "Encoder: NVENC initialize %ux%u failed (%d)", e->width, e->height, (int)st);
+        CloseNvenc(e);
+        return E_FAIL;
+    }
+
+    NV_ENC_CREATE_BITSTREAM_BUFFER bb = {};
+    bb.version = NV_ENC_CREATE_BITSTREAM_BUFFER_VER;
+    st = e->nv.nvEncCreateBitstreamBuffer(e->nvEnc, &bb);
+    if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NVENC bitstream buffer failed (%d)", (int)st); CloseNvenc(e); return E_FAIL; }
+    e->nvBits = bb.bitstreamBuffer;
+
+    for (UINT i = 0; i < VDD_ENC_RING; i++) {
+        NV_ENC_REGISTER_RESOURCE rr = {};
+        rr.version = NV_ENC_REGISTER_RESOURCE_VER;
+        rr.resourceType = NV_ENC_INPUT_RESOURCE_TYPE_DIRECTX;
+        rr.width = e->width;
+        rr.height = e->height;
+        rr.resourceToRegister = e->nv12[i];
+        rr.bufferFormat = NV_ENC_BUFFER_FORMAT_NV12;
+        rr.bufferUsage = NV_ENC_INPUT_IMAGE;
+        st = e->nv.nvEncRegisterResource(e->nvEnc, &rr);
+        if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NVENC register texture failed (%d)", (int)st); CloseNvenc(e); return E_FAIL; }
+        e->nvReg[i] = rr.registeredResource;
+    }
+    e->nvenc = TRUE;
+    strcpy_s(e->name, sizeof(e->name), "NVIDIA NVENC H.264");
+    return S_OK;
+}
+
+/* Encode the NV12 texture in ring slot `slot` and hand the result to out().
+   Synchronous: a few milliseconds even at 4K. */
+static HRESULT NvencEncode(VddEncoder* e, UINT slot, BOOL key)
+{
+    NVENCSTATUS st;
+    NV_ENC_MAP_INPUT_RESOURCE mi = {};
+    mi.version = NV_ENC_MAP_INPUT_RESOURCE_VER;
+    mi.registeredResource = e->nvReg[slot];
+    st = e->nv.nvEncMapInputResource(e->nvEnc, &mi);
+    if (st != NV_ENC_SUCCESS) { EncLog(e, "Encoder: NVENC map failed (%d)", (int)st); return E_FAIL; }
+
+    NV_ENC_PIC_PARAMS pp = {};
+    pp.version = NV_ENC_PIC_PARAMS_VER;
+    pp.inputBuffer = mi.mappedResource;
+    pp.bufferFmt = mi.mappedBufferFmt;
+    pp.inputWidth = e->width;
+    pp.inputHeight = e->height;
+    pp.outputBitstream = e->nvBits;
+    pp.pictureStruct = NV_ENC_PIC_STRUCT_FRAME;
+    pp.inputTimeStamp = e->framesIn;
+    if (key) pp.encodePicFlags = NV_ENC_PIC_FLAG_FORCEIDR | NV_ENC_PIC_FLAG_OUTPUT_SPSPPS;
+    st = e->nv.nvEncEncodePicture(e->nvEnc, &pp);
+    if (st != NV_ENC_SUCCESS) {
+        e->nv.nvEncUnmapInputResource(e->nvEnc, mi.mappedResource);
+        EncLog(e, "Encoder: NVENC encode failed (%d)", (int)st);
+        return E_FAIL;
+    }
+
+    NV_ENC_LOCK_BITSTREAM lb = {};
+    lb.version = NV_ENC_LOCK_BITSTREAM_VER;
+    lb.outputBitstream = e->nvBits;
+    st = e->nv.nvEncLockBitstream(e->nvEnc, &lb);
+    if (st == NV_ENC_SUCCESS) {
+        BOOL idr = lb.pictureType == NV_ENC_PIC_TYPE_IDR;
+        if (lb.bitstreamSizeInBytes)
+            e->out(e->user, (const BYTE*)lb.bitstreamBufferPtr, lb.bitstreamSizeInBytes, idr,
+                   e->width, e->height);
+        if (e->framesOut++ == 0)
+            EncLog(e, "Encoder: first frame encoded (%u bytes, key=%d)", lb.bitstreamSizeInBytes, idr);
+        e->nv.nvEncUnlockBitstream(e->nvEnc, e->nvBits);
+    } else {
+        EncLog(e, "Encoder: NVENC lock bitstream failed (%d)", (int)st);
+    }
+    e->nv.nvEncUnmapInputResource(e->nvEnc, mi.mappedResource);
+    return st == NV_ENC_SUCCESS ? S_OK : E_FAIL;
+}
+
 /* ---- Public API ---- */
 
 HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
@@ -611,11 +832,6 @@ HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
     *result = nullptr;
     if (!device || !ctx || !out || width < 64 || height < 64 || (width & 1) || (height & 1))
         return E_INVALIDARG;
-    if (!VddMfLoad()) {
-        if (log) log("Encoder: Media Foundation is not available in this guest");
-        return E_NOTIMPL;
-    }
-
     VddEncoder* e = (VddEncoder*)calloc(1, sizeof(VddEncoder));
     if (!e) return E_OUTOFMEMORY;
     e->log = log;
@@ -646,10 +862,6 @@ HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
         e->startQpc = c.QuadPart;
     }
 
-    hr = g_mf.Startup(MF_VERSION, MFSTARTUP_NOSOCKET);
-    if (FAILED(hr)) { EncLog(e, "Encoder: MFStartup FAILED 0x%08X", hr); goto fail; }
-    e->mfStarted = TRUE;
-
     /* The encoder uses the device from its own threads. */
     {
         ID3D11Multithread* mt = nullptr;
@@ -661,6 +873,25 @@ HRESULT VddEncoderCreate(ID3D11Device* device, ID3D11DeviceContext* ctx,
 
     hr = CreateConverter(e);
     if (FAILED(hr)) goto fail;
+
+    /* NVIDIA: the NVENC API directly. */
+    if (SUCCEEDED(OpenNvenc(e))) {
+        EncLog(e, "Encoder: \"%s\" ready, %ux%u @ %u Hz, %u kbit/s",
+               e->name, width, height, e->fps, e->kbps);
+        e->pendingKey = TRUE;
+        *result = e;
+        return S_OK;
+    }
+
+    /* Other GPUs: a hardware encoder through Media Foundation. */
+    if (!VddMfLoad()) {
+        EncLog(e, "Encoder: Media Foundation is not available in this guest");
+        hr = E_NOTIMPL;
+        goto fail;
+    }
+    hr = g_mf.Startup(MF_VERSION, MFSTARTUP_NOSOCKET);
+    if (FAILED(hr)) { EncLog(e, "Encoder: MFStartup FAILED 0x%08X", hr); goto fail; }
+    e->mfStarted = TRUE;
 
     hr = g_mf.CreateDXGIDeviceManager(&e->resetToken, &e->devMgr);
     if (FAILED(hr)) { EncLog(e, "Encoder: MFCreateDXGIDeviceManager FAILED 0x%08X", hr); goto fail; }
@@ -711,6 +942,15 @@ static HRESULT FeedFrame(VddEncoder* e, BOOL forceKey)
     st.pInputSurface = e->srcView;
     hr = e->vctx->VideoProcessorBlt(e->vp, e->nv12View[slot], 0, 1, &st);
     if (FAILED(hr)) { EncLog(e, "Encoder: VideoProcessorBlt FAILED 0x%08X", hr); return hr; }
+
+    if (e->nvenc) {
+        BOOL key = e->pendingKey;
+        e->pendingKey = FALSE;
+        hr = NvencEncode(e, slot, key);
+        if (FAILED(hr)) return hr;
+        e->framesIn++;
+        return S_OK;
+    }
 
     IMFMediaBuffer* buf = nullptr;
     IMFSample* sample = nullptr;
@@ -792,6 +1032,7 @@ void VddEncoderDestroy(VddEncoder* e)
 {
     if (!e) return;
     InterlockedExchange(&e->stop, 1);
+    CloseNvenc(e);
     if (e->mft) {
         IMFShutdown* sd = nullptr;
         e->mft->ProcessMessage(MFT_MESSAGE_NOTIFY_END_STREAMING, 0);
