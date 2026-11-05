@@ -190,6 +190,38 @@ Goal: let AI agents use App Sandbox as a disposable, GPU-capable sandbox.
 
 ## 10. Other roadmap items
 
+### Drag and drop files into the VM window ("Inbox")
+
+Drop files from the host onto the VM window; they are copied into an
+**Inbox** folder in the guest (e.g. `C:\Users\<user>\Desktop\Inbox`, or
+`~/Desktop/Inbox` on Ubuntu), and the folder opens when the copy finishes.
+
+- **Host, receiving the drop**: `vm_display_idd.c` calls `DragAcceptFiles`
+  on the VM window and handles `WM_DROPFILES` (`DragQueryFileW`). App
+  Sandbox runs elevated, and UIPI blocks drops from the non-elevated
+  Explorer: allow them with `ChangeWindowMessageFilterEx` for
+  `WM_DROPFILES`, `WM_COPYDATA` and `WM_COPYGLOBALDATA (0x0049)`. OLE
+  `IDropTarget` does not work across integrity levels; use `WM_DROPFILES`.
+  Folders are walked recursively, and the relative paths are kept.
+- **Transport**: reuse the clipboard file transfer (`vm_clipboard.c`,
+  FILE_DATA messages, 1 MiB chunks, host→guest channel 5) with a new
+  "deliver to Inbox" message type. Alternatively add an agent command on
+  channel 1. Either way, bump the protocol and ignore the message on old
+  guests (rule 5.1), and update the Linux guest daemon too.
+- **Guest**: the receiver writes to a temporary name and renames it when
+  done, resolves name clashes (`name (2).ext`), refuses `..` and absolute
+  paths, and creates the Inbox in the interactive user's profile (the
+  clipboard SYSTEM writer must resolve that user's desktop).
+- **UX**:
+  - Show a drop overlay on the window while dragging over it.
+  - Show progress in the floating toolbar, with a cancel option.
+  - Write a log line per batch.
+  - Set limits: warn above a few GB, and stop if the guest disk is low.
+- **Security**: one direction only (host→guest), and only for files the
+  user dropped. The guest can never ask the host for files. No change to
+  what the guest can read on the host.
+
+
 - Controllers: bundle ViGEmBus (license OK, BSD-3; needs owner approval),
   rumble back channel (needs a host reader on ch3), PlayStation controllers
   (host HID/GameInput), stats overlay (FPS, encode/decode time, bit rate).
