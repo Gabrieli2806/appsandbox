@@ -325,6 +325,7 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_int(jb, L"vmHddGb", (int)vm_hdd_gb);
     jb_string(jb, L"defaultDiskDirectory", base_dir);
     jb_bool(jb, L"closeToTrayWithoutAsking", asb_get_suppress_tray_warn());
+    jb_bool(jb, L"autoUpdateGuestTools", asb_get_auto_update_guest_tools());
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -410,6 +411,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
             if (g_display_vm_ids[k] == v->unique_id && g_idd_displays[k])
                 driver = vm_display_idd_guest_driver(g_idd_displays[k]);
         jb_int(jb, L"displayDriver", driver);
+        jb_bool(jb, L"updatingTools", v->updating_tools);
+        jb_bool(jb, L"guestToolsOutdated", asb_vm_guest_tools_outdated(asb_vm_get(i)));
     }
 
     /* Snapshot tree */
@@ -1408,6 +1411,22 @@ static void handle_webview2_message(const wchar_t *json)
                 ui_show_alert(L"That display mode is not available.");
         }
         send_vm_list();
+    } else if (wcscmp(action, L"updateGuestTools") == 0) {
+        int idx;
+        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
+            HRESULT hr = asb_vm_update_guest_tools(asb_vm_get(idx));
+            if (hr == E_ACCESSDENIED)
+                ui_show_alert(L"Stop the VM (Shut down) before updating its guest components.");
+            else if (FAILED(hr))
+                ui_show_alert(L"Guest components can only be updated for Windows VMs.");
+        }
+        send_vm_list();
+    } else if (wcscmp(action, L"setAutoUpdateGuestTools") == 0) {
+        BOOL enabled = TRUE;
+        json_get_bool(json, L"enabled", &enabled);
+        asb_set_auto_update_guest_tools(enabled);
+        asb_save();
+        send_host_info();
     } else if (wcscmp(action, L"setCloseBehavior") == 0) {
         /* {toTray: true} = hide to the tray without asking; false = ask. */
         BOOL to_tray = FALSE;

@@ -966,10 +966,11 @@ function osIcon(osType) {
     return ICONS.monitor;
 }
 
-function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting); }
+function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting || vm.updatingTools); }
 
 /* Status label + style for a VM (kind: running | busy | stopping | stopped). */
 function vmStatus(vm) {
+    if (vm.updatingTools) return { label: 'Updating components', kind: 'busy' };
     if (vm.starting) return { label: 'Starting', kind: 'busy' };
     if (vm.buildingVhdx)
         return { label: vm.vhdxStaging ? 'Staging files' : 'Building disk ' + (vm.vhdxProgress || 0) + '%', kind: 'busy' };
@@ -1240,7 +1241,7 @@ function renderVmTable() {
     vms.forEach(function(vm, i) {
         var card = rowCache[vm.id];
         var sig = [
-            i === selectedVm, vm.name, vm.running, vm.starting, vm.buildingVhdx, vm.vhdxStaging,
+            i === selectedVm, vm.name, vm.running, vm.starting, vm.buildingVhdx, vm.vhdxStaging, vm.updatingTools,
             vm.shuttingDown, vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort, vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.hasSnapshots,
@@ -1336,6 +1337,7 @@ function renderVmDetail() {
     var actions = document.getElementById('vmd-actions');
     var bld = isBusy(vm);
     var sig = [vm.id, vm.running, bld, vm.isTemplate, vm.sshEnabled, sshReady(vm)].join('|');
+    renderToolsCard(vm);
     if (actions.getAttribute('data-sig') !== sig) {
         actions.setAttribute('data-sig', sig);
         actions.textContent = '';
@@ -1418,6 +1420,48 @@ function renderVmDetail() {
     }
 }
 
+/* ---- Guest components ---- */
+
+function renderToolsCard(vm) {
+    var card = document.getElementById('vmd-tools-card');
+    var applies = !hostBridge.isMac && vm.osType === 'Windows' && !vm.isTemplate;
+    card.hidden = !applies;
+    if (!applies) return;
+    var auto = !lastHostInfo || lastHostInfo.autoUpdateGuestTools !== false;
+    var text;
+    if (vm.updatingTools) text = 'Copying this version\u2019s agent, helpers and display driver into the VM\u2019s disk\u2026';
+    else if (!vm.installComplete) text = 'Installed with the VM. Available to update once Windows setup has finished.';
+    else if (vm.guestToolsOutdated)
+        text = 'This version of App Sandbox has newer components than this VM (agent, helpers, display driver). ' +
+            (auto ? 'They are copied in automatically the next time the VM starts, or now: ' : 'Update them now: ') +
+            'the VM must be stopped. The display driver installs during the next start.';
+    else text = 'Up to date with this version of App Sandbox.';
+    document.getElementById('vmd-tools-text').textContent = text;
+    var btn = document.getElementById('vmd-tools-btn');
+    btn.disabled = !!(vm.running || isBusy(vm) || !vm.installComplete);
+    btn.className = vm.guestToolsOutdated ? 'primary' : '';
+    btn.title = vm.running ? 'Shut the VM down first' : '';
+}
+
+function updateGuestTools(id) {
+    var vm = vms[vmIndexById(id)];
+    if (!vm || vm.running || isBusy(vm)) return;
+    showModal('Update guest components',
+        'App Sandbox will open the disk of "' + vm.name + '" and copy in this version\u2019s agent, helpers and display driver. ' +
+        'The display driver installs during the next start (the VM screen may blink once).\n\n' +
+        'Tip: take a snapshot first if you want a way back.', 'Update', { confirmClass: 'primary' })
+        .then(function(ok) {
+            if (ok) sendCmd('updateGuestTools', { vmId: id });
+        });
+}
+
+function toggleAutoTools() {
+    var on = !(lastHostInfo && lastHostInfo.autoUpdateGuestTools === false);
+    sendCmd('setAutoUpdateGuestTools', { enabled: !on });
+    if (lastHostInfo) lastHostInfo.autoUpdateGuestTools = !on;
+    renderSettingsView();
+}
+
 /* ---- Display tab ---- */
 
 const DISPLAY_PRESETS = [
@@ -1434,11 +1478,15 @@ function renderDisplayTab(vm) {
 
     var note = document.getElementById('vmd-display-note');
     var drv = typeof vm.displayDriver === 'number' ? vm.displayDriver : -1;
+    var auto = !lastHostInfo || lastHostInfo.autoUpdateGuestTools !== false;
+    document.getElementById('vmd-display-update').hidden = !(drv === 0 && !vm.running && !isBusy(vm));
     if (drv === 0) {
         note.className = 'notice warn';
-        note.innerHTML = '<strong>This VM has the older display driver.</strong> It was created with an earlier App Sandbox ' +
-            '(or from a template made with one), so it stays at 1920 × 1080 at 60 Hz. ' +
-            'Create a new VM with this version, without a template, to change resolution and refresh rate.';
+        note.innerHTML = '<strong>This VM has the older display driver,</strong> so it stays at 1920 × 1080 at 60 Hz. ' +
+            (vm.running
+                ? (auto ? 'Shut the VM down and start it again: App Sandbox updates its components before it starts.'
+                        : 'Shut the VM down, then use Update guest components.')
+                : 'Update its guest components (below), then start the VM.');
     } else if (drv >= 2) {
         note.className = 'notice ok';
         note.textContent = 'The display driver in this VM supports these settings. Changes apply in a few seconds.';
@@ -1563,6 +1611,8 @@ function renderSettingsView() {
 
     if (lastHostInfo && !hostBridge.isMac)
         document.getElementById('set-close').value = lastHostInfo.closeToTrayWithoutAsking ? 'tray' : 'ask';
+    document.getElementById('set-auto-tools').setAttribute('aria-checked',
+        lastHostInfo && lastHostInfo.autoUpdateGuestTools === false ? 'false' : 'true');
 
     var rows = [];
     if (lastHostInfo) {

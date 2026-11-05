@@ -260,6 +260,16 @@ ASB_API const wchar_t *asb_get_last_iso_path(void);
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress);
 ASB_API BOOL asb_get_suppress_tray_warn(void);
 
+/* Guest components (agent, helpers, display driver) for Windows VMs.
+   Automatic mode refreshes a VM's components before it starts whenever the
+   app has newer ones (default on). asb_vm_update_guest_tools does it now for
+   a stopped VM, on a background thread; progress and errors go to the log
+   and the VM's state notifications (VmInstance.updating_tools). */
+ASB_API void asb_set_auto_update_guest_tools(BOOL enabled);
+ASB_API BOOL asb_get_auto_update_guest_tools(void);
+ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm);
+ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm);
+
 /* Set HINSTANCE (needed by modules that use ui_get_instance). */
 ASB_API void asb_set_hinstance(HINSTANCE hInst);
 

@@ -177,6 +177,7 @@
     <ClCompile Include="tools\provision\win_provision.c" />
     <ClCompile Include="src\backend_win\d3dlayers.c" />
     <ClCompile Include="src\backend_win\snapshot.c" />
+    <ClCompile Include="src\backend_win\guest_tools.c" />
     <ClCompile Include="src\backend_win\vmms_cert.c" />
     <ClCompile Include="src\backend_win\vm_agent.c" />
     <ClCompile Include="src\backend_win\prereq.c" />

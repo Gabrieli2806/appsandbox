@@ -15,6 +15,7 @@
 #include "disk_util.h"
 #include "d3dlayers.h"
 #include "snapshot.h"
+#include "guest_tools.h"
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
@@ -211,6 +212,7 @@ static void stop_template_copies(void)
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
 static BOOL g_suppress_tray_warn = FALSE;
+static BOOL g_auto_update_tools = TRUE;
 
 static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
@@ -616,12 +618,14 @@ static BOOL save_vm_list(void)
         return FALSE;
     }
 
-    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn) {
+    if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_auto_update_tools) {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
         if (g_suppress_tray_warn)
             fwprintf(f, L"SuppressTrayWarn=1\n");
+        if (!g_auto_update_tools)
+            fwprintf(f, L"AutoUpdateGuestTools=0\n");
         fwprintf(f, L"\n");
     }
 
@@ -780,6 +784,8 @@ static void load_vm_list(void)
                 wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
+            else if (wcsncmp(line, L"AutoUpdateGuestTools=", 21) == 0)
+                g_auto_update_tools = (_wtoi(line + 21) != 0);
             continue;
         }
 
@@ -1213,6 +1219,18 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
     VmInstance *vm = args->vm;
     HRESULT hr;
     wchar_t endpoint_guid_str[64] = { 0 };
+
+    /* Refresh the guest components first when this app has newer ones. The
+       compute system is being re-created, so nothing holds the disk. A
+       failure (e.g. Windows was hibernated) is logged and the VM boots as is. */
+    if (g_auto_update_tools && guest_tools_outdated(vm)) {
+        wchar_t err[512];
+        asb_log(L"Updating guest components in \"%s\" before it starts...", vm->name);
+        if (SUCCEEDED(guest_tools_update(vm, err, ARRAYSIZE(err))))
+            asb_log(L"Guest components updated; the display driver installs during this boot.");
+        else
+            asb_log(L"Guest components not updated: %s", err);
+    }
 
     /* Allocate NAT IP before endpoint creation (only for NAT mode) */
     if (args->network_mode == NET_NAT) {
@@ -3865,6 +3883,10 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
     if (idx < 0) return E_INVALIDARG;
     inst = &VM_AT(idx);
     if (inst->starting || inst->building_vhdx) return E_ACCESSDENIED;
+    if (inst->updating_tools) {
+        asb_log(L"\"%s\" is updating its guest components; start it when that finishes.", inst->name);
+        return E_ACCESSDENIED;
+    }
     SnapshotTree *tree = &SNAP_AT(idx);
 
     if (inst->running) { asb_log(L"VM \"%s\" is already running.", inst->name); return S_FALSE; }
@@ -4681,6 +4703,83 @@ ASB_API const wchar_t *asb_get_last_iso_path(void)
 ASB_API void asb_set_suppress_tray_warn(BOOL suppress)
 {
     g_suppress_tray_warn = suppress;
+}
+
+ASB_API void asb_set_auto_update_guest_tools(BOOL enabled)
+{
+    g_auto_update_tools = enabled ? TRUE : FALSE;
+}
+
+ASB_API BOOL asb_get_auto_update_guest_tools(void)
+{
+    return g_auto_update_tools;
+}
+
+ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    if (idx < 0) return FALSE;
+    return guest_tools_outdated(&VM_AT(idx));
+}
+
+typedef struct { AsbVm vm; UINT64 id; } ToolsUpdateArgs;
+
+static DWORD WINAPI tools_update_thread(LPVOID param)
+{
+    ToolsUpdateArgs *a = (ToolsUpdateArgs *)param;
+    int idx = vm_index_of(a->vm);
+    wchar_t err[512];
+    HRESULT hr;
+    VmInstance *inst;
+
+    if (idx < 0 || VM_AT(idx).unique_id != a->id) { free(a); return 0; }
+    inst = &VM_AT(idx);
+    asb_log(L"Updating guest components in \"%s\"...", inst->name);
+    hr = guest_tools_update(inst, err, ARRAYSIZE(err));
+    if (SUCCEEDED(hr))
+        asb_log(L"Guest components updated in \"%s\". The display driver installs on the next start "
+                L"(the VM screen may blink once).", inst->name);
+    else
+        asb_alert(err[0] ? err : L"Guest components could not be updated.");
+    inst->updating_tools = FALSE;
+    notify_state(a->vm, FALSE, g_state_ud);
+    free(a);
+    return 0;
+}
+
+ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm)
+{
+    int idx = vm_index_of(vm);
+    VmInstance *inst;
+    ToolsUpdateArgs *a;
+    HANDLE t;
+
+    if (idx < 0) return E_INVALIDARG;
+    inst = &VM_AT(idx);
+    if (!guest_tools_applies(inst)) return E_INVALIDARG;
+    if (inst->running || inst->starting || inst->building_vhdx || inst->updating_tools) {
+        asb_log(L"Stop \"%s\" before updating its guest components.", inst->name);
+        return E_ACCESSDENIED;
+    }
+    /* A stopped compute system can still hold the disk; drop it (as a
+       snapshot switch does). It is re-created on the next start. */
+    if (inst->handle) hcs_close_vm(inst);
+
+    a = (ToolsUpdateArgs *)malloc(sizeof(*a));
+    if (!a) return E_OUTOFMEMORY;
+    a->vm = vm;
+    a->id = inst->unique_id;
+    inst->updating_tools = TRUE;
+    notify_state(vm, FALSE, g_state_ud);
+    t = CreateThread(NULL, 0, tools_update_thread, a, 0, NULL);
+    if (!t) {
+        inst->updating_tools = FALSE;
+        free(a);
+        notify_state(vm, FALSE, g_state_ud);
+        return HRESULT_FROM_WIN32(GetLastError());
+    }
+    CloseHandle(t);
+    return S_OK;
 }
 
 ASB_API BOOL asb_get_suppress_tray_warn(void)

@@ -377,6 +377,14 @@ body {
 .notice.ok { background: var(--success-soft); border-color: var(--success); }
 .notice strong { font-weight: 700; }
 
+.switch {
+    flex: none; width: 48px; height: 28px; padding: 3px; border-radius: 999px;
+    background: var(--border-strong); border: none; justify-content: flex-start;
+}
+.switch span { width: 22px; height: 22px; border-radius: 50%; background: var(--text-dim); }
+.switch[aria-checked="true"] { background: var(--accent); justify-content: flex-end; }
+.switch[aria-checked="true"] span { background: var(--on-accent); }
+
 .swatches { display: flex; gap: 10px; }
 .swatch {
     width: 34px; height: 34px; padding: 0; border-radius: 50%;
@@ -643,3 +651,5 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
     .detail-body { flex-direction: column; }
     .tabs { flex-direction: row; flex-basis: auto; overflow-x: auto; border-right: none; border-bottom: 1px solid var(--border); }
 }
+
+#modal-message { white-space: pre-line; }

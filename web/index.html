@@ -108,6 +108,13 @@
             <div class="tab-panel" data-panel="overview">
                 <h2 class="panel-title">Overview</h2>
                 <div class="card rows" id="vmd-overview"></div>
+                <div class="card win-only" id="vmd-tools-card">
+                    <div class="card-head">
+                        <h3>Guest components</h3>
+                        <p class="muted" id="vmd-tools-text"></p>
+                    </div>
+                    <div><button type="button" id="vmd-tools-btn" onclick="updateGuestTools(detailVmId)">Update guest components</button></div>
+                </div>
             </div>
             <div class="tab-panel" data-panel="hardware" hidden>
                 <h2 class="panel-title">Hardware</h2>
@@ -119,6 +126,7 @@
                 <h2 class="panel-title">Display</h2>
                 <p class="muted">Applied live while the VM window is open, and saved for next time.</p>
                 <div id="vmd-display-note" class="notice" role="status"></div>
+                <div id="vmd-display-update" hidden><button type="button" class="primary" onclick="updateGuestTools(detailVmId)">Update guest components</button></div>
                 <div class="card">
                     <div class="card-head">
                         <h3>Resolution</h3>
@@ -181,6 +189,13 @@
                 <option value="ask">Ask every time</option>
                 <option value="tray">Minimize to the tray</option>
             </select>
+        </div>
+    </div>
+    <h2 class="group-title win-only">Virtual machines</h2>
+    <div class="card rows win-only">
+        <div class="row">
+            <div class="row-text"><span class="row-label">Update guest components automatically</span><span class="muted small">Before a Windows VM starts, copy in this version&rsquo;s agent, helpers and display driver when they are newer.</span></div>
+            <button type="button" class="switch" id="set-auto-tools" role="switch" aria-checked="true" aria-label="Update guest components automatically" onclick="toggleAutoTools()"><span></span></button>
         </div>
     </div>
     <h2 class="group-title">This computer</h2>

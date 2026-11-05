@@ -1548,6 +1548,66 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size, DWORD
 
 /* ---- VDD device check: restart if not running ---- */
 
+/* ---- Display driver update staged by the host (guest_tools.c) ----
+ *
+ * With the VM stopped, App Sandbox copies a newer VDD package into
+ * C:\Windows\AppSandbox\drivers and leaves vdd-update.pending there. Each
+ * build signs the driver with its own test certificate, so trust that first,
+ * then update the existing Root\AppSandboxVDD device to the new package. */
+static void run_logged(const wchar_t *cmd_line, const char *what)
+{
+    STARTUPINFOW si;
+    PROCESS_INFORMATION pi;
+    wchar_t cmd[1024];
+    DWORD code = 1;
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+    wcscpy_s(cmd, ARRAYSIZE(cmd), cmd_line);
+    if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
+        agent_log("%s: could not start (%lu).", what, GetLastError());
+        return;
+    }
+    WaitForSingleObject(pi.hProcess, 120000);
+    GetExitCodeProcess(pi.hProcess, &code);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    agent_log("%s: exit %lu.", what, code);
+}
+
+static void apply_pending_vdd_update(void)
+{
+    wchar_t dir[MAX_PATH], marker[MAX_PATH], cer[MAX_PATH], sys_dir[MAX_PATH];
+    wchar_t cmd[1024], *slash;
+    char output[1024];
+    DWORD exit_code = 1;
+
+    GetModuleFileNameW(NULL, dir, MAX_PATH);
+    slash = wcsrchr(dir, L'\\');
+    if (slash) *slash = L'\0';
+    swprintf_s(marker, MAX_PATH, L"%s\\drivers\\vdd-update.pending", dir);
+    if (GetFileAttributesW(marker) == INVALID_FILE_ATTRIBUTES) return;
+
+    agent_log("VDD update: package staged by the host, installing.");
+    GetSystemDirectoryW(sys_dir, MAX_PATH);
+    swprintf_s(cer, MAX_PATH, L"%s\\drivers\\AppSandboxVDD.cer", dir);
+    if (GetFileAttributesW(cer) != INVALID_FILE_ATTRIBUTES) {
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\\certutil.exe\" -addstore Root \"%s\"", sys_dir, cer);
+        run_logged(cmd, "VDD update: trust certificate (Root)");
+        swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\\certutil.exe\" -f -addstore TrustedPublisher \"%s\"", sys_dir, cer);
+        run_logged(cmd, "VDD update: trust certificate (TrustedPublisher)");
+    }
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"update \"%s\\drivers\\AppSandboxVDD.inf\" Root\\AppSandboxVDD", dir);
+    if (run_devcon(cmd, output, sizeof(output), &exit_code))
+        agent_log("VDD update: devcon exit %lu: %.400s", exit_code, output);
+    else
+        agent_log("VDD update: devcon failed to launch (%lu).", GetLastError());
+
+    /* Remove the marker either way: retrying a failing install on every boot
+       would only repeat the failure. The host log shows how to retry. */
+    DeleteFileW(marker);
+}
+
 static void ensure_vdd_running(void)
 {
     char output[4096];
@@ -2613,6 +2673,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     set_service_status(SERVICE_RUNNING, 0);
     agent_log("Service started.");
+
+    /* A newer display driver staged by the host while the VM was off. */
+    apply_pending_vdd_update();
 
     /* Ensure VDD device is running (may need restart after logout teardown) */
     ensure_vdd_running();
