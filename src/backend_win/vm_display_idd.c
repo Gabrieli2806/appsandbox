@@ -34,6 +34,7 @@
 #include "vm_display_idd.h"
 #include "vm_video_decode.h"
 #include "vm_display_d3d12.h"
+#include "../core/asb_display_protocol.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
 #include "vm_clipboard.h"
@@ -103,9 +104,12 @@ typedef struct AudioFrameHeader {
 /* Clipboard reader-apply message (posted by vm_clipboard.c to our wndproc) */
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
 
-/* ---- Frame protocol constants ---- */
+/* ---- Frame protocol constants ----
+   The wire protocol itself (magics, message layouts, protocol versions) is
+   src/core/asb_display_protocol.h, shared with the guest display driver;
+   the names below are this file's aliases for it. */
 
-#define FRAME_MAGIC         0x52465341  /* "ASFR" little-endian */
+#define FRAME_MAGIC         VDD_FRAME_MAGIC
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
@@ -115,44 +119,27 @@ typedef struct AudioFrameHeader {
 #define MAX_FRAME_HEIGHT    4320
 #define MAX_FRAME_DATA_SIZE ((UINT)MAX_FRAME_WIDTH * MAX_FRAME_HEIGHT * 4)
 
-/* Mode request sent to the guest VDD on the frame channel (host -> guest).
-   Must match VDD_WIRE_MODE_REQUEST in tools/vdd/vdd.h. */
-#define MODE_REQUEST_MAGIC  0x524D5341  /* "ASMR" little-endian */
-#define VDD_HELLO_QUERY_MAGIC 0x51485341 /* "ASHQ": ask the guest driver what it supports */
-#define VDD_HELLO_MAGIC     0x48565341  /* "ASVH": its answer (drivers that take mode requests) */
+/* Mode request (ASMR) and hello (ASHQ/ASVH): see the shared header. */
+#define MODE_REQUEST_MAGIC  VDD_MODE_REQUEST_MAGIC
 /* Frames received with no answer to the query before the guest counts as an
    older driver. Idle guests resend a frame every ~100 ms, so this is ~2 s. */
 #define HELLO_FRAME_GRACE   20
-#pragma pack(push, 1)
-typedef struct ModeRequest {
-    UINT32 magic;
-    UINT32 width;
-    UINT32 height;
-    UINT32 refresh;
-} ModeRequest;
+typedef VDD_WIRE_MODE_REQUEST ModeRequest;
 
-/* Performance mode (guest driver protocol 3; must match tools/vdd/vdd.h).
-   Host -> guest ASPF { magic, mode, kbps, flags } (ModeRequest shape);
-   guest -> host ASPS { magic, mode, codec, hresult } and ASVE + bitstream. */
-#define PERF_REQUEST_MAGIC  0x46505341  /* "ASPF" */
-#define PERF_STATUS_MAGIC   0x53505341  /* "ASPS" */
-#define VIDEO_MAGIC         0x45565341  /* "ASVE" */
-#define PERF_FLAG_KEYFRAME  0x1
-#define VIDEO_FLAG_KEY      0x1
+/* Performance mode (driver protocol 3+): ASPF request (ModeRequest shape),
+   ASPS status, ASVE video access units. */
+#define PERF_REQUEST_MAGIC  VDD_PERF_REQUEST_MAGIC
+#define PERF_STATUS_MAGIC   VDD_PERF_STATUS_MAGIC
+#define VIDEO_MAGIC         VDD_VIDEO_MAGIC
+#define PERF_FLAG_KEYFRAME  VDD_PERF_FLAG_KEYFRAME
+#define VIDEO_FLAG_KEY      VDD_VIDEO_FLAG_KEY
 #define VDD_PROTOCOL_VIDEO  3
 #define MAX_VIDEO_AU        (32u * 1024 * 1024)
 #define MAX_VIDEO_QUEUE     (64u * 1024 * 1024)
 
-typedef struct VideoHeader {
-    UINT32 magic;
-    UINT32 width;
-    UINT32 height;
-    UINT32 codec;
-    UINT32 flags;
-    UINT32 size;
-    UINT64 seq;
-} VideoHeader;
+typedef VDD_WIRE_VIDEO_HEADER VideoHeader;
 
+#pragma pack(push, 1)
 /* One queued access unit, followed by `len` bytes. */
 typedef struct VideoQEntry {
     UINT32 len;
@@ -263,39 +250,12 @@ static const char g_ps_blur_hlsl[] =
     "    return float4(lerp(back, sharp, m), 1);\n"
     "}\n";
 
-/* ---- Frame header from wire ---- */
+/* ---- Frame and cursor headers from the wire (shared header) ---- */
 
-#pragma pack(push, 1)
-typedef struct FrameHeader {
-    UINT32 magic;
-    UINT32 width;
-    UINT32 height;
-    UINT32 stride;
-    UINT64 frame_seq;
-    UINT32 dirty_rect_count;
-} FrameHeader;
-
-/* ---- Cursor header from wire (must match VDD_WIRE_CURSOR_HEADER) ---- */
-
-#define CURSOR_MAGIC        0x52435341  /* "ASCR" little-endian */
+typedef VDD_WIRE_FRAME_HEADER FrameHeader;
+typedef VDD_WIRE_CURSOR_HEADER CursorHeader;
+#define CURSOR_MAGIC        VDD_CURSOR_MAGIC
 #define MAX_CURSOR_SIZE     (256 * 256 * 4 * 2)  /* 2x for MASKED_COLOR double-height */
-
-typedef struct CursorHeader {
-    UINT32 magic;
-    INT32  x;
-    INT32  y;
-    UINT32 visible;
-    UINT32 shape_updated;
-    UINT32 shape_id;
-    UINT32 width;
-    UINT32 height;
-    UINT32 pitch;
-    UINT32 xhot;
-    UINT32 yhot;
-    UINT32 cursor_type;     /* 1=MASKED_COLOR, 2=ALPHA */
-    UINT32 shape_data_size;
-} CursorHeader;
-#pragma pack(pop)
 
 /* ---- Display context ---- */
 
