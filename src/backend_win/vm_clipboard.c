@@ -14,11 +14,16 @@
 #include "vm_clipboard.h"
 #include "hcs_vm.h"
 #include <shlobj.h>
+#include <knownfolders.h>
+#include <sddl.h>
+#include <aclapi.h>
 #include <stdio.h>
 #include <string.h>
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
 
 /* ---- HV socket address ---- */
 
@@ -162,8 +167,11 @@ struct VmClipboardData {
     ULONGLONG        list_window;
     UINT             list_count;
 
-    /* Temp directory for file transfers */
+    /* Folder for files copied in the guest (%ProgramData%\AppSandbox\clip\<vm>),
+       empty when no safe folder could be set up (guest files are then
+       refused). root_handle keeps the admin-only clip root in place. */
     wchar_t          temp_dir[MAX_PATH];
+    HANDLE           root_handle;
     UINT64           recv_budget;          /* bytes still accepted in this guest->host transfer */
     UINT32           recv_entries;         /* files + folders still accepted in it */
 };
@@ -358,12 +366,20 @@ static BOOL clip_join_path(wchar_t *dst, const wchar_t *a, const wchar_t *b)
     return TRUE;
 }
 
+/* Delete dir and everything in it. Links (junctions, symlinks) are removed
+   as links and never followed; when dir itself is a link, or is not set,
+   nothing is touched. */
 static void clip_remove_dir_recursive(const wchar_t *dir)
 {
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
     HANDLE h;
+    DWORD attrs;
 
+    if (!dir || !dir[0]) return;
+    attrs = GetFileAttributesW(dir);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        !(attrs & FILE_ATTRIBUTE_DIRECTORY)) return;
     if (!clip_join_path(pattern, dir, L"*")) return;
     h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
@@ -382,6 +398,146 @@ static void clip_remove_dir_recursive(const wchar_t *dir)
     } while (FindNextFileW(h, &fd));
     FindClose(h);
     RemoveDirectoryW(dir);
+}
+
+/* ---- Clipboard folders ----
+
+   Files copied in a guest land in %ProgramData%\AppSandbox\clip\<vm>\. The
+   app runs elevated, so that folder must not be one that a non-elevated
+   process of the same user can change. (In %TEMP% such a process could swap
+   the folder for a junction and make the elevated app delete, write or read
+   files wherever the junction points.) The clip root is owned by
+   Administrators with a protected DACL: SYSTEM and Administrators full
+   control, Users read/execute so Explorer can paste the files. Every VM keeps
+   a handle open on the root, without delete sharing, so it cannot be renamed
+   or replaced while the VM runs. */
+
+#define CLIP_ROOT_SDDL L"O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;BU)"
+
+/* %ProgramData%\AppSandbox\clip, taken from the known-folder settings
+   rather than the ProgramData environment variable. FALSE when unknown or
+   too long. */
+static BOOL clip_root_path(wchar_t *out)
+{
+    PWSTR pd = NULL;
+    BOOL ok = FALSE;
+    if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_ProgramData, 0, NULL, &pd)) && pd &&
+        pd[0] && wcslen(pd) + 32 < MAX_PATH) {
+        swprintf_s(out, MAX_PATH, L"%s\\AppSandbox\\clip", pd);
+        ok = TRUE;
+    }
+    if (pd) CoTaskMemFree(pd);
+    return ok;
+}
+
+/* Open the folder dir itself (never a link's target) for checking and
+   setting its permissions. The handle shares read and write but not delete,
+   so while it is open nobody can rename, delete or replace the folder.
+   INVALID_HANDLE_VALUE when dir is missing, a link, or not a folder. */
+static HANDLE clip_open_dir_pinned(const wchar_t *dir)
+{
+    BY_HANDLE_FILE_INFORMATION info;
+    HANDLE h = CreateFileW(dir, READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) return h;
+    if (!GetFileInformationByHandle(h, &info) ||
+        (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ||
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        CloseHandle(h);
+        return INVALID_HANDLE_VALUE;
+    }
+    return h;
+}
+
+/* TRUE when SYSTEM or Administrators owns the object. A non-elevated
+   process cannot create an object owned by either. */
+static BOOL clip_owner_is_admin(HANDLE h)
+{
+    PSID owner = NULL;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    BOOL ok = FALSE;
+    if (GetSecurityInfo(h, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                        &owner, NULL, NULL, NULL, &sd) == ERROR_SUCCESS && owner)
+        ok = IsWellKnownSid(owner, WinBuiltinAdministratorsSid) ||
+             IsWellKnownSid(owner, WinLocalSystemSid);
+    if (sd) LocalFree(sd);
+    return ok;
+}
+
+/* Set up the clip root (root receives its path) and return a pinned handle
+   to it, or INVALID_HANDLE_VALUE when no safe root is available. A root that
+   an administrator did not create (for example one a non-elevated process
+   made first, or a link) is removed and created afresh. */
+static HANDLE clip_open_root(wchar_t *root)
+{
+    SECURITY_ATTRIBUTES sa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    wchar_t parent[MAX_PATH], *slash;
+    int attempt;
+
+    root[0] = L'\0';
+    if (!clip_root_path(root)) return INVALID_HANDLE_VALUE;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(CLIP_ROOT_SDDL, SDDL_REVISION_1,
+                                                              &sd, NULL))
+        return INVALID_HANDLE_VALUE;
+    if (!GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) || !present || !dacl) {
+        LocalFree(sd);
+        return INVALID_HANDLE_VALUE;
+    }
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+
+    /* %ProgramData%\AppSandbox, as the rest of the app creates it. */
+    wcscpy_s(parent, MAX_PATH, root);
+    slash = wcsrchr(parent, L'\\');
+    if (slash) {
+        *slash = L'\0';
+        CreateDirectoryW(parent, NULL);
+    }
+
+    for (attempt = 0; attempt < 2 && h == INVALID_HANDLE_VALUE; attempt++) {
+        BOOL created = CreateDirectoryW(root, &sa);
+        BOOL foreign = FALSE;
+        DWORD attrs;
+        if (!created && GetLastError() != ERROR_ALREADY_EXISTS) break;
+        h = clip_open_dir_pinned(root);
+        if (h != INVALID_HANDLE_VALUE && !created) {
+            /* Made by an earlier run: keep it only if an administrator owns
+               it, and put its permissions back to the expected ones. */
+            if (!clip_owner_is_admin(h)) {
+                foreign = TRUE;
+                CloseHandle(h);
+                h = INVALID_HANDLE_VALUE;
+            } else if (SetSecurityInfo(h, SE_FILE_OBJECT,
+                                       DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                       NULL, NULL, dacl, NULL) != ERROR_SUCCESS) {
+                CloseHandle(h);
+                h = INVALID_HANDLE_VALUE;
+            }
+        }
+        if (h != INVALID_HANDLE_VALUE || attempt > 0) continue;
+        /* A link, a file, or a folder a non-administrator made: remove it
+           (a link only as the link) and create it afresh. An administrator's
+           folder that merely could not be opened is left alone: other VMs
+           may be using it. */
+        attrs = GetFileAttributesW(root);
+        if (attrs == INVALID_FILE_ATTRIBUTES) continue;
+        if (!(attrs & FILE_ATTRIBUTE_DIRECTORY))
+            DeleteFileW(root);
+        else if (attrs & FILE_ATTRIBUTE_REPARSE_POINT)
+            RemoveDirectoryW(root);
+        else if (foreign)
+            clip_remove_dir_recursive(root);
+        else
+            break;
+    }
+    LocalFree(sd);
+    return h;
 }
 
 /* Create the folders above file_path. Returns how many it had to create. */
@@ -450,29 +606,20 @@ static BOOL clip_path_is_safe(const wchar_t *rel_path)
 #define CLIP_MAX_TRANSFER_ENTRIES 250000u
 
 /* TRUE when path names an entry inside one of this app's clipboard folders
-   (%TEMP%\AppSandboxClip-<vm>\<name>...), where every CF_HDROP this process
-   builds from guest files points. */
+   (%ProgramData%\AppSandbox\clip\<vm>\<name>...), where every CF_HDROP
+   this process builds from guest files points. */
 static BOOL clip_path_in_clip_temp(const wchar_t *path)
 {
-    static const wchar_t prefix[] = L"AppSandboxClip-";
-    wchar_t tmp[MAX_PATH], root[MAX_PATH], full[MAX_PATH];
+    wchar_t root[MAX_PATH], full[MAX_PATH];
     const wchar_t *rest, *sep;
     size_t root_len;
     DWORD n;
 
-    n = GetTempPathW(MAX_PATH, tmp);
-    if (n == 0 || n >= MAX_PATH) return FALSE;
-    n = GetFullPathNameW(tmp, MAX_PATH, root, NULL);
-    if (n == 0 || n >= MAX_PATH) return FALSE;
+    if (!clip_root_path(root)) return FALSE;
     root_len = wcslen(root);
-    if (root[root_len - 1] != L'\\') {
-        if (root_len + 2 > MAX_PATH) return FALSE;
-        root[root_len++] = L'\\';
-        root[root_len] = L'\0';
-    }
-    if (root_len + ARRAYSIZE(prefix) > MAX_PATH) return FALSE;
-    wcscat_s(root, MAX_PATH, prefix);
-    root_len = wcslen(root);
+    if (root_len + 2 > MAX_PATH) return FALSE;
+    root[root_len++] = L'\\';
+    root[root_len] = L'\0';
 
     /* GetFullPathNameW folds "..", so a path cannot climb back out. */
     n = GetFullPathNameW(path, MAX_PATH, full, NULL);
@@ -618,6 +765,7 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
     wchar_t *ptr;
     int i;
 
+    if (!temp_dir[0]) return NULL;
     if (!clip_join_path(pattern, temp_dir, L"*")) return NULL;
     h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return NULL;
@@ -910,7 +1058,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
                 UINT fi;
                 /* Files go to a guest only when the host user copied them.
                    A file list this process put on the clipboard came from a
-                   guest and points into a clipboard temp folder; any other
+                   guest and points into a clipboard folder; any other
                    path in it is never sent. */
                 BOOL from_guest = clip_hdrop_is_from_guest();
                 if (file_count > CLIP_MAX_FORMATS) file_count = CLIP_MAX_FORMATS;
@@ -1115,7 +1263,7 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
        keeps 1 GB free; anything else is read off the wire and dropped. */
     {
         BOOL accept = clip->sync_enabled && clip->share_guest_to_host &&
-                      clip_reader_hdrop_pending(clip);
+                      clip->temp_dir[0] && clip_reader_hdrop_pending(clip);
         ULARGE_INTEGER free_bytes;
         if (accept && (!clip_path_is_safe(rel_path) ||
                        !clip_join_path(full_path, clip->temp_dir, rel_path))) {
@@ -1496,7 +1644,7 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
                                         VmClipboardLogFn log_fn, void *log_ud)
 {
     VmClipboard clip;
-    wchar_t tmp[MAX_PATH];
+    wchar_t root[MAX_PATH];
     SOCKET writer_s;
     GUID svc;
 
@@ -1526,13 +1674,22 @@ ASB_API VmClipboard vm_clipboard_create(const GUID *runtime_id,
 
     clip->push_event = CreateEventW(NULL, FALSE, FALSE, NULL);
 
-    GetTempPathW(MAX_PATH, tmp);
-    /* One folder per VM: two running VMs must not clear each other's
-       transfers. */
-    swprintf_s(clip->temp_dir, MAX_PATH, L"%sAppSandboxClip-%08lX%04X", tmp,
-               runtime_id ? runtime_id->Data1 : GetCurrentProcessId(),
-               runtime_id ? runtime_id->Data2 : 0);
-    CreateDirectoryW(clip->temp_dir, NULL);
+    /* One folder per VM under the admin-only clip root: two running VMs
+       must not clear each other's transfers. Without a safe root, files
+       copied in the guest are refused rather than written elsewhere. */
+    clip->root_handle = clip_open_root(root);
+    if (clip->root_handle != INVALID_HANDLE_VALUE && wcslen(root) + 16 < MAX_PATH) {
+        swprintf_s(clip->temp_dir, MAX_PATH, L"%s\\%08lX%04X", root,
+                   runtime_id ? runtime_id->Data1 : GetCurrentProcessId(),
+                   runtime_id ? runtime_id->Data2 : 0);
+        clip_remove_dir_recursive(clip->temp_dir);   /* left over from a crash */
+        CreateDirectoryW(clip->temp_dir, NULL);
+    } else {
+        clip->temp_dir[0] = L'\0';
+        clip_log(clip, L"CLIP: Could not set up the clipboard folder under %s; "
+                       L"files copied in the guest will not reach the host.",
+                 root[0] ? root : L"ProgramData");
+    }
 
     /* Initial writer connection */
     hcs_service_guid(clip->os_type, 5, &svc);
@@ -1600,6 +1757,8 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
 
     clip_reader_free_pending(clip);
     clip_remove_dir_recursive(clip->temp_dir);
+    if (clip->root_handle && clip->root_handle != INVALID_HANDLE_VALUE)
+        CloseHandle(clip->root_handle);
 
     DeleteCriticalSection(&clip->writer_cs);
     DeleteCriticalSection(&clip->reader_cs);

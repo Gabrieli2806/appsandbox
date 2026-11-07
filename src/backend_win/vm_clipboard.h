@@ -25,9 +25,10 @@
  * from the guest is discarded.
  *
  * The guest is untrusted. From it the host takes only text, images, HTML,
- * RTF and files (copied into a per-VM temp folder, size-limited); it never
- * takes a file list naming host paths. To it the host sends only formats it
- * offered, and files only when the host user copied them.
+ * RTF and files (copied into a per-VM folder under the admin-only
+ * %ProgramData%\AppSandbox\clip, size-limited); it never takes a file list
+ * naming host paths. To it the host sends only formats it offered, and files
+ * only when the host user copied them.
  */
 
 /* Sync-enable message sent on :0005. Body: 1 byte (0=disable, 1=enable). */
