@@ -13,6 +13,7 @@
 
 #include <winsock2.h>
 #include <windows.h>
+#include <commctrl.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -50,6 +51,7 @@
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "imm32.lib")
+#pragma comment(lib, "comctl32.lib")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
@@ -222,17 +224,30 @@ static const char g_ps_hlsl[] =
     "}\n";
 
 /* Adaptive resolution backdrop. While the guest catches up with a new
-   window shape, the whole window is drawn in one pass: a blurred, dimmed
-   copy of the picture scaled to cover the window (small mip level + 5x5
-   tent), and the sharp picture on top whose edges fade into it over a
-   feather band, so there is no visible seam.
-   b0: a = cover scale xy, lod, dim; b = backdrop texel xy, fade, 0;
-       r = picture rect in window uv (x0 y0 x1 y1); f = feather xy in uv. */
+   window shape, the whole window is drawn in one pass (the same source is
+   compiled for ps_4_0 on D3D11 and ps_5_0 on D3D12):
+   - backdrop: the picture scaled to cover the window, read from a small
+     mip level (~32 px wide) through a 5x5 tent, slightly desaturated and
+     dimmed, fading in;
+   - a soft drop shadow under the picture, offset down a little;
+   - the picture itself, sharp up to its rounded corners (the edge is
+     antialiased over one pixel), with a faint 1 px light outline.
+   Shapes use the signed distance to a rounded box, in pixels (SV_POSITION).
+   Corner radius, shadow and outline grow with the fade so nothing pops.
+   b0 (16 floats):
+     a = cover scale xy, backdrop lod, fade (0..1)
+     b = backdrop texel size xy, brightness, desaturation (0..1)
+     r = picture rect in client pixels (x0 y0 x1 y1)
+     f = corner radius, shadow size, shadow offset down (pixels), shadow opacity */
 static const char g_ps_blur_hlsl[] =
     "Texture2D pic : register(t0);\n"
     "Texture2D bg : register(t1);\n"
     "SamplerState samp : register(s0);\n"
     "cbuffer P : register(b0) { float4 a; float4 b; float4 r; float4 f; };\n"
+    "float rbox(float2 p, float2 h, float k) {\n"
+    "    float2 q = abs(p) - h + k;\n"
+    "    return min(max(q.x, q.y), 0.0) + length(max(q, 0.0)) - k;\n"
+    "}\n"
     "float4 main(float4 pos : SV_POSITION, float2 uv : TEXCOORD0) : SV_TARGET {\n"
     "    float2 c = 0.5 + (uv - 0.5) * a.xy;\n"
     "    float4 s = 0; float w = 0;\n"
@@ -242,12 +257,21 @@ static const char g_ps_blur_hlsl[] =
     "        s += bg.SampleLevel(samp, c + float2(x, y) * b.xy * 1.5, a.z) * k;\n"
     "        w += k;\n"
     "    }\n"
-    "    float3 back = (s / w).rgb * a.w * b.z;\n"
-    "    float2 puv = (uv - r.xy) / (r.zw - r.xy);\n"
-    "    float3 sharp = pic.SampleLevel(samp, saturate(puv), 0).rgb;\n"
-    "    float2 d = min(uv - r.xy, r.zw - uv) / f.xy;\n"
-    "    float m = smoothstep(0.0, 1.0, saturate(min(d.x, d.y)));\n"
-    "    return float4(lerp(back, sharp, m), 1);\n"
+    "    float3 back = s.rgb / w;\n"
+    "    float l = dot(back, float3(0.2126, 0.7152, 0.0722));\n"
+    "    back = lerp(back, float3(l, l, l), b.w) * (b.z * a.w);\n"
+    "    float2 sz = max(r.zw - r.xy, 1.0);\n"
+    "    float2 hs = sz * 0.5;\n"
+    "    float2 p = pos.xy - (r.xy + hs);\n"
+    "    float rad = min(f.x * a.w, min(hs.x, hs.y));\n"
+    "    float d = rbox(p, hs, rad);\n"
+    "    float ss = max(f.y, 1.0);\n"
+    "    float sh = 1.0 - smoothstep(-0.25 * ss, ss, rbox(p - float2(0.0, f.z), hs, rad));\n"
+    "    back *= 1.0 - f.w * a.w * sh * sh;\n"
+    "    float3 sharp = pic.SampleLevel(samp, saturate((pos.xy - r.xy) / sz), 0).rgb;\n"
+    "    float3 col = lerp(back, sharp, saturate(0.5 - d));\n"
+    "    col = lerp(col, float3(1.0, 1.0, 1.0), 0.1 * a.w * saturate(1.0 - abs(d + 0.5)));\n"
+    "    return float4(col, 1.0);\n"
     "}\n";
 
 /* ---- Frame and cursor headers from the wire (shared header) ---- */
@@ -274,7 +298,9 @@ struct VmDisplayIdd {
 
     /* Floating toolbar (owned popup over the top edge of the render area). */
     HWND          toolbar_hwnd;
+    HWND          toolbar_tip;        /* tooltips for its icon buttons */
     BOOL          toolbar_pinned;
+    BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting" */
     int           toolbar_hot;        /* item under the pointer, -1 none */
     RECT          toolbar_items[12];  /* client rects of the items, for hit tests */
     int           toolbar_count;
@@ -306,6 +332,12 @@ struct VmDisplayIdd {
     UINT                     bg_w, bg_h;
     BOOL                     bg_stale;
     ID3D11SamplerState      *sampler;
+    /* GPU device lost (driver update or reset, TDR): the renderer is
+       rebuilt on the window thread, retrying with a growing delay. */
+    BOOL                     gpu_lost;
+    ULONGLONG                gpu_retry_at;
+    UINT                     gpu_retry_ms;
+    BOOL                     present_err_logged;
 
     /* Frame buffer (CPU-side, updated by recv thread) */
     BYTE          *frame_buf;
@@ -412,8 +444,11 @@ struct VmDisplayIdd {
     volatile BOOL    clip_share_host_to_guest;
     volatile BOOL    clip_share_guest_to_host;
 
-    /* Audio playback channel (:0004 — guest→host render) */
+    /* Audio playback channel (:0004 — guest→host render). The audio thread
+       owns and closes the socket; audio_lock lets the window thread wake it
+       (idd_wake_threads) without racing that close. */
     volatile SOCKET  audio_socket;
+    SRWLOCK          audio_lock;
     HANDLE           audio_recv_thread;
     volatile BOOL    audio_muted;
 
@@ -1492,8 +1527,15 @@ static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
     AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)sub, L"Display");
 }
 
+/* What the window waits for while no frames arrive: shown on the toolbar
+   and in the title instead of the frame rate (the picture is black then). */
+static const wchar_t *idd_status_text(VmDisplayIdd *d)
+{
+    return d->recv_count ? L"Reconnecting\u2026" : L"Waiting for the display\u2026";
+}
+
 /* Window title: name, guest resolution and the frame rate received from the
-   guest. Refreshed at most twice a second. */
+   guest, or what it is waiting for. Refreshed at most twice a second. */
 static void idd_update_title(VmDisplayIdd *d, BOOL force)
 {
     ULONGLONG now = GetTickCount64();
@@ -1510,7 +1552,10 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
     d->fps_last_recv = recv;
     d->fps_tick = now;
 
-    if (!asb_get_viewer_title_stats()) {
+    if (!d->frame_connected) {
+        swprintf_s(title, ARRAYSIZE(title), L"%s%s - %s", d->audio_muted ? L"\U0001F507 " : L"",
+                   d->vm_name, idd_status_text(d));
+    } else if (!asb_get_viewer_title_stats()) {
         /* Settings > VM windows: name only. */
         swprintf_s(title, ARRAYSIZE(title), L"%s%s", d->audio_muted ? L"\U0001F507 " : L"", d->vm_name);
     } else
@@ -1599,9 +1644,15 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
         else
             swprintf_s(text, cap, L"%ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
         break;
-    case TB_FPS:     *icon = FALSE; swprintf_s(text, cap, L"%u FPS%s", d->frame_connected ? d->fps_value : 0,
-                              (d->frame_connected && d->video_active)
-                                  ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" \u00B7 HEVC" : L" \u00B7 H.264") : L""); break;
+    case TB_FPS:
+        *icon = FALSE;
+        if (!d->frame_connected)
+            wcscpy_s(text, cap, idd_status_text(d));
+        else
+            swprintf_s(text, cap, L"%u FPS%s", d->fps_value,
+                       d->video_active
+                           ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" \u00B7 HEVC" : L" \u00B7 H.264") : L"");
+        break;
     case TB_CLIP:    wcscpy_s(text, cap, L"\xE77F"); *on = d->clip_share_host_to_guest && d->clip_share_guest_to_host; break;
     case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); *on = !d->audio_muted; break;
     case TB_KEYS:    wcscpy_s(text, cap, L"\xE765"); *on = d->transmit_hotkeys; break;
@@ -1619,12 +1670,41 @@ static const wchar_t *tb_tooltip(VmDisplayIdd *d, int item)
     case TB_CLIP:    return d->clip_share_host_to_guest && d->clip_share_guest_to_host
                          ? L"Clipboard shared (click to stop)" : L"Clipboard not shared (click to share)";
     case TB_AUDIO:   return d->audio_muted ? L"Unmute audio" : L"Mute audio";
-    case TB_KEYS:    return L"Send Windows shortcuts (Win, Alt+Tab) to the VM";
+    case TB_KEYS:    return d->transmit_hotkeys
+                         ? L"Windows shortcuts (Win, Alt+Tab) go to the VM (click to keep them on this PC)"
+                         : L"Send Windows shortcuts (Win, Alt+Tab) to the VM";
     case TB_FULL:    return L"Borderless fullscreen (F11)";
     case TB_PIN:     return d->toolbar_pinned ? L"Let the toolbar hide" : L"Keep the toolbar visible";
     case TB_MORE:    return L"More options";
     default:         return NULL;
     }
+}
+
+/* Tooltips for the icon buttons: one tool per item (id = item), text asked
+   for when shown (TTN_GETDISPINFO) so toggles read their current state.
+   tb_position keeps the tool rectangles on the buttons. */
+static void tb_add_tooltips(VmDisplayIdd *d)
+{
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_BAR_CLASSES };
+    TTTOOLINFOW ti;
+    int item;
+    InitCommonControlsEx(&icc);
+    d->toolbar_tip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL,
+                                     WS_POPUP | TTS_ALWAYSTIP | TTS_NOPREFIX,
+                                     CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                                     d->toolbar_hwnd, NULL, d->hInstance, NULL);
+    if (!d->toolbar_tip) return;
+    for (item = 0; item < TB_COUNT; item++) {
+        if (!tb_tooltip(d, item)) continue;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = TTTOOLINFOW_V2_SIZE;     /* accepted by every comctl32 version */
+        ti.uFlags = TTF_SUBCLASS;
+        ti.hwnd = d->toolbar_hwnd;
+        ti.uId = (UINT_PTR)item;
+        ti.lpszText = LPSTR_TEXTCALLBACKW;
+        SendMessageW(d->toolbar_tip, TTM_ADDTOOLW, 0, (LPARAM)&ti);
+    }
+    SendMessageW(d->toolbar_tip, TTM_SETMAXTIPWIDTH, 0, tb_scale(d, 360));
 }
 
 /* Measure items and size the window; positions are kept for hit tests. */
@@ -1671,6 +1751,20 @@ static void tb_position(VmDisplayIdd *d)
     dc = GetDC(d->toolbar_hwnd);
     sz = tb_layout(d, dc);
     ReleaseDC(d->toolbar_hwnd, dc);
+    if (d->toolbar_tip) {
+        /* Keep the tooltip areas on the buttons (their widths change). */
+        TTTOOLINFOW ti;
+        int item;
+        for (item = 0; item < d->toolbar_count; item++) {
+            if (!tb_tooltip(d, item)) continue;
+            ZeroMemory(&ti, sizeof(ti));
+            ti.cbSize = TTTOOLINFOW_V2_SIZE;
+            ti.hwnd = d->toolbar_hwnd;
+            ti.uId = (UINT_PTR)item;
+            ti.rect = d->toolbar_items[item];
+            SendMessageW(d->toolbar_tip, TTM_NEWTOOLRECTW, 0, (LPARAM)&ti);
+        }
+    }
     GetClientRect(d->render_hwnd, &rc);
     top.x = rc.left + (rc.right - rc.left - sz.cx) / 2;
     top.y = rc.top + tb_scale(d, TB_MARGIN_PX);
@@ -1682,6 +1776,7 @@ static void tb_position(VmDisplayIdd *d)
 static void tb_hide(VmDisplayIdd *d)
 {
     if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) return;
+    if (d->toolbar_tip) SendMessageW(d->toolbar_tip, TTM_POP, 0, 0);
     ShowWindow(d->toolbar_hwnd, SW_HIDE);
     KillTimer(d->hwnd, IDT_TOOLBAR);
     d->toolbar_hot = -1;
@@ -1715,7 +1810,7 @@ static void tb_on_timer(VmDisplayIdd *d)
     if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) { KillTimer(d->hwnd, IDT_TOOLBAR); return; }
     SetTimer(d->hwnd, IDT_TOOLBAR, 400, NULL);
     if (d->relative_mouse) { tb_hide(d); return; }
-    if (d->toolbar_pinned) return;
+    if (d->toolbar_pinned || !d->frame_connected) return;   /* pinned, or showing the status */
     GetCursorPos(&pt);
     GetWindowRect(d->toolbar_hwnd, &tr);
     band = tr;
@@ -1884,12 +1979,8 @@ static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             TRACKMOUSEEVENT tme = { sizeof(tme), TME_LEAVE, hwnd, 0 };
             TrackMouseEvent(&tme);
             if (hot != d->toolbar_hot) {
-                const wchar_t *tip = hot >= 0 ? tb_tooltip(d, hot) : NULL;
                 d->toolbar_hot = hot;
                 InvalidateRect(hwnd, NULL, FALSE);
-                /* Tooltip-like hint in the log line of the title is enough;
-                   keep the toolbar itself compact. */
-                (void)tip;
             }
             SetCursor(LoadCursorW(NULL, IDC_ARROW));
         }
@@ -1908,8 +1999,22 @@ static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         }
         return 0;
     case WM_APP + 1:
-        if (d) tb_refresh(d);
+        if (d) {
+            tb_refresh(d);
+            if (d->toolbar_tip) SendMessageW(d->toolbar_tip, TTM_UPDATE, 0, 0);  /* toggled text */
+        }
         return 0;
+    case WM_NOTIFY:
+        /* Tooltip text for a button (tools are registered per item id). */
+        if (d && ((NMHDR *)lp)->code == TTN_GETDISPINFOW) {
+            NMTTDISPINFOW *di = (NMTTDISPINFOW *)lp;
+            const wchar_t *tip = tb_tooltip(d, (int)di->hdr.idFrom);
+            di->lpszText = (LPWSTR)(tip ? tip : L"");
+            di->szText[0] = 0;
+            di->hinst = NULL;
+            return 0;
+        }
+        break;
     }
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
@@ -2382,6 +2487,64 @@ failed:
 }
 
 /* ==================================================================
+ * Stopping the worker threads
+ *
+ * The receive, audio and controller threads all use `d`, so it is freed
+ * only once every one of them has ended (vm_display_idd_destroy). WM_CLOSE
+ * sets d->stop, wakes the threads blocked on a socket and joins them.
+ * ================================================================== */
+
+/* Wake a thread blocked in recv() on s without closing the socket: its
+   owner closes it, so the handle value cannot be reused under it. Later
+   receives fail at once and a pending one is cancelled. */
+static void idd_wake_socket(SOCKET s)
+{
+    if (s == INVALID_SOCKET) return;
+    shutdown(s, SD_BOTH);
+    CancelIoEx((HANDLE)s, NULL);
+}
+
+/* After d->stop is set: wake the receive and audio threads. Each socket is
+   touched under the lock its owner holds while publishing or retiring it. */
+static void idd_wake_threads(VmDisplayIdd *d)
+{
+    AcquireSRWLockExclusive(&d->frame_send_lock);
+    idd_wake_socket(d->frame_socket);
+    ReleaseSRWLockExclusive(&d->frame_send_lock);
+    AcquireSRWLockExclusive(&d->audio_lock);
+    idd_wake_socket(d->audio_socket);
+    ReleaseSRWLockExclusive(&d->audio_lock);
+}
+
+/* Wait up to timeout_ms for a worker thread to end. Messages sent to this
+   thread's windows are still handled meanwhile (a worker may be inside
+   SendMessage to the log list box); posted ones stay queued. On success the
+   handle is closed and cleared. On timeout it is kept: a handle left set
+   tells vm_display_idd_destroy that `d` is still in use. */
+static BOOL idd_join_thread(VmDisplayIdd *d, HANDLE *h, const wchar_t *what, DWORD timeout_ms)
+{
+    ULONGLONG end = GetTickCount64() + timeout_ms;
+    if (!*h) return TRUE;
+    for (;;) {
+        ULONGLONG now = GetTickCount64();
+        DWORD left = now >= end ? 0 : (DWORD)(end - now);
+        DWORD r = MsgWaitForMultipleObjectsEx(1, h, left, QS_SENDMESSAGE, 0);
+        if (r == WAIT_OBJECT_0) break;
+        if (r == WAIT_OBJECT_0 + 1 && left) {
+            MSG m;
+            PeekMessageW(&m, NULL, 0, 0, PM_NOREMOVE | PM_QS_SENDMESSAGE);
+            continue;
+        }
+        ui_log(L"[%s] VM window: the %s thread has not stopped after %u s.",
+               d->vm_name, what, (unsigned)(timeout_ms / 1000));
+        return FALSE;
+    }
+    CloseHandle(*h);
+    *h = NULL;
+    return TRUE;
+}
+
+/* ==================================================================
  * Audio playback — guest -> host
  * ================================================================== */
 
@@ -2431,9 +2594,17 @@ static DWORD WINAPI audio_recv_thread_proc(LPVOID param)
         /* Blocking recv for the session */
         {
             DWORD no_timeout = 0;
+            BOOL stopping;
             setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (char *)&no_timeout, sizeof(no_timeout));
+            /* Published under audio_lock so WM_CLOSE can wake this thread;
+               d->stop is read under it too, so a close that came first is
+               seen here. */
+            AcquireSRWLockExclusive(&d->audio_lock);
+            d->audio_socket = s;
+            stopping = d->stop;
+            ReleaseSRWLockExclusive(&d->audio_lock);
+            if (stopping) goto session_cleanup;
         }
-        d->audio_socket = s;
 
         /* Read one-shot AudioHeader.
            The guest closes without sending a header when the VAD endpoint
@@ -2563,10 +2734,10 @@ session_cleanup:
         if (pEnum)  { IMMDeviceEnumerator_Release(pEnum); pEnum = NULL; }
         if (renderfmt) { CoTaskMemFree(renderfmt); renderfmt = NULL; }
 
-        if (d->audio_socket != INVALID_SOCKET) {
-            closesocket(d->audio_socket);
-            d->audio_socket = INVALID_SOCKET;
-        }
+        AcquireSRWLockExclusive(&d->audio_lock);
+        d->audio_socket = INVALID_SOCKET;
+        ReleaseSRWLockExclusive(&d->audio_lock);
+        closesocket(s);
         if (session_logged) {
             idd_log(d, L"Audio session ended.");
             session_logged = FALSE;
@@ -2574,12 +2745,15 @@ session_cleanup:
 
         if (d->stop) break;
         /* Back off when the guest keeps rejecting us (VAD not ready) */
-        Sleep(header_misses > 3 ? 5000 : 500);
+        {
+            int wait, backoff = header_misses > 3 ? 5000 : 500;
+            for (wait = 0; wait < backoff && !d->stop; wait += 100)
+                Sleep(100);
+        }
     }
 
     if (scratch) HeapFree(GetProcessHeap(), 0, scratch);
     if (com_ok)  CoUninitialize();
-    d->audio_recv_thread = NULL;
     return 0;
 }
 
@@ -2806,6 +2980,56 @@ static BOOL d3d_init(VmDisplayIdd *d)
     return TRUE;
 }
 
+/* TRUE when the GPU device is gone (driver update or reset, TDR, GPU
+   removed). hr is the result of the call that failed (S_OK: only ask the
+   devices). Marks the renderer for a rebuild on the next paint. */
+static BOOL d3d_check_lost(VmDisplayIdd *d, HRESULT hr)
+{
+    HRESULT reason = S_OK;
+    if (d->gpu_lost) return TRUE;
+    if (d->device) reason = d->device->lpVtbl->GetDeviceRemovedReason(d->device);
+    if (SUCCEEDED(reason) && d->dx12) reason = dx12_device_removed_reason(d->dx12);
+    if (SUCCEEDED(reason) && hr != DXGI_ERROR_DEVICE_REMOVED && hr != DXGI_ERROR_DEVICE_RESET)
+        return FALSE;
+    d->gpu_lost = TRUE;
+    d->gpu_retry_at = 0;
+    d->gpu_retry_ms = 500;
+    idd_log_main(d, L"The graphics device was reset or removed (0x%08X); restarting the renderer.",
+                 (unsigned)(FAILED(reason) ? reason : hr));
+    return TRUE;
+}
+
+static void d3d_cleanup(VmDisplayIdd *d);
+static void d3d_resize_swap_chain(VmDisplayIdd *d);
+
+/* Rebuild the renderer after the GPU device was lost. The CPU copy of the
+   last raw frame survives and is uploaded again; in performance mode the
+   guest is asked for a key frame. While the driver is still coming back,
+   retries with a growing delay (0.5 s up to 8 s). Window thread only. */
+static BOOL d3d_rebuild(VmDisplayIdd *d)
+{
+    ULONGLONG now = GetTickCount64();
+    if (now < d->gpu_retry_at) return FALSE;
+    d3d_cleanup(d);
+    if (!d3d_init(d)) {
+        d3d_cleanup(d);
+        d->gpu_retry_at = now + d->gpu_retry_ms;
+        if (d->gpu_retry_ms < 8000) d->gpu_retry_ms *= 2;
+        return FALSE;
+    }
+    d->gpu_lost = FALSE;
+    d->present_err_logged = FALSE;
+    d->anim_valid = FALSE;
+    d->bd_start = 0;
+    d->showing_video = FALSE;
+    d->frame_dirty = TRUE;
+    d3d_resize_swap_chain(d);
+    idd_log_main(d, L"Renderer restarted (Direct3D %d).", d->dx12 ? 12 : 11);
+    if (d->video_active) idd_send_perf(d, PERF_FLAG_KEYFRAME);
+    idd_update_title(d, TRUE);
+    return TRUE;
+}
+
 static void d3d_resize_swap_chain(VmDisplayIdd *d)
 {
     RECT rc;
@@ -2835,17 +3059,20 @@ static void d3d_resize_swap_chain(VmDisplayIdd *d)
             (UINT)rc.right, (UINT)rc.bottom,
             DXGI_FORMAT_UNKNOWN, 0);
     if (FAILED(hr)) {
-        ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
+        if (!d3d_check_lost(d, hr))
+            ui_log(L"IDD: ResizeBuffers failed (0x%08X)", hr);
         return;
     }
 
     hr = d->swap_chain->lpVtbl->GetBuffer(d->swap_chain, 0,
                                    &IID_ID3D11Texture2D, (void **)&back_buf);
     if (SUCCEEDED(hr)) {
-        d->device->lpVtbl->CreateRenderTargetView(d->device,
+        hr = d->device->lpVtbl->CreateRenderTargetView(d->device,
                 (ID3D11Resource *)back_buf, NULL, &d->rtv);
         back_buf->lpVtbl->Release(back_buf);
     }
+    if (FAILED(hr) && !d3d_check_lost(d, hr))
+        ui_log(L"IDD: back buffer view failed (0x%08X)", hr);
 }
 
 /* Re-create the frame texture when the guest resolution changed. Called with
@@ -2951,6 +3178,9 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
             if (!key) { need_key = TRUE; continue; }
             d->vdec = vm_video_decoder_create(d->device, d->ctx, e.codec, e.width, e.height,
                                               idd_video_log, d);
+            /* A lost GPU device is not a missing decoder: the renderer is
+               rebuilt and asks for a key frame then. */
+            if (!d->vdec && d3d_check_lost(d, S_OK)) break;
             if (!d->vdec && e.codec == VM_VIDEO_CODEC_HEVC) {
                 /* No working HEVC decoder here: ask for H.264 instead. */
                 d->hevc_unavailable = TRUE;
@@ -2974,6 +3204,7 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
             vm_video_decoder_destroy(d->vdec);
             d->vdec = NULL;
             need_key = TRUE;
+            if (d3d_check_lost(d, S_OK)) break;
             continue;
         }
         if (r > 0) got = TRUE;
@@ -3039,51 +3270,59 @@ static float ease_out_cubic(float t)
     return 1.0f - t * t * t;
 }
 
-/* Constants for the backdrop blend shader (b0, 16 floats) for a picture
-   at rect (x, y, w, h client pixels). Also refreshes the mip-mapped copy.
-   FALSE = backdrop not available. */
+/* Look of the adaptive backdrop (sizes in pixels at 100% scaling). */
+#define BD_FADE_MS        180.0f   /* backdrop fade-in */
+#define BD_BRIGHTNESS     0.45f
+#define BD_DESATURATE     0.30f    /* mix toward luminance */
+#define BD_CORNER_PX      12.0f
+#define BD_SHADOW_PX      28.0f
+#define BD_SHADOW_DOWN_PX 6.0f
+#define BD_SHADOW_ALPHA   0.5f
+
+/* Constants for the backdrop blend shader (b0, 16 floats, layout in the
+   comment above g_ps_blur_hlsl) for a picture at rect (x, y, w, h client
+   pixels). Used by the D3D11 and the D3D12 renderer alike. Also refreshes
+   the mip-mapped copy. FALSE = backdrop not available. */
 static BOOL d3d_blend_consts(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
                              UINT cw, UINT ch, const float *rect, float fade, float *c)
 {
-    float fa, ca, lod = 0.0f, mw, feather;
-    UINT fw = d->frame_width, fh = d->frame_height, lw, lh;
-    BOOL bars_x, bars_y;
+    float fa, ca, lod = 0.0f, mw, scale;
+    UINT fw = d->frame_width, fh = d->frame_height, lw, lh, dpi;
 
     if (!src || !fw || !fh || !cw || !ch) return FALSE;
     if (!d3d_bg_update(d, src)) return FALSE;
 
     fa = (float)fw / (float)fh;
     ca = (float)cw / (float)ch;
-    for (mw = (float)fw; mw > 48.0f; mw *= 0.5f) lod += 1.0f;   /* ~48 px wide mip */
+    for (mw = (float)fw; mw > 32.0f; mw *= 0.5f) lod += 1.0f;   /* ~32 px wide mip */
     lw = fw >> (UINT)lod; if (!lw) lw = 1;
     lh = fh >> (UINT)lod; if (!lh) lh = 1;
-    /* Feather: about 6% of the picture's short side, at least 24 px. */
-    feather = (rect[2] < rect[3] ? rect[2] : rect[3]) * 0.06f;
-    if (feather < 24.0f) feather = 24.0f;
-    bars_x = rect[0] > 0.5f || rect[0] + rect[2] < (float)cw - 0.5f;
-    bars_y = rect[1] > 0.5f || rect[1] + rect[3] < (float)ch - 0.5f;
+    /* Corner and shadow sizes follow the window's DPI scaling. */
+    dpi = d->hwnd ? GetDpiForWindow(d->hwnd) : 96;
+    scale = (float)(dpi ? dpi : 96) / 96.0f;
 
     c[0] = ca > fa ? 1.0f : ca / fa;      /* cover */
     c[1] = ca > fa ? fa / ca : 1.0f;
     c[2] = lod;
-    c[3] = 0.6f;                          /* dim */
+    c[3] = fade;
     c[4] = 1.0f / (float)lw;
     c[5] = 1.0f / (float)lh;
-    c[6] = fade;
-    c[7] = 0.0f;
-    c[8]  = rect[0] / (float)cw;
-    c[9]  = rect[1] / (float)ch;
-    c[10] = (rect[0] + rect[2]) / (float)cw;
-    c[11] = (rect[1] + rect[3]) / (float)ch;
-    /* No fade along edges that touch the window (no bars there). */
-    c[12] = bars_x ? feather / (float)cw : 1e-6f;
-    c[13] = bars_y ? feather / (float)ch : 1e-6f;
-    c[14] = c[15] = 0.0f;
+    c[6] = BD_BRIGHTNESS;
+    c[7] = BD_DESATURATE;
+    c[8]  = rect[0];
+    c[9]  = rect[1];
+    c[10] = rect[0] + rect[2];
+    c[11] = rect[1] + rect[3];
+    c[12] = BD_CORNER_PX * scale;
+    c[13] = BD_SHADOW_PX * scale;
+    c[14] = BD_SHADOW_DOWN_PX * scale;
+    c[15] = BD_SHADOW_ALPHA;
     return TRUE;
 }
 
-/* Draw the picture (rect x,y,w,h in client pixels) blended into the
-   blurred backdrop over the whole client area. FALSE = not drawn. */
+/* Draw the picture (rect x,y,w,h in client pixels) with rounded corners
+   and a drop shadow over the blurred backdrop, over the whole client
+   area. FALSE = not drawn. */
 static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
                               UINT cw, UINT ch, const float *rect, float fade)
 {
@@ -3118,6 +3357,19 @@ static BOOL d3d_draw_adaptive(VmDisplayIdd *d, ID3D11ShaderResourceView *src,
     return TRUE;
 }
 
+/* Present the D3D11 swap chain. A lost device schedules a rebuild; other
+   errors are logged once until a frame gets through again. */
+static void d3d_present11(VmDisplayIdd *d)
+{
+    HRESULT hr = d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    if (SUCCEEDED(hr)) {
+        d->present_err_logged = FALSE;
+    } else if (!d3d_check_lost(d, hr) && !d->present_err_logged) {
+        d->present_err_logged = TRUE;
+        idd_log_main(d, L"Present failed (0x%08X).", (unsigned)hr);
+    }
+}
+
 static void d3d_render_frame(VmDisplayIdd *d)
 {
     D3D11_MAPPED_SUBRESOURCE mapped;
@@ -3127,6 +3379,8 @@ static void d3d_render_frame(VmDisplayIdd *d)
     float clear_color[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
     BOOL frame_uploaded = FALSE;
 
+    if (d->gpu_lost && !d3d_rebuild(d))
+        return;
     if (!d->device || !d->ctx || (!d->dx12 && (!d->swap_chain || !d->rtv)))
         return;
 
@@ -3134,6 +3388,8 @@ static void d3d_render_frame(VmDisplayIdd *d)
        the previous) and show the last picture. */
     if (d->vq_len && idd_decode_video(d))
         frame_uploaded = TRUE;
+    if (d->gpu_lost)
+        return;
 
     /* Upload frame data to GPU texture if dirty */
     if (d->frame_dirty) {
@@ -3141,11 +3397,16 @@ static void d3d_render_frame(VmDisplayIdd *d)
         if (!d3d_ensure_frame_texture(d)) {
             d->frame_dirty = FALSE;
             LeaveCriticalSection(&d->frame_cs);
+            d3d_check_lost(d, S_OK);
             return;
         }
         hr = d->ctx->lpVtbl->Map(d->ctx,
                 (ID3D11Resource *)d->frame_tex, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (FAILED(hr) && d3d_check_lost(d, hr)) {
+            LeaveCriticalSection(&d->frame_cs);
+            return;
+        }
         if (SUCCEEDED(hr)) {
             UINT row;
             UINT copy_stride = d->frame_width * 4;
@@ -3202,13 +3463,13 @@ static void d3d_render_frame(VmDisplayIdd *d)
 
     {
         ID3D11ShaderResourceView *srv = d->frame_srv;
-        float target[4], shown[4];
+        float target[4], shown[4], fade = 1.0f;
         ULONGLONG now = GetTickCount64();
         BOOL bars;
         if (d->showing_video && d->vdec)
             srv = vm_video_decoder_srv(d->vdec);
 
-        /* Ease the shown picture rect toward where it belongs (~180 ms)
+        /* Ease the shown picture rect toward where it belongs (~200 ms)
            instead of jumping when the window or resolution changes. */
         target[0] = vp.TopLeftX; target[1] = vp.TopLeftY;
         target[2] = vp.Width;    target[3] = vp.Height;
@@ -3238,38 +3499,30 @@ static void d3d_render_frame(VmDisplayIdd *d)
         memcpy(shown, d->anim_rect, sizeof(shown));
 
         /* Adaptive sizes are rounded (width to 8 px), so a few pixels of
-           bar are normal once settled: only real gaps get the backdrop. */
+           bar are normal once settled: only real gaps get the backdrop.
+           Without them the plain picture is drawn. */
         bars = d->res_choice == RES_ADAPTIVE &&
                ((float)rc.right - shown[2] > 12.0f || (float)rc.bottom - shown[3] > 12.0f);
+        if (bars) {
+            if (!d->bd_start) d->bd_start = now;
+            fade = (float)(now - d->bd_start) / BD_FADE_MS;          /* fade in */
+            if (fade >= 1.0f) fade = 1.0f; else d->anim_active = TRUE;
+            fade = ease_out_cubic(fade);
+        } else {
+            d->bd_start = 0;
+        }
         if (d->dx12) {
             /* Direct3D 12 presents; D3D11 only provides the textures. */
             float consts[16];
-            BOOL blend = FALSE;
-            if (bars) {
-                float fade;
-                if (!d->bd_start) d->bd_start = now;
-                fade = (float)(now - d->bd_start) / 220.0f;
-                if (fade >= 1.0f) fade = 1.0f; else d->anim_active = TRUE;
-                blend = d3d_blend_consts(d, srv, (UINT)rc.right, (UINT)rc.bottom, shown,
-                                         ease_out_cubic(fade), consts);
-            } else {
-                d->bd_start = 0;
-            }
-            dx12_present(d->dx12, srv, shown, blend, blend ? d->bg_srv : NULL, consts);
+            BOOL blend = bars && d3d_blend_consts(d, srv, (UINT)rc.right, (UINT)rc.bottom,
+                                                  shown, fade, consts);
+            if (!dx12_present(d->dx12, srv, shown, blend, blend ? d->bg_srv : NULL, consts))
+                d3d_check_lost(d, S_OK);
             return;
         }
-        if (bars) {
-            float fade;
-            if (!d->bd_start) d->bd_start = now;
-            fade = (float)(now - d->bd_start) / 220.0f;             /* fade in */
-            if (fade >= 1.0f) fade = 1.0f; else d->anim_active = TRUE;
-            fade = ease_out_cubic(fade);
-            if (d3d_draw_adaptive(d, srv, (UINT)rc.right, (UINT)rc.bottom, shown, fade)) {
-                d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
-                return;
-            }
-        } else {
-            d->bd_start = 0;
+        if (bars && d3d_draw_adaptive(d, srv, (UINT)rc.right, (UINT)rc.bottom, shown, fade)) {
+            d3d_present11(d);
+            return;
         }
 
         vp.TopLeftX = shown[0]; vp.TopLeftY = shown[1];
@@ -3284,13 +3537,17 @@ static void d3d_render_frame(VmDisplayIdd *d)
         d->ctx->lpVtbl->Draw(d->ctx, 3, 0);
     }
 
-    d->swap_chain->lpVtbl->Present(d->swap_chain, 0, 0);
+    d3d_present11(d);
 }
 
 static void d3d_cleanup(VmDisplayIdd *d)
 {
     if (d->vdec)       { vm_video_decoder_destroy(d->vdec);              d->vdec = NULL; }
     if (d->dx12)       { dx12_destroy(d->dx12);                          d->dx12 = NULL; }
+    /* Unbind everything and flush after the releases, so the swap chain is
+       really gone (a new one can be made for the same window after a
+       device loss). */
+    if (d->ctx)        d->ctx->lpVtbl->ClearState(d->ctx);
     if (d->bg_srv)     { d->bg_srv->lpVtbl->Release(d->bg_srv);         d->bg_srv = NULL; }
     if (d->bg_tex)     { d->bg_tex->lpVtbl->Release(d->bg_tex);         d->bg_tex = NULL; }
     if (d->cb_blur)    { d->cb_blur->lpVtbl->Release(d->cb_blur);       d->cb_blur = NULL; }
@@ -3302,6 +3559,7 @@ static void d3d_cleanup(VmDisplayIdd *d)
     if (d->frame_tex)  { d->frame_tex->lpVtbl->Release(d->frame_tex);   d->frame_tex = NULL; }
     if (d->rtv)        { d->rtv->lpVtbl->Release(d->rtv);               d->rtv = NULL; }
     if (d->swap_chain) { d->swap_chain->lpVtbl->Release(d->swap_chain); d->swap_chain = NULL; }
+    if (d->ctx)        d->ctx->lpVtbl->Flush(d->ctx);
     if (d->ctx)        { d->ctx->lpVtbl->Release(d->ctx);               d->ctx = NULL; }
     if (d->device)     { d->device->lpVtbl->Release(d->device);         d->device = NULL; }
 }
@@ -3606,11 +3864,11 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
         FrameHeader hdr;
 
         /* Ensure input channel is connected (independent of frame channel) */
-        if (input_s == INVALID_SOCKET)
+        if (input_s == INVALID_SOCKET && !d->stop)
             input_s = connect_input(d);
 
         /* Clipboard module (handles :0005 + :0006 internally) */
-        if (!d->clipboard) {
+        if (!d->clipboard && !d->stop) {
             d->clipboard = vm_clipboard_create(&d->runtime_id, d->os_type,
                                                d->hwnd, clip_log_callback, d);
             if (d->clipboard) {
@@ -3624,10 +3882,13 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
         /* Ensure audio recv thread is running (:0004, guest→host).
            The thread handles connecting on its own — the helper may not be up yet. */
-        if (!d->audio_recv_thread) {
+        if (!d->audio_recv_thread && !d->stop) {
             d->audio_recv_thread = CreateThread(NULL, 0, audio_recv_thread_proc, d, 0, NULL);
             idd_log(d, L"Audio: Started recv thread (will connect when helper is available).");
         }
+
+        /* Each step above can take seconds: stop promptly when closing. */
+        if (d->stop) break;
 
         /* Try to connect frame channel (VDD driver, GUID :0002) */
         idd_log(d, L"Connecting to frame service...");
@@ -4134,6 +4395,7 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         BOOL dark = TRUE;
         DwmSetWindowAttribute(d->toolbar_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof(corner));
         DwmSetWindowAttribute(d->toolbar_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        tb_add_tooltips(d);
         tb_show(d, 4000);
     }
 
@@ -4413,39 +4675,32 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             idd_flush_held_keys(d);
             idd_flush_mouse_buttons(d);
 
-            /* Stop recv threads */
+            /* Stop the worker threads. The window disappears at once; the
+               threads can take a few seconds (a connect or the guest's
+               input handshake in progress). */
             d->stop = TRUE;
             idd_update_relative_mouse(d);
+            tb_hide(d);
+            if (d->log_hwnd && IsWindow(d->log_hwnd)) ShowWindow(d->log_hwnd, SW_HIDE);
+            ShowWindow(hwnd, SW_HIDE);
+            idd_wake_threads(d);
 
-            /* Destroy clipboard module */
-            if (d->clipboard) {
+            /* The receive thread first: it creates the clipboard module and
+               the audio thread, so nothing new appears once it has ended.
+               A thread that does not end keeps its handle, and `d` is then
+               never freed (vm_display_idd_destroy). */
+            idd_join_thread(d, &d->recv_thread, L"receive", 15000);
+
+            /* Destroy clipboard module (only once its creator has ended) */
+            if (!d->recv_thread && d->clipboard) {
                 vm_clipboard_destroy(d->clipboard);
                 d->clipboard = NULL;
             }
 
-            /* Wait for audio recv thread (:0004) */
-            if (d->audio_recv_thread) {
-                if (d->audio_socket != INVALID_SOCKET) {
-                    closesocket(d->audio_socket);
-                    d->audio_socket = INVALID_SOCKET;
-                }
-                WaitForSingleObject(d->audio_recv_thread, 2000);
-                CloseHandle(d->audio_recv_thread);
-                d->audio_recv_thread = NULL;
-            }
-
-            if (d->gamepad_thread) {
-                WaitForSingleObject(d->gamepad_thread, 1000);
-                CloseHandle(d->gamepad_thread);
-                d->gamepad_thread = NULL;
-            }
-
-            /* Wait briefly for recv thread to exit */
-            if (d->recv_thread) {
-                WaitForSingleObject(d->recv_thread, 2000);
-                CloseHandle(d->recv_thread);
-                d->recv_thread = NULL;
-            }
+            /* Audio (:0004) and controller threads */
+            idd_wake_threads(d);
+            idd_join_thread(d, &d->audio_recv_thread, L"audio", 10000);
+            idd_join_thread(d, &d->gamepad_thread, L"controller", 5000);
 
             d->open = FALSE;
 
@@ -4479,8 +4734,9 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         KillTimer(hwnd, IDT_PRESENT);
         KillTimer(hwnd, IDT_TOOLBAR);
         if (d && d->toolbar_hwnd) {
-            DestroyWindow(d->toolbar_hwnd);
+            DestroyWindow(d->toolbar_hwnd);     /* also destroys its tooltips */
             d->toolbar_hwnd = NULL;
+            d->toolbar_tip = NULL;
         }
         if (d) idd_remove_kbd_hook(d);  /* safety net if WM_CLOSE was bypassed */
         if (d) {
@@ -4568,8 +4824,18 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_PRESENT && d) {
             if (d->mouse_sync_pending) idd_poll_mouse_position(d);
-            if (d->frame_dirty || d->anim_active)
+            if (d->frame_dirty || d->anim_active || d->gpu_lost)
                 d3d_render_frame(d);
+            /* Before the first frame and while reconnecting the picture is
+               black: say why on the toolbar (kept up) and in the title. */
+            if (d->status_shown != !d->frame_connected) {
+                d->status_shown = !d->frame_connected;
+                if (d->status_shown && d->toolbar_hwnd && !IsWindowVisible(d->toolbar_hwnd))
+                    tb_show(d, 400);
+                else
+                    tb_refresh(d);
+                idd_update_title(d, TRUE);
+            }
             idd_update_title(d, FALSE);
         } else if (wp == IDT_ADAPTIVE && d) {
             /* Still dragging: wait for the drag to end. */
@@ -4948,6 +5214,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->keyboard_version   = 1;
     d->input_socket       = INVALID_SOCKET;
     d->audio_socket       = INVALID_SOCKET;
+    InitializeSRWLock(&d->audio_lock);
     d->clipboard          = NULL;
     d->cursor_visible     = TRUE;
 
@@ -4995,7 +5262,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
 
 void vm_display_idd_destroy(VmDisplayIdd *display)
 {
-    BOOL quit_requested = FALSE;
+    BOOL quit_requested = FALSE, posted = FALSE, in_use = FALSE;
     int quit_code = 0;
     if (!display) return;
 
@@ -5003,16 +5270,21 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
     display->stop = TRUE;
     display->open = FALSE;
 
-    /* Close the window to unblock the message pump */
-    if (display->hwnd && IsWindow(display->hwnd))
-        PostMessageW(display->hwnd, WM_CLOSE, 0, 0);
-
-    /* Wait for window thread (pumping messages to stay responsive) */
+    /* Wait for the window thread, pumping messages to stay responsive. Its
+       WM_CLOSE stops and joins the worker threads. WM_CLOSE is (re)posted
+       once the window exists: it may still be being created. `display` is
+       freed only after every thread that uses it has ended; if one does not
+       end in time it is left allocated (a small leak instead of a crash
+       that would take every running VM down with the app). */
     if (display->window_thread) {
-        DWORD result;
-        do {
-            result = MsgWaitForMultipleObjects(
-                1, &display->window_thread, FALSE, 5000, QS_ALLINPUT);
+        ULONGLONG start = GetTickCount64();
+        BOOL warned = FALSE;
+        for (;;) {
+            DWORD result;
+            if (!posted && display->hwnd && IsWindow(display->hwnd))
+                posted = PostMessageW(display->hwnd, WM_CLOSE, 0, 0);
+            result = MsgWaitForMultipleObjects(1, &display->window_thread, FALSE, 250, QS_ALLINPUT);
+            if (result == WAIT_OBJECT_0) break;
             if (result == WAIT_OBJECT_0 + 1) {
                 MSG msg;
                 while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -5024,41 +5296,56 @@ void vm_display_idd_destroy(VmDisplayIdd *display)
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
+            } else if (result != WAIT_TIMEOUT) {
+                in_use = TRUE;           /* cannot wait: do not free */
+                break;
             }
-        } while (result == WAIT_OBJECT_0 + 1);
+            if (GetTickCount64() - start > 5000 && !warned) {
+                warned = TRUE;
+                ui_log(L"[%s] VM window: still closing...", display->vm_name);
+            }
+            if (GetTickCount64() - start > 60000) {
+                ui_log(L"[%s] VM window: did not close in 60 s; its memory is left allocated.",
+                       display->vm_name);
+                in_use = TRUE;
+                break;
+            }
+        }
         CloseHandle(display->window_thread);
+        display->window_thread = NULL;
+    }
+    if (in_use) {
+        if (quit_requested) PostQuitMessage(quit_code);
+        return;
     }
 
-    /* recv_thread is cleaned up by WM_CLOSE handler, but guard just in case */
-    if (display->recv_thread) {
-        WaitForSingleObject(display->recv_thread, 3000);
-        CloseHandle(display->recv_thread);
+    /* Worker threads WM_CLOSE could not join (or that run without it, when
+       the window failed to start): give them a last chance. */
+    if (display->recv_thread || display->audio_recv_thread || display->gamepad_thread) {
+        idd_wake_threads(display);
+        if (!idd_join_thread(display, &display->recv_thread, L"receive", 5000)) in_use = TRUE;
     }
 
     /* Clipboard is cleaned up by WM_CLOSE handler, but guard */
-    if (display->clipboard) {
+    if (!in_use && display->clipboard) {
         vm_clipboard_destroy(display->clipboard);
         display->clipboard = NULL;
     }
-
-    /* audio_recv_thread guard */
-    if (display->audio_recv_thread) {
-        if (display->audio_socket != INVALID_SOCKET) {
-            closesocket(display->audio_socket);
-            display->audio_socket = INVALID_SOCKET;
-        }
-        WaitForSingleObject(display->audio_recv_thread, 3000);
-        CloseHandle(display->audio_recv_thread);
+    if (display->audio_recv_thread || display->gamepad_thread) {
+        idd_wake_threads(display);
+        if (!idd_join_thread(display, &display->audio_recv_thread, L"audio", 5000)) in_use = TRUE;
+        if (!idd_join_thread(display, &display->gamepad_thread, L"controller", 2000)) in_use = TRUE;
+    }
+    if (in_use) {
+        ui_log(L"[%s] VM window: a thread is still running; its memory is left allocated.",
+               display->vm_name);
+        if (quit_requested) PostQuitMessage(quit_code);
+        return;
     }
 
     DeleteCriticalSection(&display->frame_cs);
     if (display->vq_buf) HeapFree(GetProcessHeap(), 0, display->vq_buf);
     if (display->vq_work) HeapFree(GetProcessHeap(), 0, display->vq_work);
-
-    if (display->clipboard) {
-        vm_clipboard_destroy(display->clipboard);
-        display->clipboard = NULL;
-    }
 
     if (display->frame_buf)
         HeapFree(GetProcessHeap(), 0, display->frame_buf);

@@ -61,6 +61,7 @@ struct Dx12Presenter {
     ID3D12PipelineState      *pso_blend;
 
     SharedTex                 pic, bg;
+    BOOL                      present_err_logged;   /* log a failing Present once */
 };
 
 static void plog(Dx12Presenter *p, const wchar_t *fmt, ...)
@@ -464,10 +465,21 @@ extern "C" BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
     HRESULT hr = p->swap->Present(0, 0);
     wait_idle(p);                                      /* one frame in flight; allocator reuse */
     if (FAILED(hr)) {
-        plog(p, L"D3D12: Present failed (0x%08X)", hr);
+        /* Once until a frame gets through again (it repeats every frame);
+           a lost device is reported by dx12_device_removed_reason. */
+        if (!p->present_err_logged) {
+            p->present_err_logged = TRUE;
+            plog(p, L"D3D12: Present failed (0x%08X)", hr);
+        }
         return FALSE;
     }
+    p->present_err_logged = FALSE;
     return TRUE;
+}
+
+extern "C" HRESULT dx12_device_removed_reason(Dx12Presenter *p)
+{
+    return (p && p->dev) ? p->dev->GetDeviceRemovedReason() : S_OK;
 }
 
 extern "C" const wchar_t *dx12_adapter_name(Dx12Presenter *p)

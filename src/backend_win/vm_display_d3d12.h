@@ -5,8 +5,9 @@
  * raw-frame upload stay on the D3D11 device; each frame is copied into
  * textures shared with D3D12 (synchronised with a shared fence), and D3D12
  * draws the window: flip-model swap chain, the plain picture or the
- * adaptive backdrop composite, Present. If anything here fails the viewer
- * falls back to its D3D11 swap chain.
+ * adaptive composite (blurred backdrop, rounded picture with a shadow),
+ * Present. If anything here fails the viewer falls back to its D3D11 swap
+ * chain.
  */
 #ifndef VM_DISPLAY_D3D12_H
 #define VM_DISPLAY_D3D12_H
@@ -33,12 +34,19 @@ void dx12_resize(Dx12Presenter *p, UINT width, UINT height);
 /* Draw one frame and present.
    pic: the picture (BGRA, frame size) as a D3D11 SRV.
    viewport: x, y, w, h of the picture in client pixels.
-   blend: draw the backdrop composite instead (bg = mip-mapped copy of the
-   picture, consts = the 16 floats of the blend shader's constant buffer).
-   Returns FALSE if the frame could not be drawn. */
+   blend: draw the adaptive composite over the whole window instead (bg =
+   mip-mapped copy of the picture, consts = the 16 floats of the blend
+   shader's constant buffer, passed as root constants b0; same layout as
+   the D3D11 path, see g_ps_blur_hlsl in vm_display_idd.c).
+   Returns FALSE if the frame could not be drawn (a failing Present is
+   logged once). */
 BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
                   const float viewport[4], BOOL blend,
                   ID3D11ShaderResourceView *bg, const float consts[16]);
+
+/* S_OK while the D3D12 device works; otherwise why it was removed
+   (driver update or reset, TDR). The viewer then rebuilds its renderer. */
+HRESULT dx12_device_removed_reason(Dx12Presenter *p);
 
 /* Adapter name, for the log/title. */
 const wchar_t *dx12_adapter_name(Dx12Presenter *p);
