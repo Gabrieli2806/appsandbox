@@ -111,6 +111,17 @@ static ICoreWebView2Environment *g_env;
    previous browser process is still shutting down. */
 #define RESTART_RETRY_MS 2000
 static int g_restart_retries;
+
+/* HRESULT_FROM_WIN32(ERROR_BUSY): the user data folder still belongs to a
+   WebView2 browser process that has not finished (an App Sandbox window
+   that was just closed, or one left behind by a process that was ended).
+   Starting is retried every BUSY_RETRY_MS for BUSY_RETRIES tries, then the
+   window uses a second user data folder so it still opens. */
+#define WV2_E_BUSY       ((HRESULT)0x800700AAL)
+#define BUSY_RETRY_MS    1000
+#define BUSY_RETRIES     15
+static int  g_busy_retries;
+static BOOL g_alt_user_data;
 static UINT_PTR g_restart_timer;
 
 /* Subclass of the parent window: see parent_subclass_proc. */
@@ -994,6 +1005,7 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
 
     /* The WebView started: a later failure is a new one. */
     g_restart_retries = 0;
+    g_busy_retries = 0;
     g_controller = controller;
     controller->lpVtbl->AddRef(controller);
     g_webview = webview;
@@ -1048,7 +1060,8 @@ static HRESULT start_environment(void)
         wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
     if (wcslen(base) + 32 >= MAX_PATH)
         return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
-    swprintf_s(udf, MAX_PATH, L"%s\\AppSandbox\\WebView2Data", base);
+    swprintf_s(udf, MAX_PATH, g_alt_user_data ? L"%s\\AppSandbox\\WebView2Data.2"
+                                              : L"%s\\AppSandbox\\WebView2Data", base);
 
     eh = (EnvHandler *)calloc(1, sizeof(EnvHandler));
     if (!eh) return E_OUTOFMEMORY;
@@ -1101,6 +1114,22 @@ static void CALLBACK retry_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
 static void start_failed(HRESULT hr)
 {
     if (g_shutting_down) return;
+    if (hr == WV2_E_BUSY && (g_busy_retries < BUSY_RETRIES || !g_alt_user_data)) {
+        UINT delay = BUSY_RETRY_MS;
+        if (g_busy_retries < BUSY_RETRIES) {
+            if (g_busy_retries == 0)
+                ui_log(L"WebView2: its data folder is still in use by another WebView2 process; "
+                       L"waiting for it to close");
+            g_busy_retries++;
+        } else {
+            g_alt_user_data = TRUE;
+            delay = 10;
+            ui_log(L"WebView2: the data folder stayed in use; using WebView2Data.2 instead");
+        }
+        kill_restart_timer();
+        g_restart_timer = SetTimer(NULL, 0, delay, retry_timer_proc);
+        if (g_restart_timer) return;
+    }
     if (g_restart_retries > 0) {
         g_restart_retries--;
         kill_restart_timer();
@@ -1122,6 +1151,7 @@ static void restart_webview(int kind)
 
     g_declined_failure = FAIL_NONE;
     g_restart_retries = 0;
+    g_busy_retries = 0;
     kill_restart_timer();
 
     /* The page process ended but the browser process runs: load the page
@@ -1437,7 +1467,8 @@ BOOL webview2_init(HWND parent, HINSTANCE hInstance)
         /* The runtime is there, so offer to try again rather than leave the
            window empty. */
         ui_log(L"WebView2: CreateEnvironment failed (0x%08X)", (unsigned)hr);
-        report_failure(FAIL_START, hr);
+        if (hr == WV2_E_BUSY) start_failed(hr);   /* waits, then retries */
+        else report_failure(FAIL_START, hr);
     }
 
     return TRUE;
