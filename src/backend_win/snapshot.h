@@ -68,8 +68,10 @@ typedef struct {
 /* Initialize snapshot tree.  Loads tree.dat from base_dir if it exists. */
 void snapshot_init(SnapshotTree *tree, const wchar_t *base_dir);
 
-/* Persist snapshot tree metadata to tree.dat. */
-void snapshot_save(SnapshotTree *tree);
+/* Persist snapshot tree metadata to tree.dat (through tree.dat.tmp, so a
+   failed write keeps the previous file). The functions below that change
+   the tree undo their changes, files included, when this fails. */
+HRESULT snapshot_save(SnapshotTree *tree);
 
 /* Take a new snapshot: freeze the VM's current state under a name.
    On a working branch, that branch becomes the snapshot; on a frozen disk,
@@ -92,10 +94,12 @@ HRESULT snapshot_select_branch(SnapshotTree *tree, VmInstance *instance, int ind
 HRESULT snapshot_ensure_writable(SnapshotTree *tree, VmInstance *instance);
 
 /* Delete a snapshot and all its branches.
-   Fails with ERROR_DIR_NOT_EMPTY while another snapshot was taken on it. */
+   Fails with ERROR_DIR_NOT_EMPTY while another snapshot was taken on it, and
+   with ERROR_SHARING_VIOLATION (nothing deleted) while one of its disks is
+   open elsewhere. The VM must be stopped. */
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index);
 
-/* Delete a single branch.
+/* Delete a single branch (kept when its disk is open elsewhere).
    index >= 0: snapshot branch.  index == -2: base branch. */
 HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int index, int branch_idx);
 

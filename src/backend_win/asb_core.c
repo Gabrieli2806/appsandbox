@@ -18,6 +18,7 @@
 #include <sddl.h>
 #include "snapshot.h"
 #include "guest_tools.h"
+#include "asb_paths.h"
 
 /* Repository and ref the Ubuntu guest sources come from (see
    Directory.Build.props). Given as bare tokens by the build, e.g.
@@ -205,6 +206,10 @@ static void prepare_gl_layers_share(GpuDriverShareList *shares)
     gpu_append_gl_layers_share(shares, dir);
 }
 
+/* Guards the VM table and the template list (see remove_vm_record). */
+static CRITICAL_SECTION g_cs;
+static BOOL g_cs_ready = FALSE;    /* g_cs usable (asb_init .. asb_cleanup) */
+
 typedef struct {
     VmInstance vm;
     SnapshotTree snapshots;
@@ -220,6 +225,11 @@ static BOOL g_config_load_failed;
    "unassigned." Used by long-lived threads (agent, IDD probe) so they
    keep working across compactions of g_vms[]. */
 
+/* The VM table (g_vm_order, g_vm_count) changes only under g_cs: records are
+   appended by create/import (UI or API thread) and removed by delete, by a
+   failed build and by template finalization (worker and HCS threads). */
+
+/* Caller holds g_cs. */
 static void remove_vm_record(int index)
 {
     VmRecord *removed = g_vm_order[index];
@@ -228,6 +238,60 @@ static void remove_vm_record(int index)
     g_vm_order[--g_vm_count] = removed;
     if (removed->vm.start_thread) CloseHandle(removed->vm.start_thread);
     ZeroMemory(removed, sizeof(*removed));
+}
+
+#define RECORD_OF(vm_ptr) CONTAINING_RECORD((vm_ptr), VmRecord, vm)
+
+/* A cleared free record for a new VM, or NULL when the table is full. The
+   VM joins the list only through append_vm_record; until then a removal on
+   another thread may move the record among the free ones, never into the
+   list, so a half-built VM is never visible. */
+static VmInstance *claim_vm_record(void)
+{
+    VmInstance *vm = NULL;
+    EnterCriticalSection(&g_cs);
+    if (g_vm_count < ASB_MAX_VMS) {
+        VmRecord *record = g_vm_order[g_vm_count];
+        ZeroMemory(record, sizeof(*record));
+        vm = &record->vm;
+    }
+    LeaveCriticalSection(&g_cs);
+    return vm;
+}
+
+/* Append a claimed record to the VM list. Returns its index, or -1. */
+static int append_vm_record(VmInstance *vm)
+{
+    int i, index = -1;
+    EnterCriticalSection(&g_cs);
+    for (i = g_vm_count; i < ASB_MAX_VMS; i++) {
+        if (&g_vm_order[i]->vm == vm) {
+            VmRecord *record = g_vm_order[i];
+            g_vm_order[i] = g_vm_order[g_vm_count];
+            g_vm_order[g_vm_count] = record;
+            index = g_vm_count++;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return index;
+}
+
+/* Remove a VM from the list under the lock, wherever it is now. Returns the
+   index it had (for the removed callback), or -1. */
+static int remove_vm(VmInstance *vm)
+{
+    int i, index = -1;
+    EnterCriticalSection(&g_cs);
+    for (i = 0; i < g_vm_count; i++) {
+        if (&g_vm_order[i]->vm == vm) {
+            remove_vm_record(i);
+            index = i;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
+    return index;
 }
 
 typedef struct {
@@ -245,6 +309,8 @@ typedef struct {
     wchar_t source[MAX_PATH];
 } TemplateCopy;
 static TemplateCopy g_template_copies[ASB_MAX_VMS];
+/* Export and import disk copies (same slot type: thread + cancel event). */
+static TemplateCopy g_disk_copies[ASB_MAX_VMS];
 
 static void release_template_copy(TemplateCopy *copy)
 {
@@ -253,16 +319,23 @@ static void release_template_copy(TemplateCopy *copy)
     ZeroMemory(copy, sizeof(*copy));
 }
 
-static void stop_template_copies(void)
+static void stop_copies(TemplateCopy *copies)
 {
     int i;
     for (i = 0; i < ASB_MAX_VMS; i++)
-        if (g_template_copies[i].cancel_event) SetEvent(g_template_copies[i].cancel_event);
+        if (copies[i].cancel_event) SetEvent(copies[i].cancel_event);
     for (i = 0; i < ASB_MAX_VMS; i++) {
-        if (g_template_copies[i].thread)
-            WaitForSingleObject(g_template_copies[i].thread, INFINITE);
-        release_template_copy(&g_template_copies[i]);
+        if (copies[i].thread)
+            WaitForSingleObject(copies[i].thread, INFINITE);
+        release_template_copy(&copies[i]);
     }
+}
+
+/* Cancel template, export and import copies and wait for their threads. */
+static void stop_template_copies(void)
+{
+    stop_copies(g_template_copies);
+    stop_copies(g_disk_copies);
 }
 
 static wchar_t g_last_iso_path[MAX_PATH] = { 0 };
@@ -273,7 +346,6 @@ static BOOL g_viewer_title_stats = TRUE;   /* resolution, FPS, codec in the titl
 static BOOL g_viewer_toolbar = TRUE;       /* floating toolbar at the top edge */
 static int  g_viewer_renderer = 11;        /* 11 = Direct3D 11, 12 = Direct3D 12 */
 
-static CRITICAL_SECTION g_cs;
 static BOOL g_initialized = FALSE;
 
 /* ---- Callbacks ---- */
@@ -325,6 +397,39 @@ static void notify_removed(int index, void *ud) {
     asb_events_changed();
 }
 
+/* ---- Log file ----
+   %ProgramData%\AppSandbox\appsandbox.log, by absolute path whatever the
+   working directory. One line per message with a local timestamp; every
+   writer in the process goes through one lock. Past 10 MB the file becomes
+   appsandbox.log.old (replacing the previous one) and a new file starts. */
+
+#define ASB_LOG_MAX_BYTES (10u * 1024u * 1024u)
+static SRWLOCK g_log_lock = SRWLOCK_INIT;
+
+ASB_API void asb_log_write_line(const wchar_t *text)
+{
+    wchar_t path[MAX_PATH], old_path[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA info;
+    SYSTEMTIME st;
+    FILE *lf = NULL;
+
+    if (!text) return;
+    asb_log_path(path, MAX_PATH);
+    GetLocalTime(&st);
+    AcquireSRWLockExclusive(&g_log_lock);
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &info) &&
+        (info.nFileSizeHigh != 0 || info.nFileSizeLow >= ASB_LOG_MAX_BYTES) &&
+        swprintf_s(old_path, MAX_PATH, L"%s.old", path) > 0)
+        MoveFileExW(path, old_path, MOVEFILE_REPLACE_EXISTING);
+    if (_wfopen_s(&lf, path, L"a") == 0 && lf) {
+        fwprintf(lf, L"%04u-%02u-%02u %02u:%02u:%02u.%03u  %s\n",
+                 st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                 st.wMilliseconds, text);
+        fclose(lf);
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
+}
+
 /* ---- Internal logging (writes to appsandbox.log and the registered log callback) ---- */
 
 static void asb_log(const wchar_t *fmt, ...)
@@ -335,15 +440,7 @@ static void asb_log(const wchar_t *fmt, ...)
     _vsnwprintf_s(buf, 4096, _TRUNCATE, fmt, args);
     va_end(args);
 
-    /* Write to log file */
-    {
-        FILE *lf = NULL;
-        if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
-            fwprintf(lf, L"%s\n", buf);
-            fclose(lf);
-        }
-    }
-
+    asb_log_write_line(buf);
     notify_log(buf, g_log_ud);
 }
 
@@ -362,15 +459,7 @@ ASB_API void ui_log(const wchar_t *fmt, ...)
     _vsnwprintf_s(buf, 4096, _TRUNCATE, fmt, args);
     va_end(args);
 
-    /* Write to log file */
-    {
-        FILE *lf = NULL;
-        if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
-            fwprintf(lf, L"%s\n", buf);
-            fclose(lf);
-        }
-    }
-
+    asb_log_write_line(buf);
     notify_log(buf, g_log_ud);
 }
 
@@ -592,34 +681,98 @@ static void get_config_path(wchar_t *out, size_t out_len)
    public-key line in pubkey_out (newline-trimmed). ed25519 keeps the public key
    short enough to fit the agent's command buffer. The private key stays host-side
    so clients can connect with `ssh -i id_appsandbox`. Returns TRUE on success. */
-/* Restrict a path holding secrets (the SSH private key) to SYSTEM,
-   Administrators and the user running App Sandbox, without inheriting the
-   ProgramData default that lets every local user read. */
-static void restrict_to_owner(const wchar_t *path, BOOL dir)
+/* Give a path a protected DACL built from an SDDL format whose one %s is the
+   SID of the user running App Sandbox. Returns a Win32 error code. */
+static DWORD set_user_dacl(const wchar_t *path, const wchar_t *sddl_format)
 {
     HANDLE token = NULL;
-    BYTE buf[256];
-    DWORD len = 0;
+    union { TOKEN_USER user; BYTE raw[sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE]; } buf;
+    DWORD len = 0, rc = ERROR_INVALID_PARAMETER;
     LPWSTR sid = NULL;
     wchar_t sddl[512], tmp[MAX_PATH];
     PSECURITY_DESCRIPTOR sd = NULL;
     PACL dacl = NULL;
     BOOL present = FALSE, defaulted = FALSE;
 
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return;
-    if (GetTokenInformation(token, TokenUser, buf, sizeof(buf), &len))
-        ConvertSidToStringSidW(((TOKEN_USER *)buf)->User.Sid, &sid);
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) return GetLastError();
+    if (GetTokenInformation(token, TokenUser, &buf, sizeof(buf), &len))
+        ConvertSidToStringSidW(buf.user.User.Sid, &sid);
     CloseHandle(token);
-    if (!sid) return;
-    swprintf_s(sddl, ARRAYSIZE(sddl), dir ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)"
-                                          : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)", sid);
+    if (!sid) return ERROR_INVALID_SID;
+    swprintf_s(sddl, ARRAYSIZE(sddl), sddl_format, sid);
     LocalFree(sid);
-    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL)) return;
-    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl) {
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl, SDDL_REVISION_1, &sd, NULL))
+        return GetLastError();
+    if (GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) && present && dacl &&
+        wcslen(path) < MAX_PATH) {
         wcscpy_s(tmp, MAX_PATH, path);
-        SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
-                              DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-                              NULL, NULL, dacl, NULL);
+        rc = SetNamedSecurityInfoW(tmp, SE_FILE_OBJECT,
+                                   DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                                   NULL, NULL, dacl, NULL);
+    }
+    LocalFree(sd);
+    return rc;
+}
+
+/* Restrict a path holding secrets (the SSH private key) to SYSTEM,
+   Administrators and the user running App Sandbox, without inheriting the
+   ProgramData default that lets every local user read. */
+static void restrict_to_owner(const wchar_t *path, BOOL dir)
+{
+    set_user_dacl(path, dir ? L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)"
+                            : L"D:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;%s)");
+}
+
+/* VM folders hold the guest's whole disk and, for template-based VMs, the
+   resources ISO with the account password, so they do not inherit their
+   parent's ACL (ProgramData lets every local user read). SYSTEM,
+   Administrators and the user running App Sandbox get full control, the
+   Hyper-V "Virtual Machines" group (S-1-5-83-0) read access, so a worker
+   process can still read the parent disks of a snapshot chain. Each VM's own
+   account is added to the files it attaches by HcsGrantVmAccess (hcs_vm.c),
+   parent disks included. */
+#define VM_FOLDER_SDDL L"D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;%s)(A;OICI;0x1200a9;;;S-1-5-83-0)"
+
+/* Folders on a network share keep the share's ACL: SIDs of this PC mean
+   nothing there, and replacing the ACL could lock the user out. */
+static BOOL folder_takes_local_acl(const wchar_t *dir)
+{
+    wchar_t volume[MAX_PATH];
+    DWORD flags = 0;
+    UINT type;
+    if (!dir || (dir[0] == L'\\' && dir[1] == L'\\')) return FALSE;
+    if (!GetVolumePathNameW(dir, volume, MAX_PATH)) return FALSE;
+    type = GetDriveTypeW(volume);
+    if (type != DRIVE_FIXED && type != DRIVE_REMOVABLE) return FALSE;
+    if (!GetVolumeInformationW(volume, NULL, 0, NULL, NULL, &flags, NULL, 0)) return FALSE;
+    return (flags & FILE_PERSISTENT_ACLS) != 0;
+}
+
+static void protect_vm_folder(const wchar_t *dir)
+{
+    DWORD rc;
+    if (!folder_takes_local_acl(dir)) return;
+    rc = set_user_dacl(dir, VM_FOLDER_SDDL);
+    if (rc != ERROR_SUCCESS)
+        asb_log(L"Could not restrict access to %s (error %lu); other local users may be able to read it.",
+                dir, rc);
+}
+
+/* VM folders made by earlier versions inherited their parent's ACL. Give
+   them the VM folder DACL once; a folder whose DACL is already protected
+   (by this function or by the user) is left alone. */
+static void protect_existing_vm_folder(const wchar_t *dir)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    SECURITY_DESCRIPTOR_CONTROL control = 0;
+    DWORD revision = 0;
+    if (GetFileAttributesW(dir) == INVALID_FILE_ATTRIBUTES || !folder_takes_local_acl(dir)) return;
+    if (GetNamedSecurityInfoW(dir, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                              NULL, NULL, &dacl, NULL, &sd) != ERROR_SUCCESS) return;
+    if (dacl && GetSecurityDescriptorControl(sd, &control, &revision) && !(control & SE_DACL_PROTECTED)) {
+        asb_log(L"Restricting access to the VM folder %s.", dir);
+        protect_vm_folder(dir);
     }
     LocalFree(sd);
 }
@@ -691,13 +844,17 @@ static BOOL ensure_appsandbox_ssh_key(wchar_t *pubkey_out, int cap)
 
 /* ---- Persistence: save VM list ---- */
 
+/* Writes a temporary file and replaces vms.cfg with it, all under g_cs so
+   the table cannot change mid-write and two savers cannot reorder their
+   files. Callers must not hold a lock an HCS callback waits for. */
 static BOOL save_vm_list(void)
 {
-    if (g_config_load_failed) return FALSE;
+    if (g_config_load_failed || !g_cs_ready) return FALSE;
     asb_events_changed();
     wchar_t path[MAX_PATH], temporary[MAX_PATH], directory[MAX_PATH];
     FILE *f;
     int i;
+    BOOL ok;
 
     get_config_path(path, MAX_PATH);
 
@@ -705,12 +862,15 @@ static BOOL save_vm_list(void)
     wchar_t *slash = wcsrchr(directory, L'\\');
     if (!slash) return FALSE;
     *slash = 0;
+    EnterCriticalSection(&g_cs);
     if (!GetTempFileNameW(directory, L"asb", 0, temporary)) {
+        LeaveCriticalSection(&g_cs);
         asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
         return FALSE;
     }
     if (_wfopen_s(&f, temporary, L"w,ccs=UTF-8") != 0 || !f) {
         DeleteFileW(temporary);
+        LeaveCriticalSection(&g_cs);
         asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
         return FALSE;
     }
@@ -786,11 +946,12 @@ static BOOL save_vm_list(void)
         fwprintf(f, L"\n");
     }
 
-    BOOL ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
+    ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
     if (fclose(f) != 0) ok = FALSE;
-    if (ok && MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-        return TRUE;
-    DeleteFileW(temporary);
+    if (ok) ok = MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH);
+    if (!ok) DeleteFileW(temporary);
+    LeaveCriticalSection(&g_cs);
+    if (ok) return TRUE;
     asb_alert(L"Cannot save VM configuration; the previous file was preserved.");
     return FALSE;
 }
@@ -885,7 +1046,7 @@ static void load_vm_list(void)
 
         if (in_settings) {
             if (wcsncmp(line, L"LastIsoPath=", 12) == 0)
-                wcscpy_s(g_last_iso_path, MAX_PATH, line + 12);
+                wcsncpy_s(g_last_iso_path, MAX_PATH, line + 12, _TRUNCATE);
             else if (wcsncmp(line, L"SuppressTrayWarn=", 17) == 0)
                 g_suppress_tray_warn = (_wtoi(line + 17) != 0);
             else if (wcsncmp(line, L"AutoUpdateGuestTools=", 21) == 0)
@@ -904,13 +1065,13 @@ static void load_vm_list(void)
         if (wcsncmp(line, L"Id=", 3) == 0)
             vm->unique_id = asb_vm_id_parse_w(line + 3);
         else if (wcsncmp(line, L"Name=", 5) == 0)
-            wcscpy_s(vm->name, 256, line + 5);
+            wcsncpy_s(vm->name, ARRAYSIZE(vm->name), line + 5, _TRUNCATE);
         else if (wcsncmp(line, L"OsType=", 7) == 0)
-            wcscpy_s(vm->os_type, 32, line + 7);
+            wcsncpy_s(vm->os_type, ARRAYSIZE(vm->os_type), line + 7, _TRUNCATE);
         else if (wcsncmp(line, L"ImagePath=", 10) == 0)
-            wcscpy_s(vm->image_path, MAX_PATH, line + 10);
+            wcsncpy_s(vm->image_path, MAX_PATH, line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"VhdxPath=", 9) == 0)
-            wcscpy_s(vm->vhdx_path, MAX_PATH, line + 9);
+            wcsncpy_s(vm->vhdx_path, MAX_PATH, line + 9, _TRUNCATE);
         else if (wcsncmp(line, L"RamMB=", 6) == 0)
             vm->ram_mb = (DWORD)_wtoi(line + 6);
         else if (wcsncmp(line, L"HddGB=", 6) == 0)
@@ -920,7 +1081,7 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"GpuMode=", 8) == 0)
             vm->gpu_mode = _wtoi(line + 8);
         else if (wcsncmp(line, L"GpuName=", 8) == 0)
-            wcscpy_s(vm->gpu_name, 256, line + 8);
+            wcsncpy_s(vm->gpu_name, ARRAYSIZE(vm->gpu_name), line + 8, _TRUNCATE);
         else if (wcsncmp(line, L"GpuId=", 6) == 0)
             wcsncpy_s(vm->gpu_id, ARRAYSIZE(vm->gpu_id), line + 6, _TRUNCATE);
         else if (wcsncmp(line, L"GpuDevicePath=", 14) == 0)
@@ -928,11 +1089,11 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"NetworkMode=", 12) == 0)
             vm->network_mode = _wtoi(line + 12);
         else if (wcsncmp(line, L"NetAdapter=", 11) == 0)
-            wcscpy_s(vm->net_adapter, 256, line + 11);
+            wcsncpy_s(vm->net_adapter, ARRAYSIZE(vm->net_adapter), line + 11, _TRUNCATE);
         else if (wcsncmp(line, L"MacAddress=", 11) == 0)
             wcsncpy_s(vm->mac_address, ARRAYSIZE(vm->mac_address), line + 11, _TRUNCATE);
         else if (wcsncmp(line, L"ResourcesIso=", 13) == 0)
-            wcscpy_s(vm->resources_iso_path, MAX_PATH, line + 13);
+            wcsncpy_s(vm->resources_iso_path, MAX_PATH, line + 13, _TRUNCATE);
         else if (wcsncmp(line, L"NatIp=", 6) == 0)
             WideCharToMultiByte(CP_UTF8, 0, line + 6, -1, vm->nat_ip, sizeof(vm->nat_ip), NULL, NULL);
         else if (wcsncmp(line, L"IsTemplate=", 11) == 0)
@@ -940,7 +1101,7 @@ static void load_vm_list(void)
         else if (wcsncmp(line, L"TestMode=", 9) == 0)
             vm->test_mode = (_wtoi(line + 9) != 0);
         else if (wcsncmp(line, L"AdminUser=", 10) == 0)
-            wcscpy_s(vm->admin_user, 128, line + 10);
+            wcsncpy_s(vm->admin_user, ARRAYSIZE(vm->admin_user), line + 10, _TRUNCATE);
         else if (wcsncmp(line, L"SshEnabled=", 11) == 0)
             vm->ssh_enabled = (_wtoi(line + 11) != 0);
         else if (wcsncmp(line, L"SshPort=", 8) == 0)
@@ -968,10 +1129,20 @@ static void load_vm_list(void)
             if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
             if (vm_load_state_json(VM_AT(i).vhdx_path))
                 VM_AT(i).install_complete = TRUE;
-            if (get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir) &&
-                wcslen(snap_dir) + 10 < MAX_PATH) {
-                wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
-                snapshot_init(&SNAP_AT(i), snap_dir);
+            if (get_vm_disk_root(VM_AT(i).vhdx_path, snap_dir)) {
+                protect_existing_vm_folder(snap_dir);
+                if (wcslen(snap_dir) + 10 < MAX_PATH) {
+                    wcscat_s(snap_dir, MAX_PATH, L"\\snapshots");
+                    snapshot_init(&SNAP_AT(i), snap_dir);
+                }
+            }
+            /* The account name goes into SSH command lines: drop one no
+               valid VM can have (quotes, control characters, %). */
+            if (VM_AT(i).admin_user[0] && wcspbrk(VM_AT(i).admin_user,
+                    L"\"%\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+                    L"\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f")) {
+                asb_log(L"Ignoring the invalid account name stored for \"%s\".", VM_AT(i).name);
+                VM_AT(i).admin_user[0] = L'\0';
             }
         }
     }
@@ -1047,12 +1218,12 @@ static void scan_templates(void)
                     if ((p = wcsstr(line, L"\"os_type\"")) != NULL) {
                         p = wcschr(p + 9, L':');
                         if (p) { p = wcschr(p, L'"'); if (p) { wchar_t *end; p++; end = wcschr(p, L'"');
-                            if (end) { *end = L'\0'; wcscpy_s(ti->os_type, 32, p); }
+                            if (end) { *end = L'\0'; wcsncpy_s(ti->os_type, ARRAYSIZE(ti->os_type), p, _TRUNCATE); }
                         }}
                     } else if ((p = wcsstr(line, L"\"image_path\"")) != NULL) {
                         p = wcschr(p + 12, L':');
                         if (p) { p = wcschr(p, L'"'); if (p) { wchar_t *end; p++; end = wcschr(p, L'"');
-                            if (end) { *end = L'\0'; wcscpy_s(ti->image_path, MAX_PATH, p); }
+                            if (end) { *end = L'\0'; wcsncpy_s(ti->image_path, MAX_PATH, p, _TRUNCATE); }
                         }}
                     }
                 }
@@ -1157,7 +1328,10 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                     wcscpy_s(ti->image_path, MAX_PATH, instance->image_path);
                     wcscpy_s(ti->vhdx_path, MAX_PATH, instance->vhdx_path);
                 }
-                remove_vm_record(i);
+                /* The index found above was read without the lock; another
+                   removal may have shifted the table since. */
+                i = vm_index_of(vm_handle(instance));
+                if (i >= 0) remove_vm_record(i);
                 LeaveCriticalSection(&g_cs);
 
                 scan_templates();
@@ -1165,7 +1339,7 @@ static void asb_hcs_state_changed(VmInstance *instance, DWORD event)
                 /* Fire the removed callback last - WM_VM_REMOVED is async, so
                    both g_vms[] and g_templates[] must be fully updated before
                    the UI thread can pull the message and re-query them. */
-                notify_removed(i, g_removed_ud);
+                if (i >= 0) notify_removed(i, g_removed_ud);
             }
 
             save_vm_list();
@@ -1417,10 +1591,13 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         asb_log(L"Error: Failed to create compute system (0x%08X)", hr);
         asb_alert(L"Failed to start VM, check its configuration.");
         /* HCS rejected the VM after we already created the HCN endpoint.
-           Free the endpoint so its IP reservation doesn't leak into the
-           next attempt as a phantom HCN_E_ADDR_INVALID_OR_RESERVED. */
+           Free the endpoint (and the network if no other VM uses it) so its
+           IP reservation doesn't leak into the next attempt as a phantom
+           HCN_E_ADDR_INVALID_OR_RESERVED. hcs_create_vm already closed any
+           handle the failed create returned. */
+        if (vm->handle) hcs_close_vm(vm);
         if (endpoint_guid_str[0] != L'\0') {
-            hcn_delete_endpoint(&args->endpoint_id);
+            asb_vm_cleanup_network(vm);
             endpoint_guid_str[0] = L'\0';
         }
         vm->starting = FALSE;
@@ -1436,6 +1613,12 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         asb_log(L"Error: Failed to start VM (0x%08X)", hr);
         if (hr == (HRESULT)0x800705AF)
             asb_alert(L"The host doesn't have enough resources to start this VM.");
+        else
+            asb_alert(L"Failed to start VM, check its configuration.");
+        /* The compute system was built from this attempt's settings: drop it
+           and its endpoint, so the next Start uses the current ones. */
+        hcs_close_vm(vm);
+        asb_vm_cleanup_network(vm);
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
         /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
@@ -1839,6 +2022,9 @@ done:
         VmInstance *inst;
         int idx;
 
+        /* Unregistering waits for running HCS callbacks, which can take g_cs
+           (save_vm_list): never do it while holding the lock. */
+        if (args->vm_inst) hcs_unregister_vm_callback(args->vm_inst);
         EnterCriticalSection(&g_cs);
         inst = asb_find_vm_by_id(args->vm_unique_id);
         idx = vm_index_of(vm_handle(inst));
@@ -1850,7 +2036,6 @@ done:
             if (SUCCEEDED(args->result)) {
                 VmInstance *heap_inst = args->vm_inst;
                 if (heap_inst) {
-                    hcs_unregister_vm_callback(heap_inst);
                     inst->handle = heap_inst->handle;
                     inst->runtime_id = heap_inst->runtime_id;
                     inst->running = TRUE;
@@ -1904,7 +2089,6 @@ done:
                handle copy, and don't write into a stale slot. */
             LeaveCriticalSection(&g_cs);
             if (args->vm_inst) {
-                hcs_unregister_vm_callback(args->vm_inst);
                 hcs_close_vm(args->vm_inst);
                 HeapFree(GetProcessHeap(), 0, args->vm_inst);
                 args->vm_inst = NULL;
@@ -2991,6 +3175,9 @@ done:
         VmInstance *inst;
         int idx;
 
+        /* Unregistering waits for running HCS callbacks, which can take g_cs
+           (save_vm_list): never do it while holding the lock. */
+        if (args->vm_inst) hcs_unregister_vm_callback(args->vm_inst);
         EnterCriticalSection(&g_cs);
         inst = asb_find_vm_by_id(args->vm_unique_id);
         idx = vm_index_of(vm_handle(inst));
@@ -3001,7 +3188,6 @@ done:
             if (SUCCEEDED(args->result)) {
                 VmInstance *heap_inst = args->vm_inst;
                 if (heap_inst) {
-                    hcs_unregister_vm_callback(heap_inst);
                     inst->handle = heap_inst->handle;
                     inst->runtime_id = heap_inst->runtime_id;
                     inst->running = TRUE;
@@ -3047,7 +3233,6 @@ done:
                handle copy, and don't write into a stale slot. */
             LeaveCriticalSection(&g_cs);
             if (args->vm_inst) {
-                hcs_unregister_vm_callback(args->vm_inst);
                 hcs_close_vm(args->vm_inst);
                 HeapFree(GetProcessHeap(), 0, args->vm_inst);
                 args->vm_inst = NULL;
@@ -3101,6 +3286,7 @@ ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;
     InitializeCriticalSection(&g_cs);
+    g_cs_ready = TRUE;
     for (int i = 0; i < ASB_MAX_VMS; ++i) g_vm_order[i] = &g_vm_storage[i];
     g_vm_count = 0;
 
@@ -3163,6 +3349,7 @@ ASB_API void asb_cleanup(void)
 
     hcs_cleanup();
     hcn_cleanup();
+    g_cs_ready = FALSE;
     DeleteCriticalSection(&g_cs);
     g_initialized = FALSE;
 }
@@ -3628,8 +3815,8 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         }
     }
 
-    inst = &VM_AT(g_vm_count);
-    ZeroMemory(inst, sizeof(VmInstance));
+    inst = claim_vm_record();
+    if (!inst) return E_OUTOFMEMORY;
     do { inst->unique_id = asb_vm_id_new(); }
     while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
     if (!inst->unique_id) return E_FAIL;
@@ -3677,6 +3864,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             asb_alert(L"Cannot create the VM disk folder. Check the location and permissions.");
             return hr;
         }
+        protect_vm_folder(vhdx_dir);
     }
     swprintf_s(cfg.vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vhdx_dir);
 
@@ -3729,8 +3917,8 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-              snapshot_init(&SNAP_AT(g_vm_count), sd); }
-            g_vm_count++;
+              snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
+            append_vm_record(inst);
 
             if (!is_template_create)
                 vm_save_state_json(cfg.vhdx_path, FALSE);
@@ -3793,9 +3981,7 @@ build_failed:
                 SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
                 HeapFree(GetProcessHeap(), 0, args);
             }
-            EnterCriticalSection(&g_cs);
-            remove_vm_record(vm_index_of(vm_handle(inst)));
-            LeaveCriticalSection(&g_cs);
+            remove_vm(inst);
             if (created_id) *created_id = 0;
             remove_dir_recursive(vhdx_dir);
             save_vm_list();
@@ -3844,8 +4030,8 @@ build_failed:
             memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-              snapshot_init(&SNAP_AT(g_vm_count), sd); }
-            g_vm_count++;
+              snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
+            append_vm_record(inst);
 
             vm_save_state_json(cfg.vhdx_path, FALSE);
             save_vm_list();
@@ -3853,7 +4039,11 @@ build_failed:
             args = (LinuxCreateArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(LinuxCreateArgs));
             if (!args) {
                 asb_log(L"Error: Out of memory for Linux create args.");
-                g_vm_count--;
+                SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+                remove_vm(inst);
+                if (created_id) *created_id = 0;
+                remove_dir_recursive(vhdx_dir);
+                save_vm_list();
                 return E_OUTOFMEMORY;
             }
             memcpy(&args->config, &cfg, sizeof(VmConfig));
@@ -3989,8 +4179,8 @@ build_failed:
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-      snapshot_init(&SNAP_AT(g_vm_count), sd); }
-    g_vm_count++;
+      snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
+    append_vm_record(inst);
 
     /* A manual-install VM has nothing for App Sandbox to provision: it is
        "installed" from the start (the user installs the OS in its window). */
@@ -4013,6 +4203,9 @@ build_failed:
             asb_alert(L"The host doesn't have enough resources to start this VM.");
         else
             asb_alert(L"Failed to start VM, check its configuration.");
+        /* Start builds a new compute system from the current settings. */
+        hcs_close_vm(inst);
+        asb_vm_cleanup_network(inst);
     }
 
     save_vm_list();
@@ -4092,8 +4285,67 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
     }
 
-    if (!inst->handle) {
-        /* Need to re-create HCS system - do it in a background thread */
+    /* A disk moved or deleted outside the app would otherwise surface only
+       as a generic HCS failure. */
+    if (GetFileAttributesW(inst->vhdx_path) == INVALID_FILE_ATTRIBUTES) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+            wchar_t msg[768];
+            swprintf_s(msg, ARRAYSIZE(msg), L"The disk of \"%s\" was not found at %s.",
+                       inst->name, inst->vhdx_path);
+            asb_log(L"Error: %s", msg);
+            asb_alert(msg);
+            notify_state(vm, FALSE, g_state_ud);
+            return HRESULT_FROM_WIN32(err);
+        }
+    }
+
+    /* Installer ISO: Windows and Ubuntu VMs need it only until the guest
+       agent reports the installation complete (their disk is built from it
+       on the host), so it is not attached after that, and the user may
+       delete it. A manual-install VM ("Other") keeps it until the user
+       removes it (asb_vm_eject_iso). Templates keep theirs for the template
+       record. */
+    {
+        BOOL manual = _wcsicmp(inst->os_type, L"Other") == 0;
+        if (!manual && !inst->is_template && inst->install_complete && inst->image_path[0]) {
+            asb_log(L"Installer ISO no longer attached to \"%s\" (installation complete).", inst->name);
+            inst->image_path[0] = L'\0';
+            if (inst->handle) hcs_close_vm(inst);
+            save_vm_list();
+        }
+        if (inst->image_path[0] && GetFileAttributesW(inst->image_path) == INVALID_FILE_ATTRIBUTES) {
+            wchar_t msg[768];
+            if (manual) {
+                swprintf_s(msg, ARRAYSIZE(msg),
+                    L"The installer ISO of \"%s\" was not found at %s. Reconnect the drive or "
+                    L"folder it was on, or remove it from the VM (Remove installer ISO) once the "
+                    L"operating system is installed.", inst->name, inst->image_path);
+                asb_log(L"Error: %s", msg);
+                asb_alert(msg);
+                notify_state(vm, FALSE, g_state_ud);
+                return HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND);
+            }
+            asb_log(L"Installer ISO of \"%s\" not found at %s; starting without it.",
+                    inst->name, inst->image_path);
+            inst->image_path[0] = L'\0';
+            if (inst->handle) hcs_close_vm(inst);
+            save_vm_list();
+        }
+    }
+
+    /* A compute system that exists while the VM is stopped is left from a
+       start that failed: it was built from the settings of that attempt
+       (RAM, CPU, GPU, network, disk) and may still hold its endpoint.
+       Drop it, so this start builds one from the current settings. */
+    if (inst->handle) {
+        asb_log(L"Discarding the previous compute system of \"%s\".", inst->name);
+        hcs_close_vm(inst);
+        asb_vm_cleanup_network(inst);
+    }
+
+    {
+        /* Re-create the HCS system on a background thread */
         StartVmArgs *args = (StartVmArgs *)calloc(1, sizeof(StartVmArgs));
         if (!args) return E_OUTOFMEMORY;
         args->vm = inst;
@@ -4125,28 +4377,6 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
         ResumeThread(inst->start_thread);
         asb_events_changed();
-    } else {
-        BOOL selected_gpu = inst->gpu_id[0] != L'\0';
-        HRESULT hr;
-        pick_auto_gpu(inst);
-        hr = hcs_start_vm(inst);
-        if (selected_gpu && !inst->gpu_id[0]) save_vm_list();
-        if (hr == (HRESULT)0x80370110L && inst->handle) {
-            hcs_terminate_vm(inst);
-            hcs_close_vm(inst);
-            return asb_vm_start(vm, -1, -1, NULL);
-        }
-        if (FAILED(hr)) {
-            asb_log(L"Error: Failed to start VM (0x%08X)", hr);
-            if (hr == (HRESULT)0x800705AF)
-                asb_alert(L"The host doesn't have enough resources to start this VM.");
-            return hr;
-        }
-        asb_log(L"VM \"%s\" started.", inst->name);
-        vm_agent_start(inst);
-        idd_probe_start(inst);
-        hcs_start_monitor(inst);
-        notify_state(vm, TRUE, g_state_ud);
     }
 
     return S_OK;
@@ -4503,24 +4733,44 @@ ASB_API HRESULT asb_vm_set_network(AsbVm vm, int mode)
 
 /* ---- Snapshots ---- */
 
+/* Taking, branching and deleting snapshots rename, create or delete the
+   disks a VM boots from, so the VM must be stopped and idle (not building,
+   exported, imported or having its guest components updated). The web UI
+   hides these actions otherwise; the headless API reaches them directly. */
+static HRESULT snapshot_change_allowed(int idx, const wchar_t *action)
+{
+    VmInstance *v = &VM_AT(idx);
+    if (v->running || v->starting) {
+        asb_log(L"Stop \"%s\" to %s.", v->name, action);
+        return E_ACCESSDENIED;
+    }
+    if (v->building_vhdx || v->copying_disk || v->updating_tools) {
+        asb_log(L"\"%s\" is busy; %s when it finishes.", v->name, action);
+        return E_ACCESSDENIED;
+    }
+    /* A compute system left from a failed start can still hold the disk. */
+    if (v->handle) hcs_close_vm(v);
+    return S_OK;
+}
+
 ASB_API HRESULT asb_snap_take(AsbVm vm, const wchar_t *name)
 {
     HRESULT hr;
     int idx = vm_index_of(vm);
     wchar_t snap_name[128];
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
-    if (VM_AT(idx).running) { asb_log(L"VM must be stopped to take a snapshot."); return E_ACCESSDENIED; }
+    hr = snapshot_change_allowed(idx, L"take a snapshot");
+    if (FAILED(hr)) return hr;
 
     if (name && name[0] != L'\0')
-        wcscpy_s(snap_name, 128, name);
+        wcsncpy_s(snap_name, 128, name, _TRUNCATE);
     else
         swprintf_s(snap_name, 128, L"Snapshot %d", SNAP_AT(idx).count + 1);
 
     /* The snapshot can freeze (rename) the disk the VM last ran on, and the VM
-       moves to a new branch: drop any compute system still bound to the old
-       disk, as asb_vm_start does when it switches branches. */
-    if (VM_AT(idx).handle) hcs_close_vm(&VM_AT(idx));
+       moves to a new branch: snapshot_change_allowed dropped any compute
+       system still bound to the old disk, as asb_vm_start does when it
+       switches branches. */
 
     asb_log(L"Taking snapshot \"%s\" of VM \"%s\"...", snap_name, VM_AT(idx).name);
     hr = snapshot_take(&SNAP_AT(idx), &VM_AT(idx), snap_name);
@@ -4539,14 +4789,17 @@ ASB_API HRESULT asb_snap_delete(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     if (snap_idx < 0) { asb_log(L"Select a snapshot to delete."); return E_INVALIDARG; }
+    hr = snapshot_change_allowed(idx, L"delete a snapshot");
+    if (FAILED(hr)) return hr;
 
     asb_log(L"Deleting snapshot %d...", snap_idx);
     hr = snapshot_delete(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (hr == HRESULT_FROM_WIN32(ERROR_DIR_NOT_EMPTY))
         asb_log(L"Error: Another snapshot was taken on this one. Delete that snapshot first.");
-    else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X)", hr);
+    else if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+        asb_log(L"Error: A disk of this snapshot is in use; nothing was deleted.");
+    else if (FAILED(hr)) asb_log(L"Error: Failed to delete snapshot (0x%08X); nothing was deleted.", hr);
     else asb_log(L"Snapshot deleted.");
 
     save_vm_list();
@@ -4559,7 +4812,8 @@ ASB_API HRESULT asb_snap_new_branch(AsbVm vm, int snap_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    hr = snapshot_change_allowed(idx, L"create a branch");
+    if (FAILED(hr)) return hr;
 
     hr = snapshot_new_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx);
     if (FAILED(hr)) asb_log(L"Error: Failed to create branch (0x%08X)", hr);
@@ -4574,14 +4828,17 @@ ASB_API HRESULT asb_snap_delete_branch(AsbVm vm, int snap_idx, int branch_idx)
     HRESULT hr;
     int idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
-    if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
+    hr = snapshot_change_allowed(idx, L"delete a branch");
+    if (FAILED(hr)) return hr;
 
     asb_log(L"Deleting branch %d of %s...", branch_idx,
             snap_idx == -2 ? L"base"
               : (snap_idx >= 0 && snap_idx < SNAP_AT(idx).count
                    ? SNAP_AT(idx).nodes[snap_idx].name : L"?"));
     hr = snapshot_delete_branch(&SNAP_AT(idx), &VM_AT(idx), snap_idx, branch_idx);
-    if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
+    if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION))
+        asb_log(L"Error: The branch disk is in use; it was not deleted.");
+    else if (FAILED(hr)) asb_log(L"Error: Failed to delete branch (0x%08X)", hr);
     else asb_log(L"Branch deleted.");
 
     save_vm_list();
@@ -5026,6 +5283,7 @@ typedef struct {
     wchar_t dest_dir[MAX_PATH];
     wchar_t side_dir[MAX_PATH]; /* where display/language settings come from */
     BOOL    is_import;
+    HANDLE  cancel_event;       /* owned by the g_disk_copies slot; set by asb_cleanup */
 } DiskCopyJob;
 
 static void disk_copy_progress(int percent, void *context)
@@ -5065,7 +5323,7 @@ static DWORD WINAPI disk_copy_thread(LPVOID param)
 
     if (idx < 0 || VM_AT(idx).unique_id != job->id) { free(job); return 0; }
     inst = &VM_AT(idx);
-    hr = vhdx_copy(job->dest, job->source, NULL, disk_copy_progress, job);
+    hr = vhdx_copy(job->dest, job->source, job->cancel_event, disk_copy_progress, job);
 
     idx = vm_index_of(job->vm);
     if (idx < 0 || VM_AT(idx).unique_id != job->id) { free(job); return 0; }
@@ -5088,12 +5346,25 @@ static DWORD WINAPI disk_copy_thread(LPVOID param)
             asb_log(L"Exported \"%s\" to %s", inst->name, job->dest_dir);
         }
     } else {
-        asb_log(L"Error: %s \"%s\" failed (0x%08X).", job->is_import ? L"Importing" : L"Exporting",
-                inst->name, hr);
-        asb_alert(job->is_import
-            ? L"The VM could not be imported. Check free space and that the source disk is readable; then delete the failed entry."
-            : L"The VM could not be exported. Check free space and the destination folder.");
-        if (!job->is_import) remove_dir_recursive(job->dest_dir);
+        BOOL cancelled = hr == HRESULT_FROM_WIN32(ERROR_CANCELLED);
+        asb_log(L"Error: %s \"%s\" %s (0x%08X).", job->is_import ? L"Importing" : L"Exporting",
+                inst->name, cancelled ? L"was cancelled" : L"failed", hr);
+        if (!cancelled)
+            asb_alert(job->is_import
+                ? L"The VM could not be imported. Check free space and that the source disk is readable."
+                : L"The VM could not be exported. Check free space and the destination folder.");
+        remove_dir_recursive(job->dest_dir);
+        if (job->is_import) {
+            /* The entry was listed (and saved) when the copy started; without
+               its disk it is of no use, so it goes with its folder. */
+            int removed;
+            inst->copying_disk = FALSE;
+            removed = remove_vm(inst);
+            save_vm_list();
+            if (removed >= 0) notify_removed(removed, g_removed_ud);
+            free(job);
+            return 0;
+        }
     }
     inst->copying_disk = FALSE;
     InterlockedExchange(&inst->copy_progress, 0);
@@ -5103,19 +5374,42 @@ static DWORD WINAPI disk_copy_thread(LPVOID param)
     return 0;
 }
 
+/* Run the copy on a thread with its own cancel event (asb_cleanup cancels
+   and waits for it). Takes ownership of job, also on failure. */
 static HRESULT start_disk_copy(DiskCopyJob *job, VmInstance *inst)
 {
-    HANDLE t;
+    TemplateCopy *slot = NULL;
+    HRESULT hr;
+    int i;
+
+    for (i = 0; i < ASB_MAX_VMS; i++) {
+        TemplateCopy *copy = &g_disk_copies[i];
+        if (copy->thread && WaitForSingleObject(copy->thread, 0) == WAIT_OBJECT_0)
+            release_template_copy(copy);
+        if (!slot && !copy->thread) slot = copy;
+    }
+    if (!slot) { free(job); return HRESULT_FROM_WIN32(ERROR_BUSY); }
+    slot->cancel_event = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!slot->cancel_event) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        release_template_copy(slot);
+        free(job);
+        return hr;
+    }
+    job->cancel_event = slot->cancel_event;
     inst->copying_disk = TRUE;
     InterlockedExchange(&inst->copy_progress, 0);
     notify_state(job->vm, FALSE, g_state_ud);
-    t = CreateThread(NULL, 0, disk_copy_thread, job, 0, NULL);
-    if (!t) {
+    slot->thread = CreateThread(NULL, 0, disk_copy_thread, job, CREATE_SUSPENDED, NULL);
+    if (!slot->thread) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
         inst->copying_disk = FALSE;
+        release_template_copy(slot);
         free(job);
-        return HRESULT_FROM_WIN32(GetLastError());
+        notify_state(vm_handle(inst), FALSE, g_state_ud);
+        return hr;
     }
-    CloseHandle(t);
+    ResumeThread(slot->thread);
     return S_OK;
 }
 
@@ -5124,6 +5418,7 @@ ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *dest_parent)
     int idx = vm_index_of(vm);
     VmInstance *inst;
     DiskCopyJob *job;
+    HRESULT hr;
 
     if (idx < 0 || !dest_parent || !dest_parent[0]) return E_INVALIDARG;
     inst = &VM_AT(idx);
@@ -5148,7 +5443,7 @@ ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *dest_parent)
         return HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS);
     }
     if (!CreateDirectoryW(job->dest_dir, NULL)) {
-        HRESULT hr = HRESULT_FROM_WIN32(GetLastError());
+        hr = HRESULT_FROM_WIN32(GetLastError());
         asb_alert(L"The export folder could not be created.");
         free(job);
         return hr;
@@ -5161,7 +5456,13 @@ ASB_API HRESULT asb_vm_export(AsbVm vm, const wchar_t *dest_parent)
         wcscpy_s(job->side_dir, MAX_PATH, root);
     }
     asb_log(L"Exporting \"%s\" to %s...", inst->name, job->dest_dir);
-    return start_disk_copy(job, inst);
+    {
+        wchar_t dest_dir[MAX_PATH];
+        wcscpy_s(dest_dir, MAX_PATH, job->dest_dir);
+        hr = start_disk_copy(job, inst);
+        if (FAILED(hr)) RemoveDirectoryW(dest_dir);
+    }
+    return hr;
 }
 
 ASB_API HRESULT asb_vm_import(const wchar_t *source)
@@ -5173,6 +5474,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     VmInstance *inst;
     DiskCopyJob *job;
     const wchar_t *error;
+    HRESULT hr;
     int n;
 
     if (g_config_load_failed || !source || !source[0]) return E_INVALIDARG;
@@ -5207,10 +5509,12 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
         }
     }
 
-    /* Name: the manifest's, else the folder (or file) name; made unique. */
+    /* Name: the manifest's, else the folder (or file) name; made unique.
+       Exports are shared between people, so everything read from vm.json is
+       checked like user input. */
     if (!(manifest[0] && json_value_w(manifest, L"name", base_name, ARRAYSIZE(base_name)) && base_name[0])) {
         const wchar_t *leaf = wcsrchr(side, L'\\');
-        wcscpy_s(base_name, ARRAYSIZE(base_name), leaf ? leaf + 1 : side);
+        wcsncpy_s(base_name, ARRAYSIZE(base_name), leaf ? leaf + 1 : side, _TRUNCATE);
         {
             wchar_t *dot = wcsrchr(base_name, L'.');
             if (dot && _wcsicmp(dot, L".asbvm") == 0) *dot = 0;
@@ -5218,10 +5522,14 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
         if (!(attrs & FILE_ATTRIBUTE_DIRECTORY) && _wcsicmp(wcsrchr(source, L'.') ? wcsrchr(source, L'.') : L"", L".vhdx") == 0
             && _wcsicmp(wcsrchr(source, L'\\') ? wcsrchr(source, L'\\') + 1 : source, L"disk.vhdx") != 0) {
             const wchar_t *leaf2 = wcsrchr(source, L'\\');
-            wcscpy_s(base_name, ARRAYSIZE(base_name), leaf2 ? leaf2 + 1 : source);
-            *wcsrchr(base_name, L'.') = 0;
+            wchar_t *dot;
+            wcsncpy_s(base_name, ARRAYSIZE(base_name), leaf2 ? leaf2 + 1 : source, _TRUNCATE);
+            dot = wcsrchr(base_name, L'.');
+            if (dot) *dot = 0;
         }
     }
+    /* Room for " (99)" within the 255-character name limit. */
+    if (wcslen(base_name) > 200) base_name[200] = 0;
     for (n = 1; n < 100; n++) {
         int i, taken = 0;
         if (n == 1) wcscpy_s(name, ARRAYSIZE(name), base_name);
@@ -5233,28 +5541,21 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
         if (wcsstr(error, L"already exists") == NULL) { asb_alert(error); return E_INVALIDARG; }
     }
     if (n >= 100) { asb_alert(L"Could not find a free name for the imported VM."); return E_FAIL; }
-    {
-        wchar_t default_dir[MAX_PATH];
-        asb_default_disk_directory(default_dir, MAX_PATH);
-        CreateDirectoryW(default_dir, NULL);
-        CreateDirectoryW(parent, NULL);
-    }
-    if (!CreateDirectoryW(vm_dir, NULL)) {
-        asb_alert(L"Cannot create the VM disk folder.");
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
 
-    inst = &VM_AT(g_vm_count);
-    ZeroMemory(inst, sizeof(VmInstance));
+    inst = claim_vm_record();
+    if (!inst) {
+        asb_alert(L"The maximum number of VMs has been reached.");
+        return E_FAIL;
+    }
     do { inst->unique_id = asb_vm_id_new(); }
     while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
-    if (!inst->unique_id) { RemoveDirectoryW(vm_dir); return E_FAIL; }
+    if (!inst->unique_id) return E_FAIL;
 
     wcscpy_s(inst->name, ARRAYSIZE(inst->name), name);
     wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), L"Windows");
     if (manifest[0] && json_value_w(manifest, L"osType", value, ARRAYSIZE(value)) &&
         (_wcsicmp(value, L"Windows") == 0 || _wcsicmp(value, L"Linux") == 0))
-        wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), value);
+        wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), _wcsicmp(value, L"Linux") == 0 ? L"Linux" : L"Windows");
     inst->ram_mb = 8192;
     inst->cpu_cores = 4;
     inst->gpu_mode = 1;
@@ -5264,8 +5565,18 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
         if (json_value_w(manifest, L"cpuCores", value, ARRAYSIZE(value))) inst->cpu_cores = (DWORD)_wtoi(value);
         if (json_value_w(manifest, L"gpuMode", value, ARRAYSIZE(value))) inst->gpu_mode = _wtoi(value);
         if (json_value_w(manifest, L"networkMode", value, ARRAYSIZE(value))) inst->network_mode = _wtoi(value);
-        if (json_value_w(manifest, L"adminUser", value, ARRAYSIZE(value)))
-            wcscpy_s(inst->admin_user, ARRAYSIZE(inst->admin_user), value);
+        /* The account name is used in SSH command lines and in vms.cfg: keep
+           it only when VM creation would accept it. */
+        if (json_value_w(manifest, L"adminUser", value, ARRAYSIZE(value)) && value[0]) {
+            size_t user_length = 0;
+            const wchar_t *user = trimmed_username(value, &user_length);
+            if (!asb_validate_username(inst->os_type, value, inst->name, FALSE) &&
+                user_length < ARRAYSIZE(inst->admin_user))
+                wcsncpy_s(inst->admin_user, ARRAYSIZE(inst->admin_user), user, user_length);
+            else
+                asb_log(L"Import: the account name in %s is not valid; \"%s\" is imported without it.",
+                        manifest_path, name);
+        }
         if (json_value_w(manifest, L"sshEnabled", value, ARRAYSIZE(value))) inst->ssh_enabled = _wtoi(value) != 0;
         if (json_value_w(manifest, L"testMode", value, ARRAYSIZE(value))) inst->test_mode = _wtoi(value) != 0;
     }
@@ -5275,18 +5586,39 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     if (inst->network_mode < NET_NONE || inst->network_mode > NET_INTERNAL || inst->network_mode == NET_EXTERNAL)
         inst->network_mode = NET_NAT;
     if (inst->gpu_mode != 0 && inst->gpu_mode != 1) inst->gpu_mode = 1;
+
+    {
+        wchar_t default_dir[MAX_PATH];
+        asb_default_disk_directory(default_dir, MAX_PATH);
+        CreateDirectoryW(default_dir, NULL);
+        CreateDirectoryW(parent, NULL);
+    }
+    if (!CreateDirectoryW(vm_dir, NULL)) {
+        hr = HRESULT_FROM_WIN32(GetLastError());
+        asb_alert(L"Cannot create the VM disk folder.");
+        return hr;
+    }
+    protect_vm_folder(vm_dir);
     swprintf_s(inst->vhdx_path, MAX_PATH, L"%s\\disk.vhdx", vm_dir);
     inst->install_complete = FALSE;          /* until the copy finishes */
     {
         wchar_t sd[MAX_PATH];
         swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vm_dir);
-        snapshot_init(&SNAP_AT(g_vm_count), sd);
+        snapshot_init(&RECORD_OF(inst)->snapshots, sd);
     }
-    g_vm_count++;
-    save_vm_list();
 
     job = (DiskCopyJob *)calloc(1, sizeof(*job));
-    if (!job) return E_OUTOFMEMORY;
+    if (!job) {
+        remove_dir_recursive(vm_dir);
+        return E_OUTOFMEMORY;
+    }
+    if (append_vm_record(inst) < 0) {
+        free(job);
+        remove_dir_recursive(vm_dir);
+        return E_FAIL;
+    }
+    save_vm_list();
+
     job->vm = vm_handle(inst);
     job->id = inst->unique_id;
     job->is_import = TRUE;
@@ -5295,7 +5627,14 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     wcscpy_s(job->dest_dir, MAX_PATH, vm_dir);
     wcscpy_s(job->side_dir, MAX_PATH, side);
     asb_log(L"Importing \"%s\" from %s...", name, disk);
-    return start_disk_copy(job, inst);
+    hr = start_disk_copy(job, inst);
+    if (FAILED(hr)) {
+        int removed = remove_vm(inst);
+        remove_dir_recursive(vm_dir);
+        save_vm_list();
+        if (removed >= 0) notify_removed(removed, g_removed_ud);
+    }
+    return hr;
 }
 
 ASB_API BOOL asb_get_suppress_tray_warn(void)

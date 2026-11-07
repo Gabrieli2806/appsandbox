@@ -1,10 +1,12 @@
 #include "hcs_vm.h"
+#include "asb_core.h"    /* asb_log_write_line */
 #include "vm_agent.h"
 #include "ui.h"
 #include "disk_util.h"   /* ASB_IS_ARM64 */
 #include <stdio.h>
 #include <sddl.h>
 #include <aclapi.h>
+#include <virtdisk.h>
 
 /* ---- HCS function pointer types ---- */
 
@@ -358,15 +360,12 @@ static const wchar_t *hcs_notify_name_v2(DWORD type)
    if the UI thread is blocked on an HCS/COM operation. */
 static void hcs_cb_log(const wchar_t *fmt, ...)
 {
-    FILE *lf = NULL;
+    wchar_t line[1024];
     va_list ap;
-    if (_wfopen_s(&lf, L"appsandbox.log", L"a") == 0 && lf) {
-        va_start(ap, fmt);
-        vfwprintf(lf, fmt, ap);
-        va_end(ap);
-        fwprintf(lf, L"\n");
-        fclose(lf);
-    }
+    va_start(ap, fmt);
+    _vsnwprintf_s(line, ARRAYSIZE(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    asb_log_write_line(line);
 }
 
 /* V1 callback signature */
@@ -1257,14 +1256,22 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
-    /* ServiceTable: list the AppSandbox service GUIDs the guest is
-       permitted to bind on. Windows guests get the a5b0cafe-XXXX-...
-       form (reached via AF_HYPERV from the in-VM agent and helpers).
-       Linux guests get the vsock-template form so a guest doing
-       bind(AF_VSOCK, port=N) ends up registered as the corresponding
-       <N>-FACB-... GUID on the host side. Same security descriptors
-       for both. Ports 1–6 cover agent + frame + input + audio + the
-       two clipboard channels. */
+    /* ServiceTable: the AppSandbox service GUIDs of this VM. Windows guests
+       get the a5b0cafe-XXXX-... form (reached via AF_HYPERV from the in-VM
+       agent and helpers). Linux guests get the vsock-template form so a
+       guest doing bind(AF_VSOCK, port=N) ends up registered as the
+       corresponding <N>-FACB-... GUID on the host side. Ports 1–6 cover
+       agent + frame + input + audio + the two clipboard channels.
+
+       The two descriptors say which HOST processes may bind (listen) and
+       connect to these services. Every channel is guest-listens /
+       host-connects, and the host side is always the elevated App Sandbox
+       process (GUI or headless daemon), so SYSTEM and Administrators are
+       enough. Everyone else on the host, including standard users in other
+       sessions and AppContainer processes, cannot reach the agent, input,
+       display, audio or clipboard channels. The VM itself needs no entry:
+       the descriptors are checked against host processes' tokens, not
+       against what runs inside the guest. hcsshim uses the same pair. */
     {
         wchar_t entry[256];
         wchar_t guid_str[64];
@@ -1274,8 +1281,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
             hcs_service_guid_str(config->os_type, port, guid_str, 64);
             swprintf_s(entry, 256,
                 L"%s\"%s\":{"
-                    L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
-                    L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;WD)\","
+                    L"\"BindSecurityDescriptor\":\"D:P(A;;FA;;;SY)(A;;FA;;;BA)\","
+                    L"\"ConnectSecurityDescriptor\":\"D:P(A;;FA;;;SY)(A;;FA;;;BA)\","
                     L"\"AllowWildcardBinds\":true"
                 L"}",
                 (port > 1) ? L"," : L"", guid_str);
@@ -1365,6 +1372,95 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     return written > 0;
 }
 
+/* Microsoft's virtual storage vendor ({EC984AEC-A0F9-47E9-901F-71415A66345B}),
+   defined here so this file needs no INITGUID. */
+static const GUID g_vendor_microsoft =
+    { 0xec984aec, 0xa0f9, 0x47e9, { 0x90, 0x1f, 0x71, 0x41, 0x5a, 0x66, 0x34, 0x5b } };
+
+/* Grant the VM access to every parent of a differencing disk: a snapshot
+   branch boots on top of frozen snapshot disks and the base disk. VM folders
+   keep other local users out (asb_core.c), so each disk the worker process
+   opens carries the VM's own entry, as HcsGrantVmAccess gives the disk
+   itself. Best effort: a parent that cannot be resolved is left to HCS,
+   which reports the failure as before. */
+static void grant_parent_disks(const wchar_t *vm_name, const wchar_t *vhdx_path)
+{
+    VIRTUAL_STORAGE_TYPE type;
+    wchar_t current[MAX_PATH];
+    int depth;
+
+    if (!pfnGrantAccess || !vhdx_path || wcslen(vhdx_path) >= MAX_PATH) return;
+    type.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_VHDX;
+    type.VendorId = g_vendor_microsoft;
+    wcscpy_s(current, MAX_PATH, vhdx_path);
+    for (depth = 0; depth < 2 * 64 + 2; depth++) {
+        OPEN_VIRTUAL_DISK_PARAMETERS open_params;
+        union {
+            GET_VIRTUAL_DISK_INFO info;
+            BYTE raw[sizeof(GET_VIRTUAL_DISK_INFO) + 4 * MAX_PATH * sizeof(wchar_t)];
+        } buf;
+        ULONG size = sizeof(buf);
+        HANDLE disk = INVALID_HANDLE_VALUE;
+        const wchar_t *parent;
+        DWORD rc;
+        HRESULT hr;
+
+        ZeroMemory(&open_params, sizeof(open_params));
+        open_params.Version = OPEN_VIRTUAL_DISK_VERSION_2;
+        open_params.Version2.GetInfoOnly = TRUE;
+        open_params.Version2.ReadOnly = TRUE;
+        rc = OpenVirtualDisk(&type, current, VIRTUAL_DISK_ACCESS_NONE,
+                             OPEN_VIRTUAL_DISK_FLAG_NONE, &open_params, &disk);
+        if (rc != ERROR_SUCCESS) return;
+        ZeroMemory(&buf, sizeof(buf));
+        buf.info.Version = GET_VIRTUAL_DISK_INFO_PARENT_LOCATION;
+        rc = GetVirtualDiskInformation(disk, &size, &buf.info, NULL);
+        CloseHandle(disk);
+        /* ERROR_VHD_INVALID_TYPE: not a differencing disk, the chain ends. */
+        if (rc != ERROR_SUCCESS || !buf.info.ParentLocation.ParentResolved) return;
+        parent = buf.info.ParentLocation.ParentLocationBuffer;
+        if (!parent[0] || wcsnlen(parent, MAX_PATH) >= MAX_PATH) return;
+        hr = pfnGrantAccess(vm_name, parent);
+        if (FAILED(hr))
+            ui_log(L"Warning: GrantVmAccess on parent disk %s failed (0x%08X).", parent, hr);
+        wcscpy_s(current, MAX_PATH, parent);
+    }
+}
+
+static DWORD WINAPI close_vm_thread(LPVOID param);
+
+/* Close the handle a failed HcsCreateComputeSystem may still have returned
+   (HCS hands it out before the operation completes). Off this thread, as
+   hcs_close_vm does; no callback is registered yet. */
+static void drop_failed_create(VmInstance *instance)
+{
+    if (instance->handle && pfnClose) {
+        HCS_SYSTEM h = instance->handle;
+        HANDLE t;
+        instance->handle = NULL;
+        t = CreateThread(NULL, 0, close_vm_thread, h, 0, NULL);
+        if (t) CloseHandle(t);
+        else pfnClose(h);
+    }
+    instance->handle = NULL;
+}
+
+#ifdef _DEBUG
+/* Debug builds keep the last compute system document for inspection. */
+static void dump_vm_json(const wchar_t *json)
+{
+    wchar_t base[MAX_PATH], path[MAX_PATH];
+    FILE *dbg = NULL;
+    DWORD n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
+    if (!n || n >= MAX_PATH) wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+    swprintf_s(path, MAX_PATH, L"%s\\AppSandbox\\last_vm.json", base);
+    _wfopen_s(&dbg, path, L"w,ccs=UTF-8");
+    if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
+}
+#else
+#define dump_vm_json(json) ((void)0)
+#endif
+
 HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
 {
     wchar_t json[16384];
@@ -1393,6 +1489,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
         }
+        grant_parent_disks(config->name, config->vhdx_path);
         if (config->image_path[0] != L'\0')
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
@@ -1403,12 +1500,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
     if (!hcs_build_vm_json(config, NULL, json, 16384))
         return E_FAIL;
 
-    /* Dump JSON to file for debugging */
-    {
-        FILE *dbg = NULL;
-        _wfopen_s(&dbg, L"C:\\ProgramData\\AppSandbox\\last_vm.json", L"w,ccs=UTF-8");
-        if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
-    }
+    dump_vm_json(json);
 
     /* Destroy any stale system with the same name before creating */
     hcs_destroy_stale(config->name);
@@ -1422,6 +1514,7 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
 
     /* Retry once — hcs_destroy_stale may have terminated a stuck system */
     if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        drop_failed_create(instance);
         ui_log(L"Retrying VM create after stale cleanup...");
         pump_sleep(2000);
         op = pfnCreateOp(NULL, NULL);
@@ -1430,6 +1523,9 @@ HRESULT hcs_create_vm(const VmConfig *config, VmInstance *instance)
             hr = hcs_exec_and_wait(hr, op);
         }
     }
+    /* A failed create must not leave a handle behind: callers take a
+       non-NULL handle for a usable compute system. */
+    if (FAILED(hr)) drop_failed_create(instance);
 
     if (SUCCEEDED(hr)) {
         record_guest_security(config);
@@ -1486,6 +1582,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             if (FAILED(grant_hr))
                 ui_log(L"Warning: GrantVmAccess retry on VHDX failed (0x%08X)", grant_hr);
         }
+        grant_parent_disks(config->name, config->vhdx_path);
         if (config->image_path[0] != L'\0')
             pfnGrantAccess(config->name, config->image_path);
         if (config->resources_iso_path[0] != L'\0')
@@ -1495,12 +1592,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
     if (!hcs_build_vm_json(config, endpoint_guid, json, 16384))
         return E_FAIL;
 
-    /* Dump JSON to file for debugging */
-    {
-        FILE *dbg = NULL;
-        _wfopen_s(&dbg, L"C:\\ProgramData\\AppSandbox\\last_vm.json", L"w,ccs=UTF-8");
-        if (dbg) { fwprintf(dbg, L"%s", json); fclose(dbg); }
-    }
+    dump_vm_json(json);
 
     /* Destroy any stale system with the same name before creating */
     hcs_destroy_stale(config->name);
@@ -1514,6 +1606,7 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
 
     /* Retry once — hcs_destroy_stale may have terminated a stuck system */
     if (hr == (HRESULT)0x8037010DL || hr == HRESULT_FROM_WIN32(ERROR_ALREADY_EXISTS)) {
+        drop_failed_create(instance);
         ui_log(L"Retrying VM create after stale cleanup...");
         pump_sleep(2000);
         op = pfnCreateOp(NULL, NULL);
@@ -1522,6 +1615,9 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
             hr = hcs_exec_and_wait(hr, op);
         }
     }
+    /* A failed create must not leave a handle behind: callers take a
+       non-NULL handle for a usable compute system. */
+    if (FAILED(hr)) drop_failed_create(instance);
 
     if (SUCCEEDED(hr)) {
         record_guest_security(config);

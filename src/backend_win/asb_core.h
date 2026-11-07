@@ -104,6 +104,11 @@ typedef void (*AsbAlertCallback)(const wchar_t *message, void *user_data);
    Called from a worker thread. */
 typedef void (*AsbVmRemovedCallback)(int index, void *user_data);
 
+/* Append one line to %ProgramData%\AppSandbox\appsandbox.log with a
+   timestamp (no callback; safe from HCS callback threads). ui_log and the
+   core's own log call it; the file rotates to appsandbox.log.old at 10 MB. */
+ASB_API void asb_log_write_line(const wchar_t *line);
+
 /* ---- Library init / cleanup ---- */
 
 /* Initialize the core library.

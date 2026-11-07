@@ -19,6 +19,7 @@
 #include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
+#include "asb_paths.h"         /* data folder, single-instance lock */
 
 #pragma comment(lib, "httpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -172,11 +173,8 @@ static void programdata_path(wchar_t *out, size_t cap, const wchar_t *leaf)
 
 static void open_log(void)
 {
-    wchar_t dir[MAX_PATH], path[MAX_PATH], base[MAX_PATH];
-    if (!GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH))
-        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
-    swprintf_s(dir, MAX_PATH, L"%s\\AppSandbox", base);
-    CreateDirectoryW(dir, NULL);
+    wchar_t dir[MAX_PATH], path[MAX_PATH];
+    asb_program_data_dir(dir, MAX_PATH);
     programdata_path(path, MAX_PATH, L"headless.log");
     InitializeCriticalSection(&g_log_cs);
     _wfopen_s(&g_log, path, L"w, ccs=UTF-8");
@@ -382,6 +380,26 @@ static void send_hr(HTTP_REQUEST_ID id, const char *action, const char *nu, AsbV
             action, nu, idText, (unsigned long)hr);
         send_json(id, 500, "Internal Server Error", b);
     }
+}
+
+/* Snapshot and branch changes swap or delete the disks a VM boots from, so
+   they need a stopped, idle VM. Answers 409 (vm_running / vm_busy) and
+   returns TRUE when the VM is not; the core refuses the same cases. */
+static BOOL refuse_snapshot_change(HTTP_REQUEST_ID id, AsbVm vm)
+{
+    VmInstance *v = asb_vm_instance(vm);
+    if (!v) return FALSE;
+    if (v->running || v->starting) {
+        send_err(id, 409, "Conflict", "vm_running",
+                 "cannot change the snapshots of a running VM; stop it first");
+        return TRUE;
+    }
+    if (v->building_vhdx || v->copying_disk || v->updating_tools) {
+        send_err(id, 409, "Conflict", "vm_busy",
+                 "the VM is being built, exported, imported or updated; retry when that finishes");
+        return TRUE;
+    }
+    return FALSE;
 }
 
 /* Read the request entity body explicitly (reliable) -> wide string for json_get_*. */
@@ -957,15 +975,15 @@ static int handle_request(PHTTP_REQUEST req)
 
         if (verb == HttpVerbGET && wcscmp(sub, L"sshInfo") == 0) {
             VmInstance *v = asb_vm_instance(vm);
-            char user[256] = {0};
             int ssh_rep;
             if (!v) { send_err(req->RequestId, 404, "Not Found", "not_found", "no such VM"); return 0; }
-            WideCharToMultiByte(CP_UTF8, 0, v->admin_user[0] ? v->admin_user : L"User", -1, user, sizeof(user), NULL, NULL);
             ssh_rep = (v->ssh_key_deployed && v->ssh_state == 2) ? 4 : v->ssh_state;
-            sprintf_s(buf, sizeof(buf),
-                "{\"host\":\"127.0.0.1\",\"port\":%lu,\"user\":\"%s\",\"sshState\":%d,\"enabled\":%s,"
-                "\"keyDeployed\":%s}",
-                (unsigned long)v->ssh_port, user, ssh_rep, v->ssh_enabled ? "true" : "false",
+            pos = sprintf_s(buf, sizeof(buf), "{\"host\":\"127.0.0.1\",\"port\":%lu,\"user\":",
+                            (unsigned long)v->ssh_port);
+            pos = append_wstr(buf, sizeof(buf), pos, v->admin_user[0] ? v->admin_user : L"User");
+            sprintf_s(buf + pos, sizeof(buf) - pos,
+                ",\"sshState\":%d,\"enabled\":%s,\"keyDeployed\":%s}",
+                ssh_rep, v->ssh_enabled ? "true" : "false",
                 v->ssh_key_deployed ? "true" : "false");
             send_json(req->RequestId, 200, "OK", buf);
             return 0;
@@ -1106,11 +1124,7 @@ static int handle_request(PHTTP_REQUEST req)
             }
             if (verb == HttpVerbPOST) {
                 wchar_t body[1024], sname[128] = {0};
-                VmInstance *sv = asb_vm_instance(vm);
-                if (sv && sv->running) {   /* clean 409, not the generic 500 from a running snapshot attempt */
-                    send_err(req->RequestId, 409, "Conflict", "vm_running", "cannot snapshot a running VM; stop it first");
-                    return 0;
-                }
+                if (refuse_snapshot_change(req->RequestId, vm)) return 0;
                 body_to_wide(req, body, 1024);
                 json_get_string(body, L"name", sname, 128);
                 send_hr(req->RequestId, "snapTake", nu, vm_id, asb_snap_take(vm, sname[0] ? sname : NULL));
@@ -1128,6 +1142,7 @@ static int handle_request(PHTTP_REQUEST req)
                    (No standalone "new branch": the GUI creates branches by starting
                     from a snapshot, exposed via POST .../start with a branchName.) */
                 if (verb == HttpVerbDELETE && *brest == L'/') {
+                    if (refuse_snapshot_change(req->RequestId, vm)) return 0;
                     send_hr(req->RequestId, "snapDeleteBranch", nu, vm_id,
                             asb_snap_delete_branch(vm, sidx, _wtoi(brest + 1)));
                     return 0;
@@ -1140,6 +1155,7 @@ static int handle_request(PHTTP_REQUEST req)
                                  "the base is not a deletable snapshot; delete a base branch via .../snapshots/-2/branches/{i}");
                         return 0;
                     }
+                    if (refuse_snapshot_change(req->RequestId, vm)) return 0;
                     send_hr(req->RequestId, "snapDelete", nu, vm_id, asb_snap_delete(vm, sidx));
                     return 0;
                 }
@@ -1472,7 +1488,7 @@ void asb_api_stop(void)
 
 int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 {
-    HANDLE mtx, bt;
+    HANDLE bt;
 
     (void)cmdline;
     open_log();
@@ -1505,9 +1521,8 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
         return 3;
     }
 
-    mtx = CreateMutexW(NULL, FALSE, L"Global\\AppSandboxCoreHost");
-    if (!mtx) { hlog(L"FATAL: CreateMutex failed (%lu).", GetLastError()); return 1; }
-    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+    /* Same lock as the app window (asb_paths.h): one instance at a time. */
+    if (asb_instance_lock() == ASB_INSTANCE_RUNNING) {
         /* cli_fail, not just hlog: the loser's open_log failed (the running
            daemon holds headless.log with share-deny), so a log-only message
            would vanish -- tell the launching console/user directly. */
@@ -1532,7 +1547,5 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     asb_cleanup();
     hlog(L"cleaned up (VMs terminated). exit 0.");
     if (g_log) { fclose(g_log); g_log = NULL; }
-    ReleaseMutex(mtx);
-    CloseHandle(mtx);
     return 0;
 }

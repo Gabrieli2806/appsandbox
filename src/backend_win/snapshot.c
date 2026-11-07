@@ -1,6 +1,7 @@
 #include "snapshot.h"
 #include "disk_util.h"
 #include <stdio.h>
+#include <io.h>
 #include <objbase.h>
 
 /* ---- Helpers ---- */
@@ -46,6 +47,73 @@ static BOOL get_branch_list(SnapshotTree *tree, int index,
     return FALSE;
 }
 
+/* ---- Deleting disks ----
+   The disks of a snapshot or branch are each opened for exclusive DELETE
+   access before anything changes. A disk something else holds open (a
+   running VM, a stale compute system, a backup tool) cannot be opened, and
+   then nothing is deleted. Missing files count as already deleted. */
+
+typedef struct {
+    HANDLE handles[MAX_BRANCHES + 1];
+    int    count;
+} DiskDeleteSet;
+
+static HRESULT delete_set_add(DiskDeleteSet *set, const wchar_t *path)
+{
+    HANDLE h;
+    if (!path || !path[0]) return S_OK;
+    if (set->count >= (int)(sizeof(set->handles) / sizeof(set->handles[0]))) return E_UNEXPECTED;
+    h = CreateFileW(path, DELETE, 0, NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) return S_OK;
+        return HRESULT_FROM_WIN32(err);
+    }
+    set->handles[set->count++] = h;
+    return S_OK;
+}
+
+/* Let the disks go without deleting them. */
+static void delete_set_release(DiskDeleteSet *set)
+{
+    int i;
+    for (i = 0; i < set->count; i++) CloseHandle(set->handles[i]);
+    set->count = 0;
+}
+
+/* Delete every disk of the set, or none: a disk that cannot be marked for
+   deletion unmarks the ones before it. */
+static HRESULT delete_set_commit(DiskDeleteSet *set)
+{
+    FILE_DISPOSITION_INFO disposition;
+    HRESULT hr = S_OK;
+    int i, marked = 0;
+    for (i = 0; i < set->count; i++) {
+        disposition.DeleteFile = TRUE;
+        if (!SetFileInformationByHandle(set->handles[i], FileDispositionInfo,
+                                        &disposition, sizeof(disposition))) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            break;
+        }
+        marked++;
+    }
+    if (FAILED(hr)) {
+        for (i = 0; i < marked; i++) {
+            disposition.DeleteFile = FALSE;
+            SetFileInformationByHandle(set->handles[i], FileDispositionInfo,
+                                       &disposition, sizeof(disposition));
+        }
+    }
+    delete_set_release(set);
+    return hr;
+}
+
+static HRESULT last_error_hresult(void)
+{
+    DWORD err = GetLastError();
+    return err ? HRESULT_FROM_WIN32(err) : E_FAIL;
+}
+
 /* ---- Persistence (tree.dat) ---- */
 
 /*  Format:
@@ -67,19 +135,31 @@ static BOOL get_branch_list(SnapshotTree *tree, int index,
  *    Vhdx=C:\...\snapshots\branch_ghi11111-....vhdx
  */
 
-void snapshot_save(SnapshotTree *tree)
+/* tree.dat is written to tree.dat.tmp, flushed to disk and then moved over
+   the old file, so a full disk, a crash or a power cut leaves the previous
+   tree.dat intact. An empty tree removes the file. */
+HRESULT snapshot_save(SnapshotTree *tree)
 {
-    wchar_t path[MAX_PATH];
+    wchar_t path[MAX_PATH], temporary[MAX_PATH];
     FILE *f;
     int i, b;
+    BOOL ok;
+    HRESULT hr;
 
-    swprintf_s(path, MAX_PATH, L"%s\\tree.dat", tree->base_dir);
+    if (swprintf_s(path, MAX_PATH, L"%s\\tree.dat", tree->base_dir) < 0 ||
+        swprintf_s(temporary, MAX_PATH, L"%s\\tree.dat.tmp", tree->base_dir) < 0)
+        return E_INVALIDARG;
     if (tree->count == 0 && tree->base_branch_count == 0) {
         tree->base_vhdx[0] = L'\0';
-        DeleteFileW(path);
-        return;
+        if (!DeleteFileW(path)) {
+            DWORD err = GetLastError();
+            if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+                return HRESULT_FROM_WIN32(err);
+        }
+        return S_OK;
     }
-    if (_wfopen_s(&f, path, L"w, ccs=UTF-8") != 0 || !f) return;
+    SetLastError(ERROR_SUCCESS);
+    if (_wfopen_s(&f, temporary, L"w, ccs=UTF-8") != 0 || !f) return last_error_hresult();
 
     fwprintf(f, L"[Base]\n%s\n\n", tree->base_vhdx);
 
@@ -116,7 +196,17 @@ void snapshot_save(SnapshotTree *tree)
         }
     }
 
-    fclose(f);
+    ok = !ferror(f) && fflush(f) == 0 && _commit(_fileno(f)) == 0;
+    if (fclose(f) != 0) ok = FALSE;
+    if (!ok) {
+        DeleteFileW(temporary);
+        return HRESULT_FROM_WIN32(ERROR_WRITE_FAULT);
+    }
+    if (MoveFileExW(temporary, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+        return S_OK;
+    hr = last_error_hresult();
+    DeleteFileW(temporary);
+    return hr;
 }
 
 static void snapshot_load(SnapshotTree *tree)
@@ -177,39 +267,39 @@ static void snapshot_load(SnapshotTree *tree)
         }
 
         if (section == 1 && tree->base_vhdx[0] == L'\0') {
-            wcscpy_s(tree->base_vhdx, MAX_PATH, line);
+            wcsncpy_s(tree->base_vhdx, MAX_PATH, line, _TRUNCATE);
             section = 0;
             continue;
         }
 
         if (section == 2 && cur_branch) {
             if (wcsncmp(line, L"Guid=", 5) == 0)
-                wcscpy_s(cur_branch->guid, 64, line + 5);
+                wcsncpy_s(cur_branch->guid, 64, line + 5, _TRUNCATE);
             else if (wcsncmp(line, L"Name=", 5) == 0)
-                wcscpy_s(cur_branch->friendly_name, 128, line + 5);
+                wcsncpy_s(cur_branch->friendly_name, 128, line + 5, _TRUNCATE);
             else if (wcsncmp(line, L"Vhdx=", 5) == 0)
-                wcscpy_s(cur_branch->vhdx_path, MAX_PATH, line + 5);
+                wcsncpy_s(cur_branch->vhdx_path, MAX_PATH, line + 5, _TRUNCATE);
             continue;
         }
 
         if (section == 4 && cur_branch) {
             if (wcsncmp(line, L"Guid=", 5) == 0)
-                wcscpy_s(cur_branch->guid, 64, line + 5);
+                wcsncpy_s(cur_branch->guid, 64, line + 5, _TRUNCATE);
             else if (wcsncmp(line, L"Name=", 5) == 0)
-                wcscpy_s(cur_branch->friendly_name, 128, line + 5);
+                wcsncpy_s(cur_branch->friendly_name, 128, line + 5, _TRUNCATE);
             else if (wcsncmp(line, L"Vhdx=", 5) == 0)
-                wcscpy_s(cur_branch->vhdx_path, MAX_PATH, line + 5);
+                wcsncpy_s(cur_branch->vhdx_path, MAX_PATH, line + 5, _TRUNCATE);
             continue;
         }
 
         if (section != 3 || !node) continue;
 
         if (wcsncmp(line, L"Guid=", 5) == 0)
-            wcscpy_s(node->guid, 64, line + 5);
+            wcsncpy_s(node->guid, 64, line + 5, _TRUNCATE);
         else if (wcsncmp(line, L"Name=", 5) == 0)
-            wcscpy_s(node->name, 128, line + 5);
+            wcsncpy_s(node->name, 128, line + 5, _TRUNCATE);
         else if (wcsncmp(line, L"Vhdx=", 5) == 0)
-            wcscpy_s(node->snap_vhdx, MAX_PATH, line + 5);
+            wcsncpy_s(node->snap_vhdx, MAX_PATH, line + 5, _TRUNCATE);
         else if (wcsncmp(line, L"Created=", 8) == 0) {
             ULARGE_INTEGER ft;
             ft.QuadPart = _wcstoui64(line + 8, NULL, 10);
@@ -217,7 +307,7 @@ static void snapshot_load(SnapshotTree *tree)
             node->created.dwHighDateTime = ft.HighPart;
         }
         else if (wcsncmp(line, L"Parent=", 7) == 0)
-            wcscpy_s(node->parent_guid, 64, line + 7);
+            wcsncpy_s(node->parent_guid, 64, line + 7, _TRUNCATE);
     }
 
     fclose(f);
@@ -232,7 +322,7 @@ void snapshot_init(SnapshotTree *tree, const wchar_t *base_dir)
     CreateDirectoryW(base_dir, NULL);
     snapshot_load(tree);
     if (tree->count == 0 && tree->base_branch_count == 0 && tree->base_vhdx[0] != L'\0')
-        snapshot_save(tree);
+        (void)snapshot_save(tree);
 }
 
 HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *name)
@@ -244,9 +334,12 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     wchar_t branch_path[MAX_PATH];
     wchar_t parent_guid[64] = L"";
     BranchEntry *cur_branches = NULL;
+    BranchEntry frozen_branch;
     int *cur_count = NULL;
     const wchar_t *cur_parent;
     int cur_snap, cur_branch, i;
+    wchar_t previous_vhdx[MAX_PATH];
+    BOOL base_captured = FALSE;
     HRESULT hr;
 
     if (!tree || !instance || !name)
@@ -255,10 +348,13 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
         return HRESULT_FROM_WIN32(ERROR_BUFFER_OVERFLOW);
     if (instance->running)
         return E_NOT_VALID_STATE;
+    wcscpy_s(previous_vhdx, MAX_PATH, instance->vhdx_path);
+    ZeroMemory(&frozen_branch, sizeof(frozen_branch));
 
     /* Capture the base VHDX on first snapshot */
     if (tree->base_vhdx[0] == L'\0') {
         wcscpy_s(tree->base_vhdx, MAX_PATH, instance->vhdx_path);
+        base_captured = TRUE;
     }
 
     /* Build frozen snapshot VHDX with GUID filename */
@@ -273,10 +369,15 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
         /* On a working branch: freeze that branch as the snapshot. It must then
            leave the branch list, because booting it again would write to a
            disk the new branch depends on. */
-        if (!get_branch_list(tree, cur_snap, &cur_branches, &cur_count, &cur_parent))
+        if (!get_branch_list(tree, cur_snap, &cur_branches, &cur_count, &cur_parent)) {
+            if (base_captured) tree->base_vhdx[0] = L'\0';
             return E_UNEXPECTED;
-        if (!MoveFileExW(instance->vhdx_path, vhdx_path, 0))
-            return HRESULT_FROM_WIN32(GetLastError());
+        }
+        if (!MoveFileExW(instance->vhdx_path, vhdx_path, 0)) {
+            hr = HRESULT_FROM_WIN32(GetLastError());
+            if (base_captured) tree->base_vhdx[0] = L'\0';
+            return hr;
+        }
         if (cur_snap >= 0)
             wcscpy_s(parent_guid, 64, tree->nodes[cur_snap].guid);
     } else {
@@ -294,7 +395,10 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
             wcscpy_s(parent_guid, 64, tree->nodes[i].guid);
         }
         hr = vhdx_create_differencing(vhdx_path, instance->vhdx_path);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) {
+            if (base_captured) tree->base_vhdx[0] = L'\0';
+            return hr;
+        }
     }
 
     /* Auto-create first branch with GUID filename */
@@ -307,11 +411,13 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
             MoveFileExW(vhdx_path, instance->vhdx_path, 0);  /* give the branch back */
         else
             DeleteFileW(vhdx_path);
+        if (base_captured) tree->base_vhdx[0] = L'\0';
         return hr;
     }
 
     /* The frozen branch is the snapshot now */
     if (cur_branches) {
+        frozen_branch = cur_branches[cur_branch];
         for (i = cur_branch; i < *cur_count - 1; i++)
             cur_branches[i] = cur_branches[i + 1];
         ZeroMemory(&cur_branches[*cur_count - 1], sizeof(BranchEntry));
@@ -340,7 +446,27 @@ HRESULT snapshot_take(SnapshotTree *tree, VmInstance *instance, const wchar_t *n
     /* Switch VM to the branch */
     wcscpy_s(instance->vhdx_path, MAX_PATH, branch_path);
 
-    snapshot_save(tree);
+    hr = snapshot_save(tree);
+    if (FAILED(hr)) {
+        /* The tree could not be recorded: undo everything, so tree.dat,
+           vms.cfg and the files on disk keep agreeing. */
+        tree->count--;
+        ZeroMemory(&tree->nodes[tree->count], sizeof(SnapNode));
+        if (cur_branches) {
+            for (i = *cur_count; i > cur_branch; i--)
+                cur_branches[i] = cur_branches[i - 1];
+            cur_branches[cur_branch] = frozen_branch;
+            (*cur_count)++;
+        }
+        wcscpy_s(instance->vhdx_path, MAX_PATH, previous_vhdx);
+        DeleteFileW(branch_path);
+        if (cur_branches)
+            MoveFileExW(vhdx_path, previous_vhdx, 0);
+        else
+            DeleteFileW(vhdx_path);
+        if (base_captured) tree->base_vhdx[0] = L'\0';
+        return hr;
+    }
     return S_OK;
 }
 
@@ -350,7 +476,7 @@ HRESULT snapshot_new_branch(SnapshotTree *tree, VmInstance *instance, int index)
     int *branch_count;
     const wchar_t *parent_vhdx;
     wchar_t guid[64];
-    wchar_t branch_path[MAX_PATH];
+    wchar_t branch_path[MAX_PATH], previous_vhdx[MAX_PATH];
     HRESULT hr;
 
     if (!tree || !instance) return E_INVALIDARG;
@@ -372,8 +498,16 @@ HRESULT snapshot_new_branch(SnapshotTree *tree, VmInstance *instance, int index)
     branches[*branch_count].valid = TRUE;
     (*branch_count)++;
 
+    wcscpy_s(previous_vhdx, MAX_PATH, instance->vhdx_path);
     wcscpy_s(instance->vhdx_path, MAX_PATH, branch_path);
-    snapshot_save(tree);
+    hr = snapshot_save(tree);
+    if (FAILED(hr)) {
+        (*branch_count)--;
+        ZeroMemory(&branches[*branch_count], sizeof(BranchEntry));
+        wcscpy_s(instance->vhdx_path, MAX_PATH, previous_vhdx);
+        DeleteFileW(branch_path);
+        return hr;
+    }
     return S_OK;
 }
 
@@ -416,12 +550,17 @@ HRESULT snapshot_ensure_writable(SnapshotTree *tree, VmInstance *instance)
 
 HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
 {
+    DiskDeleteSet disks;
+    SnapNode removed;
+    wchar_t previous_vhdx[MAX_PATH], previous_base[MAX_PATH], fallback[MAX_PATH];
     int i, b;
     BOOL need_fallback = FALSE;
+    HRESULT hr;
 
     if (!tree || !instance) return E_INVALIDARG;
     if (index < 0 || index >= tree->count) return E_INVALIDARG;
     if (!tree->nodes[index].valid) return E_NOT_VALID_STATE;
+    if (instance->running) return E_NOT_VALID_STATE;
 
     /* A snapshot taken on this one is a differencing child of its disk */
     if (tree->nodes[index].guid[0] != L'\0') {
@@ -448,7 +587,7 @@ HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
         BOOL found = FALSE;
         for (b = 0; b < tree->base_branch_count && !found; b++) {
             if (tree->base_branches[b].valid) {
-                wcscpy_s(instance->vhdx_path, MAX_PATH, tree->base_branches[b].vhdx_path);
+                wcscpy_s(fallback, MAX_PATH, tree->base_branches[b].vhdx_path);
                 found = TRUE;
             }
         }
@@ -456,46 +595,80 @@ HRESULT snapshot_delete(SnapshotTree *tree, VmInstance *instance, int index)
             if (i == index || !tree->nodes[i].valid) continue;
             for (b = 0; b < tree->nodes[i].branch_count; b++) {
                 if (tree->nodes[i].branches[b].valid) {
-                    wcscpy_s(instance->vhdx_path, MAX_PATH, tree->nodes[i].branches[b].vhdx_path);
+                    wcscpy_s(fallback, MAX_PATH, tree->nodes[i].branches[b].vhdx_path);
                     found = TRUE;
                     break;
                 }
             }
         }
         if (!found)
-            wcscpy_s(instance->vhdx_path, MAX_PATH, tree->base_vhdx);
+            wcscpy_s(fallback, MAX_PATH, tree->base_vhdx);
     }
 
-    /* Delete all branch VHDXs */
+    /* Hold every disk of the snapshot (its branches, then its frozen disk)
+       before changing anything: one in use keeps the whole snapshot. */
+    disks.count = 0;
     for (b = 0; b < tree->nodes[index].branch_count; b++) {
-        if (tree->nodes[index].branches[b].valid)
-            DeleteFileW(tree->nodes[index].branches[b].vhdx_path);
+        if (!tree->nodes[index].branches[b].valid) continue;
+        hr = delete_set_add(&disks, tree->nodes[index].branches[b].vhdx_path);
+        if (FAILED(hr)) { delete_set_release(&disks); return hr; }
     }
-    /* Delete the frozen snapshot VHDX */
-    DeleteFileW(tree->nodes[index].snap_vhdx);
+    hr = delete_set_add(&disks, tree->nodes[index].snap_vhdx);
+    if (FAILED(hr)) { delete_set_release(&disks); return hr; }
 
-    /* Shift remaining nodes down */
+    /* Record the tree without the snapshot first; the disks go only once
+       tree.dat no longer lists them. */
+    removed = tree->nodes[index];
+    wcscpy_s(previous_vhdx, MAX_PATH, instance->vhdx_path);
+    wcscpy_s(previous_base, MAX_PATH, tree->base_vhdx);
+    if (need_fallback)
+        wcscpy_s(instance->vhdx_path, MAX_PATH, fallback);
     for (i = index; i < tree->count - 1; i++)
         tree->nodes[i] = tree->nodes[i + 1];
     ZeroMemory(&tree->nodes[tree->count - 1], sizeof(SnapNode));
     tree->count--;
 
-    snapshot_save(tree);
+    hr = snapshot_save(tree);
+    if (FAILED(hr)) {
+        for (i = tree->count; i > index; i--)
+            tree->nodes[i] = tree->nodes[i - 1];
+        tree->nodes[index] = removed;
+        tree->count++;
+        wcscpy_s(tree->base_vhdx, MAX_PATH, previous_base);
+        wcscpy_s(instance->vhdx_path, MAX_PATH, previous_vhdx);
+        delete_set_release(&disks);
+        return hr;
+    }
+    /* tree.dat no longer lists these disks; a failure here only leaves
+       unreferenced files behind. */
+    (void)delete_set_commit(&disks);
     return S_OK;
 }
 
 HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int index, int branch_idx)
 {
+    DiskDeleteSet disks;
     BranchEntry *branches;
+    BranchEntry removed;
     int *branch_count;
     const wchar_t *parent_vhdx;
+    wchar_t previous_vhdx[MAX_PATH], previous_base[MAX_PATH];
     int i;
+    HRESULT hr;
 
     if (!tree || !instance) return E_INVALIDARG;
+    if (instance->running) return E_NOT_VALID_STATE;
     if (!get_branch_list(tree, index, &branches, &branch_count, &parent_vhdx))
         return E_INVALIDARG;
     if (branch_idx < 0 || branch_idx >= *branch_count || !branches[branch_idx].valid)
         return E_INVALIDARG;
+
+    disks.count = 0;
+    hr = delete_set_add(&disks, branches[branch_idx].vhdx_path);
+    if (FAILED(hr)) return hr;
+
+    wcscpy_s(previous_vhdx, MAX_PATH, instance->vhdx_path);
+    wcscpy_s(previous_base, MAX_PATH, tree->base_vhdx);
 
     /* If currently on this branch, fall back to a sibling or base */
     if (_wcsicmp(instance->vhdx_path, branches[branch_idx].vhdx_path) == 0) {
@@ -511,15 +684,25 @@ HRESULT snapshot_delete_branch(SnapshotTree *tree, VmInstance *instance, int ind
             wcscpy_s(instance->vhdx_path, MAX_PATH, tree->base_vhdx);
     }
 
-    DeleteFileW(branches[branch_idx].vhdx_path);
-
     /* Shift remaining branches down */
+    removed = branches[branch_idx];
     for (i = branch_idx; i < *branch_count - 1; i++)
         branches[i] = branches[i + 1];
     ZeroMemory(&branches[*branch_count - 1], sizeof(BranchEntry));
     (*branch_count)--;
 
-    snapshot_save(tree);
+    hr = snapshot_save(tree);
+    if (FAILED(hr)) {
+        for (i = *branch_count; i > branch_idx; i--)
+            branches[i] = branches[i - 1];
+        branches[branch_idx] = removed;
+        (*branch_count)++;
+        wcscpy_s(tree->base_vhdx, MAX_PATH, previous_base);
+        wcscpy_s(instance->vhdx_path, MAX_PATH, previous_vhdx);
+        delete_set_release(&disks);
+        return hr;
+    }
+    (void)delete_set_commit(&disks);
     return S_OK;
 }
 
@@ -602,6 +785,9 @@ BOOL snapshot_get_branch_time(SnapshotTree *tree, int snap_idx, int branch_idx, 
 
 HRESULT snapshot_rename(SnapshotTree *tree, int snap_idx, int branch_idx, const wchar_t *new_name)
 {
+    wchar_t *target, previous[128];
+    HRESULT hr;
+
     if (!tree || !new_name || new_name[0] == L'\0')
         return E_INVALIDARG;
 
@@ -610,22 +796,25 @@ HRESULT snapshot_rename(SnapshotTree *tree, int snap_idx, int branch_idx, const 
         if (branch_idx < 0 || branch_idx >= tree->base_branch_count ||
             !tree->base_branches[branch_idx].valid)
             return E_INVALIDARG;
-        wcscpy_s(tree->base_branches[branch_idx].friendly_name, 128, new_name);
+        target = tree->base_branches[branch_idx].friendly_name;
     } else if (snap_idx >= 0 && snap_idx < tree->count && tree->nodes[snap_idx].valid) {
         if (branch_idx < 0) {
             /* Rename the snapshot itself */
-            wcscpy_s(tree->nodes[snap_idx].name, 128, new_name);
+            target = tree->nodes[snap_idx].name;
         } else {
             /* Rename a snapshot branch */
             if (branch_idx >= tree->nodes[snap_idx].branch_count ||
                 !tree->nodes[snap_idx].branches[branch_idx].valid)
                 return E_INVALIDARG;
-            wcscpy_s(tree->nodes[snap_idx].branches[branch_idx].friendly_name, 128, new_name);
+            target = tree->nodes[snap_idx].branches[branch_idx].friendly_name;
         }
     } else {
         return E_INVALIDARG;
     }
 
-    snapshot_save(tree);
-    return S_OK;
+    wcscpy_s(previous, 128, target);
+    wcsncpy_s(target, 128, new_name, _TRUNCATE);
+    hr = snapshot_save(tree);
+    if (FAILED(hr)) wcscpy_s(target, 128, previous);
+    return hr;
 }
