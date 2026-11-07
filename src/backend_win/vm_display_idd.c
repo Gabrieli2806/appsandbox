@@ -176,6 +176,10 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 /* Wait after the last window resize before asking the guest for a new size,
    so a drag produces one mode change instead of dozens. */
 #define ADAPTIVE_DEBOUNCE_MS 400
+/* A frame channel drop shorter than this is not reported ("Reconnecting")
+   on the toolbar or in the title: the guest driver drops the channel on
+   every display mode change and the host reconnects about 1 s later. */
+#define STATUS_DEBOUNCE_MS 2500
 
 /* ---- Window messages ---- */
 
@@ -300,7 +304,8 @@ struct VmDisplayIdd {
     HWND          toolbar_hwnd;
     HWND          toolbar_tip;        /* tooltips for its icon buttons */
     BOOL          toolbar_pinned;
-    BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting" */
+    BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting"
+                                         (debounced copy of !frame_connected) */
     int           toolbar_hot;        /* item under the pointer, -1 none */
     RECT          toolbar_items[12];  /* client rects of the items, for hit tests */
     int           toolbar_count;
@@ -399,6 +404,7 @@ struct VmDisplayIdd {
     volatile LONG  keyboard_version;
     volatile LONG  mouse_version;
     volatile BOOL  frame_connected;
+    volatile LONG64 frame_lost_tick; /* GetTickCount64() when the frame channel last dropped */
     BOOL           relative_mouse;
     BOOL           input_sizing;
     UINT           mouse_buttons;
@@ -1552,7 +1558,7 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
     d->fps_last_recv = recv;
     d->fps_tick = now;
 
-    if (!d->frame_connected) {
+    if (d->status_shown) {
         swprintf_s(title, ARRAYSIZE(title), L"%s%s - %s", d->audio_muted ? L"\U0001F507 " : L"",
                    d->vm_name, idd_status_text(d));
     } else if (!asb_get_viewer_title_stats()) {
@@ -1646,7 +1652,7 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
         break;
     case TB_FPS:
         *icon = FALSE;
-        if (!d->frame_connected)
+        if (d->status_shown)
             wcscpy_s(text, cap, idd_status_text(d));
         else
             swprintf_s(text, cap, L"%u FPS%s", d->fps_value,
@@ -1769,8 +1775,14 @@ static void tb_position(VmDisplayIdd *d)
     top.x = rc.left + (rc.right - rc.left - sz.cx) / 2;
     top.y = rc.top + tb_scale(d, TB_MARGIN_PX);
     ClientToScreen(d->render_hwnd, &top);
-    SetWindowPos(d->toolbar_hwnd, HWND_TOP, top.x, top.y, sz.cx, sz.cy,
-                 SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    /* Raise it only while the viewer is in front: a refresh (FPS, status)
+       while the user works in another app must not put it above that app. */
+    if (GetForegroundWindow() == d->hwnd)
+        SetWindowPos(d->toolbar_hwnd, HWND_TOP, top.x, top.y, sz.cx, sz.cy,
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    else
+        SetWindowPos(d->toolbar_hwnd, NULL, top.x, top.y, sz.cx, sz.cy,
+                     SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER);
 }
 
 static void tb_hide(VmDisplayIdd *d)
@@ -1810,7 +1822,9 @@ static void tb_on_timer(VmDisplayIdd *d)
     if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) { KillTimer(d->hwnd, IDT_TOOLBAR); return; }
     SetTimer(d->hwnd, IDT_TOOLBAR, 400, NULL);
     if (d->relative_mouse) { tb_hide(d); return; }
-    if (d->toolbar_pinned || !d->frame_connected) return;   /* pinned, or showing the status */
+    if (d->toolbar_pinned) return;
+    /* Showing the status: keep it up while the viewer is in front. */
+    if (d->status_shown && GetForegroundWindow() == d->hwnd) return;
     GetCursorPos(&pt);
     GetWindowRect(d->toolbar_hwnd, &tr);
     band = tr;
@@ -1881,7 +1895,7 @@ static void tb_paint(VmDisplayIdd *d, HWND hwnd)
             DeleteObject(b);
         }
         if (on && icon) fg = TB_ACCENT;
-        if (item == TB_FPS) fg = d->frame_connected ? RGB(0x5F, 0xD9, 0x93) : RGB(0xA7, 0xB0, 0xC0);
+        if (item == TB_FPS) fg = !d->status_shown ? RGB(0x5F, 0xD9, 0x93) : RGB(0xA7, 0xB0, 0xC0);
         if (item == TB_NAME) fg = RGB(0xE8, 0xEA, 0xF0);
         SetTextColor(mem, fg);
         SelectObject(mem, icon ? icon_font : (item == TB_FPS ? small_font : text_font));
@@ -4249,7 +4263,10 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                 input_s = connect_input(d);
         }
 
-        /* Frame channel lost — close it but keep input alive */
+        /* Frame channel lost — close it but keep input alive. The drop time
+           goes first (full barrier) so the window thread never sees the
+           channel down with an old time. */
+        InterlockedExchange64(&d->frame_lost_tick, (LONG64)GetTickCount64());
         d->frame_connected = FALSE;
         d->cursor_visible = TRUE;
         PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
@@ -4827,14 +4844,23 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (d->frame_dirty || d->anim_active || d->gpu_lost)
                 d3d_render_frame(d);
             /* Before the first frame and while reconnecting the picture is
-               black: say why on the toolbar (kept up) and in the title. */
-            if (d->status_shown != !d->frame_connected) {
-                d->status_shown = !d->frame_connected;
-                if (d->status_shown && d->toolbar_hwnd && !IsWindowVisible(d->toolbar_hwnd))
-                    tb_show(d, 400);
-                else
+               black: say why on the toolbar (kept up while the viewer is in
+               front) and in the title. A short drop (mode change) is not
+               reported; before the first frame it is reported at once. */
+            {
+                BOOL waiting = !d->frame_connected &&
+                    (!d->recv_count ||
+                     GetTickCount64() - (ULONGLONG)d->frame_lost_tick > STATUS_DEBOUNCE_MS);
+                if (d->status_shown != waiting) {
+                    d->status_shown = waiting;
                     tb_refresh(d);
-                idd_update_title(d, TRUE);
+                    idd_update_title(d, TRUE);
+                }
+                /* Also brings it back after the user returns to the viewer
+                   or restores it (activation loss and minimizing hide it). */
+                if (d->status_shown && d->toolbar_hwnd && GetForegroundWindow() == hwnd &&
+                    !IsWindowVisible(d->toolbar_hwnd))
+                    tb_show(d, 400);
             }
             idd_update_title(d, FALSE);
         } else if (wp == IDT_ADAPTIVE && d) {
