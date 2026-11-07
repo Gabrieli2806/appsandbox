@@ -7,6 +7,10 @@ MIT License and remain under their own licenses and copyrights. Each vendored
 source file additionally carries its own `SPDX-License-Identifier` header, which
 governs that file.
 
+This file and [LICENSE](LICENSE) ship at the root of the Windows release zip
+and of the MSIX package. Paths below are repository paths; where a component
+ships in the Windows release, its location there is given too.
+
 ---
 
 ## tools/linux/dxgkrnl/ — Microsoft WSL2 `dxgkrnl` GPU driver
@@ -93,6 +97,156 @@ governs that file.
   NetKVM virtio-net guest driver, JIT-staged into a Mac-hosted Windows guest for
   NAT networking. Redistributed unmodified; the license text is staged alongside
   the driver in the guest.
+
+## tools/win-mesa-gl/prebuilt/ — Mesa OpenGL (gallium d3d12) and zlib (prebuilt binaries)
+
+Ships in the Windows release as `resources\win-mesa-gl\` (`opengl32.dll`,
+`gallium_wgl.dll`, `z-1.dll`); the guest agent copies the three files into a
+Windows guest's `System32`.
+
+- `opengl32.dll`, `gallium_wgl.dll`: **Mesa 26.1.2**, built unmodified from the
+  upstream `26.1` branch by `tools/win-mesa-gl/build/build-mesa.cmd`.
+  - **License:** MIT License (Mesa's overall license). Mesa also contains
+    components under other permissive licenses, among them the Microsoft
+    DirectX-Headers (MIT) compiled into the d3d12 driver; the full list is at
+    <https://docs.mesa3d.org/license.html>.
+  - **Copyright:** Copyright (C) 1999-2007 Brian Paul and the Mesa contributors.
+- `z-1.dll`: **zlib 1.3.1** (a Mesa build subproject).
+  - **License:** zlib License (`SPDX: Zlib`).
+  - **Copyright:** Copyright (C) 1995-2024 Jean-loup Gailly and Mark Adler.
+
+Mesa license text:
+
+```
+Copyright (C) 1999-2007 Brian Paul All Rights Reserved.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of this software and associated documentation files (the "Software"),
+to deal in the Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Software, and to permit persons to whom the
+Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included
+in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+BRIAN PAUL BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN
+AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
+zlib license text:
+
+```
+  (C) 1995-2024 Jean-loup Gailly and Mark Adler
+
+  This software is provided 'as-is', without any express or implied
+  warranty.  In no event will the authors be held liable for any damages
+  arising from the use of this software.
+
+  Permission is granted to anyone to use this software for any purpose,
+  including commercial applications, and to alter it and redistribute it
+  freely, subject to the following restrictions:
+
+  1. The origin of this software must not be misrepresented; you must not
+     claim that you wrote the original software. If you use this software
+     in a product, an acknowledgment in the product documentation would be
+     appreciated but is not required.
+  2. Altered source versions must be plainly marked as such, and must not be
+     misrepresented as being the original software.
+  3. This notice may not be removed or altered from any source distribution.
+
+  Jean-loup Gailly        Mark Adler
+  jloup@gzip.org          madler@alumni.caltech.edu
+```
+
+## tools/vdd/ThirdParty/nvenc/nvEncodeAPI.h — NVIDIA Video Codec SDK (NVENC API header)
+
+- **License:** MIT License (`SPDX: MIT`); the notice is at the top of the file.
+- **Copyright:** Copyright (c) 2010-2023 NVIDIA Corporation.
+- The NVENC API 12.1 header, as distributed in FFmpeg's `nv-codec-headers`
+  (<https://github.com/FFmpeg/nv-codec-headers>). It is compiled into the
+  guest display driver (`drivers\AppSandboxVDD.dll`). The NVENC runtime
+  (`nvEncodeAPI64.dll`) is part of the NVIDIA driver and is not shipped.
+
+```
+Copyright (c) 2010-2023 NVIDIA Corporation
+
+Permission is hereby granted, free of charge, to any person
+obtaining a copy of this software and associated documentation
+files (the "Software"), to deal in the Software without
+restriction, including without limitation the rights to use,
+copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the software, and to permit persons to whom the
+software is furnished to do so, subject to the following
+conditions:
+
+The above copyright notice and this permission notice shall be
+included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND,
+EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES
+OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND
+NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR
+OTHER DEALINGS IN THE SOFTWARE.
+```
+
+## tools/agent/appsandbox-input.c — ViGEmClient interface definitions
+
+- **License:** MIT License (`SPDX: MIT`).
+- **Copyright:** Copyright (c) 2018 Benjamin Höglinger-Stelzer.
+- The guest input helper (`resources\appsandbox-input.exe`) talks to the
+  ViGEmBus driver with the bus interface GUID, IOCTL codes and request
+  structures of ViGEmClient (<https://github.com/nefarius/ViGEmClient>). No
+  ViGEmClient source file is included. ViGEmBus itself (BSD-3-Clause) is not
+  shipped; the agent installs it only when `drivers\ViGEmBus_setup.exe` is
+  added to the guest components.
+
+```
+MIT License
+
+Copyright (c) 2018 Benjamin Höglinger-Stelzer
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+---
+
+## Downloaded at run time (not included in the zip or the MSIX)
+
+The Windows app downloads these when a VM is created, from their publishers'
+servers, and copies them into that VM. They are not redistributed by this
+project and stay under their own terms.
+
+| Component | Downloaded from | License | Used for |
+|---|---|---|---|
+| Win32-OpenSSH 10.0.0.0p2 (`OpenSSH-Win64/ARM64-v10.0.0.0.msi`, Microsoft-signed; SHA-256 pinned in `disk_util.c`) | `github.com/PowerShell/Win32-OpenSSH` releases | OpenSSH license (BSD-style) and those of its bundled components; see the project's `LICENSE` | Installed in Windows guests when SSH is enabled |
+| Microsoft OpenCL, OpenGL and Vulkan Compatibility Pack (`Microsoft.D3DMappingLayers`, Store ID 9NQPSL29BFFF): `OpenGLOn12.dll`, `OpenCLOn12.dll`, `clon12compiler.dll`, `dxil.dll`, `vulkan_dzn.dll` | Microsoft Store delivery service (`displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`, Microsoft CDN) | Microsoft software license terms of the Store package | Copied into Windows guests with GPU (the DLLs must carry Microsoft's Authenticode signature) |
+| `Microsoft.Direct3D.Linux` and DXCore NuGet packages (`libd3d12`, `libdxcore`) | `pkgs.dev.azure.com/shine-oss` (the public feed the WSL build uses) | Microsoft license terms included in the packages | Copied into Ubuntu guests (GPU acceleration) |
+| Ubuntu packages (build dependencies of the guest components) | `archive.ubuntu.com` | Each package's own license (`/usr/share/doc/<package>/copyright` in the guest) | Installed in Ubuntu guests |
+| This project's Linux guest sources (incl. `tools/linux/dxgkrnl`, GPL-2.0) | `codeload.github.com` (the repository and commit set at build time) | As listed in this file | Compiled inside Ubuntu guests |
 
 ---
 

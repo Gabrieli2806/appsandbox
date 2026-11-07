@@ -17,7 +17,8 @@
  *   5. detach.
  *
  * On the next boot the (new) agent sees vdd-update.pending, trusts the
- * driver's certificate and runs `devcon update` for Root\AppSandboxVDD.
+ * driver's test certificate when one ships and runs `devcon update` for
+ * Root\AppSandboxVDD.
  *
  * A signature of the host's guest files is stored beside the VM's disk
  * (guest_tools.sig) so the automatic check before each start only attaches
@@ -41,12 +42,16 @@ static const wchar_t *g_guest_bins[] = {
     L"appsandbox-agent.exe", L"appsandbox-input.exe", L"appsandbox-displays.exe",
     L"appsandbox-clipboard.exe", L"appsandbox-clipboard-reader.exe", L"appsandbox-audio.exe"
 };
-/* VDD package under drivers\. The .cer is required: each build signs the
-   driver with its own test certificate. */
+/* VDD package under drivers\. A test build signs the driver with its own
+   test certificate and ships it as AppSandboxVDD.cer (the agent trusts it
+   before installing). A release build ships a Microsoft-signed driver and
+   no .cer, so the .cer is optional (VDD_OPTIONAL_FILE); the rest is
+   required. */
 static const wchar_t *g_vdd_files[] = {
     L"AppSandboxVDD.dll", L"AppSandboxVDD.inf", L"AppSandboxVDD.cat",
     L"AppSandboxVDD.cer", L"devcon.exe"
 };
+#define VDD_OPTIONAL_FILE L"AppSandboxVDD.cer"
 
 #define VDD_PENDING_MARKER L"vdd-update.pending"
 
@@ -78,7 +83,11 @@ static void fnv1a(UINT64 *h, const BYTE *p, DWORD n)
 }
 
 /* FNV-1a over the contents of every file the update copies. The files do
-   not change while the app runs, so the result is computed once. */
+   not change while the app runs, so the result is computed once. A missing
+   optional file is skipped, so builds that ship it keep the same signature
+   as before. When a required file is missing, the signature fails and
+   g_host_missing names that file for the error message. */
+static wchar_t g_host_missing[MAX_PATH];
 static BOOL host_signature_compute(UINT64 *sig);
 
 static BOOL host_signature(UINT64 *sig)
@@ -106,12 +115,21 @@ static BOOL host_signature_compute(UINT64 *sig)
     for (i = 0; i < (int)(ARRAYSIZE(g_guest_bins) + ARRAYSIZE(g_vdd_files)); i++) {
         HANDLE f;
         DWORD got;
-        if (i < (int)ARRAYSIZE(g_guest_bins))
-            swprintf_s(path, MAX_PATH, L"%s\\%s", res, g_guest_bins[i]);
-        else
-            swprintf_s(path, MAX_PATH, L"%s\\%s", drv, g_vdd_files[i - ARRAYSIZE(g_guest_bins)]);
+        const wchar_t *name;
+        if (i < (int)ARRAYSIZE(g_guest_bins)) {
+            name = g_guest_bins[i];
+            swprintf_s(path, MAX_PATH, L"%s\\%s", res, name);
+        } else {
+            name = g_vdd_files[i - ARRAYSIZE(g_guest_bins)];
+            swprintf_s(path, MAX_PATH, L"%s\\%s", drv, name);
+        }
         f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-        if (f == INVALID_HANDLE_VALUE) return FALSE;
+        if (f == INVALID_HANDLE_VALUE) {
+            if (_wcsicmp(name, VDD_OPTIONAL_FILE) == 0 &&
+                GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) continue;
+            wcscpy_s(g_host_missing, MAX_PATH, path);
+            return FALSE;
+        }
         while (ReadFile(f, buf, sizeof(buf), &got, NULL) && got > 0) fnv1a(&h, buf, got);
         CloseHandle(f);
     }
@@ -303,8 +321,16 @@ HRESULT guest_tools_update(VmInstance *vm, wchar_t *err, size_t err_cap)
         wcscpy_s(err, err_cap, L"Guest tools updates are for Windows VMs.");
         return E_INVALIDARG;
     }
-    if (!host_dirs(res, drv, MAX_PATH) || !host_signature(&sig)) {
+    if (!host_dirs(res, drv, MAX_PATH)) {
         wcscpy_s(err, err_cap, L"This App Sandbox folder is missing its resources or drivers folder.");
+        return E_FAIL;
+    }
+    if (!host_signature(&sig)) {
+        if (g_host_missing[0])
+            swprintf_s(err, err_cap, L"This App Sandbox installation cannot read %s. Reinstall App Sandbox.",
+                       g_host_missing);
+        else
+            wcscpy_s(err, err_cap, L"This App Sandbox installation is missing guest component files.");
         return E_FAIL;
     }
 

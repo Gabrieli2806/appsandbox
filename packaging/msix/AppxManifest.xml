@@ -1,9 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!--
-  App Sandbox MSIX manifest. make-msix.ps1 fills in __VERSION__, __PUBLISHER__
-  and __NAME__. Full-trust desktop app that elevates (HCS and http.sys need
+  App Sandbox MSIX manifest. make-msix.ps1 fills in the double-underscore
+  placeholders below: identity name, publisher, version, architecture, display
+  name and publisher display name (for the Store: the values reserved in
+  Partner Center). Full-trust desktop app that elevates (HCS and http.sys need
   administrator rights), with an execution alias so shortcuts and scripts can
-  start AppSandbox.exe from %LOCALAPPDATA%\Microsoft\WindowsApps.
+  start AppSandbox.exe from %LOCALAPPDATA%\Microsoft\WindowsApps. The package
+  holds one architecture and its guest components are built for that same
+  architecture, so an x64 package must not stand in for an arm64 one on
+  Windows on ARM.
 -->
 <Package
   xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
@@ -13,11 +18,11 @@
   xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
   IgnorableNamespaces="uap uap3 desktop rescap">
 
-  <Identity Name="__NAME__" Publisher="__PUBLISHER__" Version="__VERSION__" ProcessorArchitecture="x64" />
+  <Identity Name="__NAME__" Publisher="__PUBLISHER__" Version="__VERSION__" ProcessorArchitecture="__ARCH__" />
 
   <Properties>
-    <DisplayName>App Sandbox</DisplayName>
-    <PublisherDisplayName>App Sandbox</PublisherDisplayName>
+    <DisplayName>__DISPLAYNAME__</DisplayName>
+    <PublisherDisplayName>__PUBLISHERDISPLAYNAME__</PublisherDisplayName>
     <Logo>Assets\StoreLogo.png</Logo>
     <Description>Virtual machines with GPU acceleration for Windows 11.</Description>
   </Properties>
@@ -33,7 +38,7 @@
   <Applications>
     <Application Id="AppSandbox" Executable="AppSandbox.exe" EntryPoint="Windows.FullTrustApplication">
       <uap:VisualElements
-        DisplayName="App Sandbox"
+        DisplayName="__DISPLAYNAME__"
         Description="Virtual machines with GPU acceleration"
         BackgroundColor="transparent"
         Square150x150Logo="Assets\Square150x150Logo.png"

@@ -12,6 +12,11 @@
  *   3. Download the .appx (a zip) from the Microsoft CDN.
  *   4. Extract with the in-box tar.exe (libarchive handles zip natively).
  *   5. Copy the mapping-layer files into <exe_dir>\d3dlayers\ (cached).
+ *   6. Check that every DLL carries a valid Authenticode signature from
+ *      Microsoft. The CDN url is often plain HTTP and the DLLs end up in the
+ *      guest's System32, so nothing is used without that check. The cache
+ *      is checked the same way each time it is used; a cache that fails is
+ *      deleted and downloaded again.
  *
  * Defensive throughout: any failure returns FALSE and VM creation continues
  * without GL/CL/Vulkan acceleration.
@@ -24,12 +29,17 @@
 
 #include <winhttp.h>
 #include <rpc.h>
+#include <wincrypt.h>
+#include <wintrust.h>
+#include <softpub.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "rpcrt4.lib")
+#pragma comment(lib, "wintrust.lib")
+#pragma comment(lib, "crypt32.lib")
 
 #define DL_PRODUCT_ID       L"9NQPSL29BFFF"
 #define DL_FE3_HOST         L"fe3.delivery.mp.microsoft.com"
@@ -514,6 +524,85 @@ static void rewrite_dzn_json(const wchar_t *dir)
     free(fixed);
 }
 
+/* ---- signature check ---- */
+
+/* TRUE when path has a valid embedded Authenticode signature whose signer
+   is Microsoft ("Microsoft Corporation" or "Microsoft Windows"), the same
+   rule the guest agent applies before it replaces opengl32.dll. No
+   revocation check. URL retrieval stays allowed so that Windows can fetch
+   a Microsoft root it does not have yet (automatic root update); with the
+   roots present the check needs no network. */
+static BOOL signed_by_microsoft(const wchar_t *path)
+{
+    static const GUID policy = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+    WINTRUST_FILE_INFO file;
+    WINTRUST_DATA trust;
+    CRYPT_PROVIDER_DATA *provider;
+    CRYPT_PROVIDER_SGNR *signer;
+    wchar_t name[256] = L"";
+    LONG status;
+    BOOL ok = FALSE;
+
+    ZeroMemory(&file, sizeof(file));
+    file.cbStruct = sizeof(file);
+    file.pcwszFilePath = path;
+    ZeroMemory(&trust, sizeof(trust));
+    trust.cbStruct = sizeof(trust);
+    trust.dwUIChoice = WTD_UI_NONE;
+    trust.fdwRevocationChecks = WTD_REVOKE_NONE;
+    trust.dwUnionChoice = WTD_CHOICE_FILE;
+    trust.pFile = &file;
+    trust.dwStateAction = WTD_STATEACTION_VERIFY;
+    status = WinVerifyTrust(NULL, (GUID *)&policy, &trust);
+    if (status == ERROR_SUCCESS) {
+        provider = WTHelperProvDataFromStateData(trust.hWVTStateData);
+        signer = provider ? WTHelperGetProvSignerFromChain(provider, 0, FALSE, 0) : NULL;
+        if (signer && signer->csCertChain && signer->pasCertChain &&
+            CertGetNameStringW(signer->pasCertChain[0].pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                               0, NULL, name, ARRAYSIZE(name)))
+            ok = !_wcsicmp(name, L"Microsoft Corporation") || !_wcsicmp(name, L"Microsoft Windows");
+        if (!ok)
+            ui_log(L"d3dlayers: %s is signed by \"%s\", not Microsoft", path, name);
+    } else {
+        ui_log(L"d3dlayers: %s has no valid signature (0x%08lX)", path, (unsigned long)status);
+    }
+    trust.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(NULL, (GUID *)&policy, &trust);
+    return ok;
+}
+
+static BOOL is_dll(const wchar_t *name)
+{
+    size_t n = wcslen(name);
+    return n > 4 && _wcsicmp(name + n - 4, L".dll") == 0;
+}
+
+/* TRUE when every DLL of the set in dir is signed by Microsoft. */
+static BOOL layers_trusted(const wchar_t *dir)
+{
+    int i;
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t f[MAX_PATH];
+        if (!is_dll(DL_DST[i])) continue;      /* dzn_icd.json: rewritten by us */
+        swprintf_s(f, MAX_PATH, L"%s\\%s", dir, DL_DST[i]);
+        if (!signed_by_microsoft(f)) return FALSE;
+    }
+    return TRUE;
+}
+
+/* Remove the mapping-layer files from the cache (other files stay). */
+static void layers_delete(const wchar_t *dir)
+{
+    int i;
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t f[MAX_PATH];
+        swprintf_s(f, MAX_PATH, L"%s\\%s", dir, DL_DST[i]);
+        SetFileAttributesW(f, FILE_ATTRIBUTE_NORMAL);
+        if (!DeleteFileW(f) && GetLastError() != ERROR_FILE_NOT_FOUND)
+            ui_log(L"d3dlayers: could not delete %s: %lu", f, GetLastError());
+    }
+}
+
 /* ---- public API ---- */
 
 BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
@@ -535,9 +624,13 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
         if (file_exists(f)) present++;
     }
     if (present == DL_NFILES) {
-        wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
-        ui_log(L"d3dlayers: using cached layers at %s", cache);
-        return TRUE;
+        if (layers_trusted(cache)) {
+            wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
+            ui_log(L"d3dlayers: using cached layers at %s", cache);
+            return TRUE;
+        }
+        ui_log(L"d3dlayers: cached layers failed the signature check; downloading them again");
+        layers_delete(cache);
     }
     mkdir_p(cache);
 
@@ -613,6 +706,12 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     }
     if (present != DL_NFILES) {
         ui_log(L"d3dlayers: only %d/%d layer files present after extract", present, DL_NFILES);
+        return FALSE;
+    }
+    if (!layers_trusted(cache)) {
+        ui_log(L"d3dlayers: the downloaded layers failed the signature check and were deleted; "
+               L"GL/CL/Vulkan acceleration is off for this VM");
+        layers_delete(cache);
         return FALSE;
     }
 

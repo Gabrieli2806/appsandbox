@@ -15,8 +15,10 @@
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "urlmon.lib")
+#pragma comment(lib, "wininet.lib")
 
 #include <urlmon.h>
+#include <wininet.h>
 
 #if ASB_IS_ARM64
 #  define ASB_UA_ARCH   L"arm64"
@@ -24,14 +26,20 @@
 #  define ASB_UA_ARCH   L"amd64"
 #endif
 
+/* Win32-OpenSSH installer for Windows guests. SSH_MSI_SHA256 is the SHA-256
+   of that exact release asset (Authenticode-signed by Microsoft Corporation);
+   the download and every cached copy must match it. Changing the URL means
+   changing the name and the hash with it. */
 #if ASB_IS_ARM64
 #  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-ARM64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME    L"OpenSSH-ARM64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME_A   "OpenSSH-ARM64-v10.0.0.0.msi"
+#  define SSH_MSI_SHA256   "7a17d0e22d004fb47ca4bfd8fef926fa305de4ebf70a6f3c7a29c39aabef0023"
 #else
 #  define SSH_MSI_URL     L"https://github.com/PowerShell/Win32-OpenSSH/releases/download/10.0.0.0p2-Preview/OpenSSH-Win64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME    L"OpenSSH-Win64-v10.0.0.0.msi"
 #  define SSH_MSI_NAME_A   "OpenSSH-Win64-v10.0.0.0.msi"
+#  define SSH_MSI_SHA256   "ddec9c53864280759cf9f74791cefd387100e3946aa849a1c138a4ed1b96b7d9"
 #endif
 
 static const GUID VHDX_VENDOR_MS = {
@@ -951,27 +959,91 @@ static void stage_agent_and_setup(const wchar_t *staging, const wchar_t *res_dir
 
 /* ---- SSH MSI download / cache ---- */
 
+/* TRUE when the SHA-256 of the file at path equals expected_hex (lowercase). */
+static BOOL file_sha256_equals(const wchar_t *path, const char *expected_hex)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    HANDLE f;
+    BYTE buf[65536], digest[32];
+    char hex[65];
+    DWORD got;
+    BOOL ok = FALSE;
+    int i;
+
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    if (BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, NULL, 0) != 0) goto done;
+    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) != 0) goto done;
+    for (;;) {
+        if (!ReadFile(f, buf, sizeof(buf), &got, NULL)) goto done;
+        if (got == 0) break;
+        if (BCryptHashData(hash, buf, got, 0) != 0) goto done;
+    }
+    if (BCryptFinishHash(hash, digest, sizeof(digest), 0) != 0) goto done;
+    for (i = 0; i < 32; i++) sprintf_s(hex + i * 2, 3, "%02x", digest[i]);
+    ok = strcmp(hex, expected_hex) == 0;
+
+done:
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(f);
+    return ok;
+}
+
+/* Cache the pinned OpenSSH MSI beside the exe (ProgramData for MSIX). A
+   cached copy is used only while its SHA-256 matches; otherwise (a proxy or
+   captive-portal page saved as the MSI, a truncated download) it is replaced.
+   The download goes to a unique temporary name and is renamed only after
+   the hash check, so a failed download never leaves a bad MSI behind and
+   two VM creations at once do not write the same file. */
 BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars)
 {
-    wchar_t exe_dir[MAX_PATH], *slash;
+    wchar_t exe_dir[MAX_PATH], part[MAX_PATH];
 
-    (void)slash;
     asb_writable_dir(exe_dir, MAX_PATH);   /* beside the exe, or ProgramData for MSIX */
 
     swprintf_s(msi_path_out, max_chars, L"%s\\%s", exe_dir, SSH_MSI_NAME);
 
     /* Already cached? */
-    if (GetFileAttributesW(msi_path_out) != INVALID_FILE_ATTRIBUTES)
-        return TRUE;
-
-    ui_log(L"Downloading OpenSSH MSI...");
-    if (URLDownloadToFileW(NULL, SSH_MSI_URL, msi_path_out, 0, NULL) == S_OK) {
-        ui_log(L"OpenSSH MSI downloaded.");
-        return TRUE;
+    if (GetFileAttributesW(msi_path_out) != INVALID_FILE_ATTRIBUTES) {
+        if (file_sha256_equals(msi_path_out, SSH_MSI_SHA256))
+            return TRUE;
+        ui_log(L"Cached %s does not match its expected SHA-256; downloading it again.", SSH_MSI_NAME);
+        SetFileAttributesW(msi_path_out, FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(msi_path_out);
     }
 
-    ui_log(L"Failed to download OpenSSH MSI.");
-    return FALSE;
+    ui_log(L"Downloading OpenSSH MSI...");
+    if (!GetTempFileNameW(exe_dir, L"ssh", 0, part)) {
+        ui_log(L"Could not create a temporary file for the OpenSSH MSI (error %lu).", GetLastError());
+        return FALSE;
+    }
+    /* Drop any copy the WinINet cache holds, so a bad earlier response
+       is not served again. */
+    DeleteUrlCacheEntryW(SSH_MSI_URL);
+    if (URLDownloadToFileW(NULL, SSH_MSI_URL, part, 0, NULL) != S_OK) {
+        DeleteFileW(part);
+        ui_log(L"Failed to download OpenSSH MSI. SSH will not be installed in this VM.");
+        return FALSE;
+    }
+    if (!file_sha256_equals(part, SSH_MSI_SHA256)) {
+        DeleteFileW(part);
+        ui_log(L"The downloaded OpenSSH MSI does not match its expected SHA-256 (a proxy or "
+               L"captive portal may have replaced it). SSH will not be installed in this VM.");
+        return FALSE;
+    }
+    if (!MoveFileExW(part, msi_path_out, MOVEFILE_REPLACE_EXISTING)) {
+        DWORD e = GetLastError();
+        DeleteFileW(part);
+        /* Another VM creation may have stored (and be copying) it already. */
+        if (file_sha256_equals(msi_path_out, SSH_MSI_SHA256)) return TRUE;
+        ui_log(L"Could not store the OpenSSH MSI (error %lu).", e);
+        return FALSE;
+    }
+    ui_log(L"OpenSSH MSI downloaded and verified.");
+    return TRUE;
 }
 
 HRESULT iso_create_resources(const wchar_t *iso_path,
