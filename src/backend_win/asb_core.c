@@ -213,6 +213,7 @@ static BOOL g_cs_ready = FALSE;    /* g_cs usable (asb_init .. asb_cleanup) */
 typedef struct {
     VmInstance vm;
     SnapshotTree snapshots;
+    BOOL claimed;       /* reserved by claim_vm_record, not yet appended */
 } VmRecord;
 static VmRecord g_vm_storage[ASB_MAX_VMS];
 static VmRecord *g_vm_order[ASB_MAX_VMS];
@@ -242,24 +243,33 @@ static void remove_vm_record(int index)
 
 #define RECORD_OF(vm_ptr) CONTAINING_RECORD((vm_ptr), VmRecord, vm)
 
-/* A cleared free record for a new VM, or NULL when the table is full. The
-   VM joins the list only through append_vm_record; until then a removal on
+/* Reserve a cleared free record for a new VM, or return NULL when every
+   free record is full or already reserved. Create and import run on the UI
+   thread and on the HTTP API thread, so the reservation (the claimed flag)
+   is taken under g_cs and keeps a second claim off this record. The VM
+   joins the list only through append_vm_record; until then a removal on
    another thread may move the record among the free ones, never into the
-   list, so a half-built VM is never visible. */
+   list, so a half-built VM is never visible. A claim that is not appended
+   is given back with release_vm_record. */
 static VmInstance *claim_vm_record(void)
 {
     VmInstance *vm = NULL;
+    int i;
     EnterCriticalSection(&g_cs);
-    if (g_vm_count < ASB_MAX_VMS) {
-        VmRecord *record = g_vm_order[g_vm_count];
+    for (i = g_vm_count; i < ASB_MAX_VMS; i++) {
+        VmRecord *record = g_vm_order[i];
+        if (record->claimed) continue;
         ZeroMemory(record, sizeof(*record));
+        record->claimed = TRUE;
         vm = &record->vm;
+        break;
     }
     LeaveCriticalSection(&g_cs);
     return vm;
 }
 
-/* Append a claimed record to the VM list. Returns its index, or -1. */
+/* Append a claimed record to the VM list and end its reservation. Returns
+   its index, or -1 when the record is not a claimed free one. */
 static int append_vm_record(VmInstance *vm)
 {
     int i, index = -1;
@@ -267,6 +277,8 @@ static int append_vm_record(VmInstance *vm)
     for (i = g_vm_count; i < ASB_MAX_VMS; i++) {
         if (&g_vm_order[i]->vm == vm) {
             VmRecord *record = g_vm_order[i];
+            if (!record->claimed) break;
+            record->claimed = FALSE;
             g_vm_order[i] = g_vm_order[g_vm_count];
             g_vm_order[g_vm_count] = record;
             index = g_vm_count++;
@@ -275,6 +287,23 @@ static int append_vm_record(VmInstance *vm)
     }
     LeaveCriticalSection(&g_cs);
     return index;
+}
+
+/* Give back a claimed record that was never appended (a create or import
+   that failed before the VM joined the list). It is cleared and free for
+   the next claim. Does nothing for a record in the list. */
+static void release_vm_record(VmInstance *vm)
+{
+    int i;
+    if (!vm) return;
+    EnterCriticalSection(&g_cs);
+    for (i = g_vm_count; i < ASB_MAX_VMS; i++) {
+        if (&g_vm_order[i]->vm == vm) {
+            if (g_vm_order[i]->claimed) ZeroMemory(g_vm_order[i], sizeof(*g_vm_order[i]));
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_cs);
 }
 
 /* Remove a VM from the list under the lock, wherever it is now. Returns the
@@ -3819,7 +3848,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     if (!inst) return E_OUTOFMEMORY;
     do { inst->unique_id = asb_vm_id_new(); }
     while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
-    if (!inst->unique_id) return E_FAIL;
+    if (!inst->unique_id) { hr = E_FAIL; goto release_claim; }
     if (created_id) *created_id = inst->unique_id;
 
     /* Net adapter */
@@ -3836,7 +3865,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
 
     if (cfg.network_mode != NET_NONE) {
         hr = ensure_vm_mac_address(inst);
-        if (FAILED(hr)) return hr;
+        if (FAILED(hr)) goto release_claim;
         wcscpy_s(cfg.mac_address, ARRAYSIZE(cfg.mac_address), inst->mac_address);
     }
 
@@ -3847,7 +3876,8 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         if (error) {
             asb_log(L"Error: %s", error);
             asb_alert(error);
-            return E_INVALIDARG;
+            hr = E_INVALIDARG;
+            goto release_claim;
         }
         asb_default_disk_directory(default_dir, MAX_PATH);
         CreateDirectoryW(default_dir, NULL);
@@ -3856,13 +3886,13 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             hr = HRESULT_FROM_WIN32(GetLastError());
             asb_log(L"Error: Cannot create disk storage folder %s (0x%08X).", parent, hr);
             asb_alert(L"Cannot create the disk storage folder.");
-            return hr;
+            goto release_claim;
         }
         if (!CreateDirectoryW(vhdx_dir, NULL)) {
             hr = HRESULT_FROM_WIN32(GetLastError());
             asb_log(L"Error: Cannot create VM disk folder %s (0x%08X).", vhdx_dir, hr);
             asb_alert(L"Cannot create the VM disk folder. Check the location and permissions.");
-            return hr;
+            goto release_claim;
         }
         protect_vm_folder(vhdx_dir);
     }
@@ -3918,7 +3948,11 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
-            append_vm_record(inst);
+            if (append_vm_record(inst) < 0) {
+                remove_dir_recursive(vhdx_dir);
+                hr = E_FAIL;
+                goto release_claim;
+            }
 
             if (!is_template_create)
                 vm_save_state_json(cfg.vhdx_path, FALSE);
@@ -4031,7 +4065,11 @@ build_failed:
 
             { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
               snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
-            append_vm_record(inst);
+            if (append_vm_record(inst) < 0) {
+                remove_dir_recursive(vhdx_dir);
+                hr = E_FAIL;
+                goto release_claim;
+            }
 
             vm_save_state_json(cfg.vhdx_path, FALSE);
             save_vm_list();
@@ -4075,7 +4113,7 @@ build_failed:
     if (FAILED(hr)) {
         asb_log(L"Error: Failed to create VHDX (0x%08X)", hr);
         remove_dir_recursive(vhdx_dir);
-        return hr;
+        goto release_claim;
     }
     asb_log(L"VHDX created successfully.");
 
@@ -4167,7 +4205,7 @@ build_failed:
             endpoint_guid_str[0] = L'\0';
         }
         remove_dir_recursive(vhdx_dir);
-        return hr;
+        goto release_claim;
     }
 
     update_vm_gpu_name(inst);
@@ -4180,7 +4218,16 @@ build_failed:
 
     { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
       snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
-    append_vm_record(inst);
+    if (append_vm_record(inst) < 0) {
+        /* Not in the table: undo what was built for it, as a failed start
+           does below, and give the record back. */
+        asb_log(L"Error: \"%s\" could not be added to the VM list.", cfg.name);
+        hcs_close_vm(inst);
+        asb_vm_cleanup_network(inst);
+        remove_dir_recursive(vhdx_dir);
+        hr = E_FAIL;
+        goto release_claim;
+    }
 
     /* A manual-install VM has nothing for App Sandbox to provision: it is
        "installed" from the start (the user installs the OS in its window). */
@@ -4212,6 +4259,14 @@ build_failed:
 
     notify_state(vm_handle(inst), inst->running, g_state_ud);
     return S_OK;
+
+release_claim:
+    /* Failed before the VM joined the list: nothing else refers to the
+       record, so give it back for the next create or import. */
+    SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
+    release_vm_record(inst);
+    if (created_id) *created_id = 0;
+    return hr;
 }
 
 /* ---- VM Start ---- */
@@ -5549,7 +5604,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     }
     do { inst->unique_id = asb_vm_id_new(); }
     while (inst->unique_id && asb_find_vm_by_id(inst->unique_id));
-    if (!inst->unique_id) return E_FAIL;
+    if (!inst->unique_id) { release_vm_record(inst); return E_FAIL; }
 
     wcscpy_s(inst->name, ARRAYSIZE(inst->name), name);
     wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), L"Windows");
@@ -5596,6 +5651,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     if (!CreateDirectoryW(vm_dir, NULL)) {
         hr = HRESULT_FROM_WIN32(GetLastError());
         asb_alert(L"Cannot create the VM disk folder.");
+        release_vm_record(inst);
         return hr;
     }
     protect_vm_folder(vm_dir);
@@ -5610,11 +5666,13 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     job = (DiskCopyJob *)calloc(1, sizeof(*job));
     if (!job) {
         remove_dir_recursive(vm_dir);
+        release_vm_record(inst);
         return E_OUTOFMEMORY;
     }
     if (append_vm_record(inst) < 0) {
         free(job);
         remove_dir_recursive(vm_dir);
+        release_vm_record(inst);
         return E_FAIL;
     }
     save_vm_list();
