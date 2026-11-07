@@ -61,6 +61,19 @@ static const GUID CLIPBOARD_READER_SERVICE_GUID =
 #define CLIP_MAX_PAYLOAD    (64 * 1024 * 1024)
 #define CLIP_FILE_CHUNK     (1024 * 1024)
 
+/* Limits on what an (untrusted) guest can make the host do.
+   - All formats of one copy from the guest together: without this one
+     FORMAT_LIST could make the host hold CLIP_MAX_FORMATS x CLIP_MAX_PAYLOAD
+     (4 GB). Two full payloads keep a 4K screenshot's CF_DIB + CF_DIBV5.
+   - Clipboard changes the guest may announce per second: each one rewrites
+     the host clipboard and wakes every clipboard listener on the host.
+   - Data requests from the guest per second: each one opens the host
+     clipboard, which other host apps then find busy. A Windows guest asks
+     for every offered format (at most CLIP_MAX_FORMATS) once per push. */
+#define CLIP_MAX_COPY_BYTES          (2u * CLIP_MAX_PAYLOAD)
+#define CLIP_MAX_GUEST_LISTS_PER_SEC 10u
+#define CLIP_MAX_DATA_REQS_PER_SEC   256u
+
 #define WM_CLIP_READER_APPLY (WM_APP + 11)
 
 #pragma pack(push, 1)
@@ -123,6 +136,16 @@ struct VmClipboardData {
     volatile LONG    pushed_seq;
     volatile LONG    pushed_seq_valid;
 
+    /* Formats of the last FORMAT_LIST pushed to the guest (under writer_cs).
+       The guest is served only these: it never learns about the others, such
+       as the full host paths in "FileNameW" next to a CF_HDROP. */
+    UINT             offered_fmts[CLIP_MAX_FORMATS];
+    UINT             offered_count;
+
+    /* Rate window for data requests from the guest (writer thread only). */
+    ULONGLONG        req_window;
+    UINT             req_count;
+
     /* Reader channel (:0006 guest->host) */
     volatile SOCKET  reader_socket;
     volatile LONG    reader_suppress;
@@ -132,10 +155,23 @@ struct VmClipboardData {
     int              reader_fmt_count;
     int              reader_fetch_idx;
 
+    /* Per-copy limits for the copy being fetched from the guest, and the rate
+       window for the guest's FORMAT_LISTs (reader thread only). */
+    UINT64           copy_bytes_left;      /* format data still accepted in this copy */
+    BOOL             copy_drop_logged;     /* one log line per copy about dropped data */
+    ULONGLONG        list_window;
+    UINT             list_count;
+
     /* Temp directory for file transfers */
     wchar_t          temp_dir[MAX_PATH];
     UINT64           recv_budget;          /* bytes still accepted in this guest->host transfer */
+    UINT32           recv_entries;         /* files + folders still accepted in it */
 };
+
+/* GetClipboardSequenceNumber() right after any VM in this process last put
+   guest content on the host clipboard. Content with this number came from a
+   guest, whichever window owns the clipboard now. */
+static volatile LONG g_guest_content_seq;
 
 /* ---- Logging ---- */
 
@@ -176,6 +212,33 @@ static BOOL clip_send_all(SOCKET s, const void *buf, int len)
         remaining -= n;
     }
     return TRUE;
+}
+
+/* Read and drop n bytes, so the stream stays aligned on message headers. */
+static BOOL clip_recv_discard(SOCKET s, UINT64 n)
+{
+    BYTE skip[4096];
+    while (n > 0) {
+        int c = n > sizeof(skip) ? (int)sizeof(skip) : (int)n;
+        if (!clip_recv_exact(s, skip, c)) return FALSE;
+        n -= (UINT64)c;
+    }
+    return TRUE;
+}
+
+/* Fixed one-second window. Returns 1 while fewer than max_per_sec events were
+   seen in the current window, -1 for the first event over the limit (the
+   caller logs once) and 0 for the rest. Each window is owned by one thread. */
+static int clip_rate_check(ULONGLONG *window_start, UINT *count, UINT max_per_sec)
+{
+    ULONGLONG now = GetTickCount64();
+    if (now - *window_start >= 1000) {
+        *window_start = now;
+        *count = 0;
+    }
+    if (*count < max_per_sec) { (*count)++; return 1; }
+    if (*count == max_per_sec) { (*count)++; return -1; }
+    return 0;
 }
 
 static SOCKET clip_connect_hv(const GUID *vm_runtime_id, const GUID *service_guid, int timeout_ms)
@@ -245,19 +308,69 @@ static BOOL clip_should_skip(UINT fmt)
     }
 }
 
+/* Formats the host accepts from a guest; everything else is dropped. Shell
+   formats can name host files ("FileNameW", "Shell IDList Array", raw
+   CF_HDROP bytes, with "Preferred DropEffect" even a move on paste), and OLE
+   formats ("Ole Private Data", "Link Source", ...) can start COM objects on
+   paste. Only these fixed names are ever registered, so a guest cannot fill
+   the session's atom table with clipboard format names. CF_HDROP is only
+   the end marker of a file transfer: the host builds the file list itself,
+   from its own temp folder. */
+static const UINT clip_guest_std_formats[] = {
+    CF_TEXT, CF_OEMTEXT, CF_UNICODETEXT, CF_LOCALE, CF_DIB, CF_DIBV5, CF_HDROP
+};
+static const char *const clip_guest_named_formats[] = {
+    "HTML Format", "Rich Text Format", "PNG"
+};
+
+/* Host format id for a format the guest announced, or 0 to drop it.
+   name: the registered name the guest sent, or NULL when it sent none (a
+   predefined CF_* id, or - from a Linux guest - a registered id the host
+   itself announced earlier, such as its "HTML Format"). */
+static UINT clip_guest_format_to_local(UINT32 fmt_id, const char *name)
+{
+    char host_name[256];
+    size_t i;
+
+    if (name) {
+        for (i = 0; i < ARRAYSIZE(clip_guest_named_formats); i++)
+            if (_stricmp(name, clip_guest_named_formats[i]) == 0)
+                return RegisterClipboardFormatA(clip_guest_named_formats[i]);
+        return 0;
+    }
+    for (i = 0; i < ARRAYSIZE(clip_guest_std_formats); i++)
+        if (fmt_id == clip_guest_std_formats[i]) return fmt_id;
+    if (fmt_id >= 0xC000 && fmt_id <= 0xFFFF &&
+        GetClipboardFormatNameA(fmt_id, host_name, sizeof(host_name)) > 0) {
+        for (i = 0; i < ARRAYSIZE(clip_guest_named_formats); i++)
+            if (_stricmp(host_name, clip_guest_named_formats[i]) == 0) return fmt_id;
+    }
+    return 0;
+}
+
+/* dst = a + "\" + b. FALSE (dst untouched) when that would not fit in
+   MAX_PATH with room left for the "\*" of a directory search: the secure CRT
+   ends the process on an over-long path instead of truncating it. */
+static BOOL clip_join_path(wchar_t *dst, const wchar_t *a, const wchar_t *b)
+{
+    if (wcslen(a) + 1 + wcslen(b) + 2 >= MAX_PATH) return FALSE;
+    swprintf_s(dst, MAX_PATH, L"%s\\%s", a, b);
+    return TRUE;
+}
+
 static void clip_remove_dir_recursive(const wchar_t *dir)
 {
     WIN32_FIND_DATAW fd;
     wchar_t pattern[MAX_PATH];
     HANDLE h;
 
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", dir);
+    if (!clip_join_path(pattern, dir, L"*")) return;
     h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return;
     do {
         wchar_t path[MAX_PATH];
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(path, MAX_PATH, L"%s\\%s", dir, fd.cFileName);
+        if (!clip_join_path(path, dir, fd.cFileName)) continue;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) {
             /* A junction/link: remove the link itself, never its target. */
             if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) RemoveDirectoryW(path);
@@ -271,22 +384,25 @@ static void clip_remove_dir_recursive(const wchar_t *dir)
     RemoveDirectoryW(dir);
 }
 
-static void clip_ensure_parent_dir(const wchar_t *file_path)
+/* Create the folders above file_path. Returns how many it had to create. */
+static UINT32 clip_ensure_parent_dir(const wchar_t *file_path)
 {
     wchar_t dir[MAX_PATH];
     wchar_t *p;
+    UINT32 made = 0;
     wcscpy_s(dir, MAX_PATH, file_path);
     p = wcsrchr(dir, L'\\');
-    if (!p) return;
+    if (!p) return 0;
     *p = L'\0';
     for (p = dir; *p; p++) {
         if (*p == L'\\' && p > dir && *(p - 1) != L':') {
             *p = L'\0';
-            CreateDirectoryW(dir, NULL);
+            if (CreateDirectoryW(dir, NULL)) made++;
             *p = L'\\';
         }
     }
-    CreateDirectoryW(dir, NULL);
+    if (CreateDirectoryW(dir, NULL)) made++;
+    return made;
 }
 
 /* A relative path from the guest: plain components only. No "..", no
@@ -327,8 +443,60 @@ static BOOL clip_path_is_safe(const wchar_t *rel_path)
     return TRUE;
 }
 
-/* Most a guest may send in one copy (all files together). */
-#define CLIP_MAX_TRANSFER_BYTES (16ULL * 1024 * 1024 * 1024)
+/* Most a guest may send in one copy (all files together), in bytes and in
+   files + folders (empty folders and files cost no bytes but still fill the
+   disk's file table). */
+#define CLIP_MAX_TRANSFER_BYTES   (16ULL * 1024 * 1024 * 1024)
+#define CLIP_MAX_TRANSFER_ENTRIES 250000u
+
+/* TRUE when path names an entry inside one of this app's clipboard folders
+   (%TEMP%\AppSandboxClip-<vm>\<name>...), where every CF_HDROP this process
+   builds from guest files points. */
+static BOOL clip_path_in_clip_temp(const wchar_t *path)
+{
+    static const wchar_t prefix[] = L"AppSandboxClip-";
+    wchar_t tmp[MAX_PATH], root[MAX_PATH], full[MAX_PATH];
+    const wchar_t *rest, *sep;
+    size_t root_len;
+    DWORD n;
+
+    n = GetTempPathW(MAX_PATH, tmp);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    n = GetFullPathNameW(tmp, MAX_PATH, root, NULL);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    root_len = wcslen(root);
+    if (root[root_len - 1] != L'\\') {
+        if (root_len + 2 > MAX_PATH) return FALSE;
+        root[root_len++] = L'\\';
+        root[root_len] = L'\0';
+    }
+    if (root_len + ARRAYSIZE(prefix) > MAX_PATH) return FALSE;
+    wcscat_s(root, MAX_PATH, prefix);
+    root_len = wcslen(root);
+
+    /* GetFullPathNameW folds "..", so a path cannot climb back out. */
+    n = GetFullPathNameW(path, MAX_PATH, full, NULL);
+    if (n == 0 || n >= MAX_PATH) return FALSE;
+    if (_wcsnicmp(full, root, root_len) != 0) return FALSE;
+    rest = full + root_len;
+    sep = wcschr(rest, L'\\');
+    return sep && sep > rest && sep[1] != L'\0';
+}
+
+/* TRUE when the CF_HDROP now on the host clipboard was put there by this
+   process, i.e. it lists files a guest copied, not files the host user
+   copied. Call with the clipboard open. */
+static BOOL clip_hdrop_is_from_guest(void)
+{
+    HWND owner = GetClipboardOwner();
+    DWORD pid = 0;
+    LONG guest_seq = InterlockedCompareExchange(&g_guest_content_seq, 0, 0);
+    DWORD seq = GetClipboardSequenceNumber();
+
+    if (guest_seq != 0 && seq != 0 && (LONG)seq == guest_seq) return TRUE;
+    if (owner) GetWindowThreadProcessId(owner, &pid);
+    return pid != 0 && pid == GetCurrentProcessId();
+}
 
 /* ---- File transfer: host->guest (send files from host clipboard) ---- */
 
@@ -361,14 +529,22 @@ static BOOL clip_send_file_entry(SOCKET s, const wchar_t *full_path, const wchar
         if (!clip_send_all(s, &fi, sizeof(fi))) return FALSE;
         if (path_bytes > 0 && !clip_send_all(s, rel_path, (int)path_bytes)) return FALSE;
 
-        swprintf_s(search, MAX_PATH, L"%s\\*", full_path);
-        h = FindFirstFileW(search, &fd);
+        h = clip_join_path(search, full_path, L"*") ? FindFirstFileW(search, &fd)
+                                                    : INVALID_HANDLE_VALUE;
         if (h != INVALID_HANDLE_VALUE) {
             do {
                 wchar_t child_full[MAX_PATH], child_rel[MAX_PATH];
                 if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-                swprintf_s(child_full, MAX_PATH, L"%s\\%s", full_path, fd.cFileName);
-                swprintf_s(child_rel, MAX_PATH, L"%s\\%s", rel_path, fd.cFileName);
+                /* Links inside a copied folder (symlinks, junctions) are not
+                   followed: they can point anywhere on the host, outside
+                   what the user copied (a guest can plant one through a
+                   shared folder), and a junction loop never ends. Other
+                   reparse points, such as cloud placeholders, are files. */
+                if ((fd.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) &&
+                    IsReparseTagNameSurrogate(fd.dwReserved0)) continue;
+                /* Paths too long for MAX_PATH are skipped, not truncated. */
+                if (!clip_join_path(child_full, full_path, fd.cFileName) ||
+                    !clip_join_path(child_rel, rel_path, fd.cFileName)) continue;
                 if (!clip_send_file_entry(s, child_full, child_rel)) {
                     FindClose(h);
                     return FALSE;
@@ -442,13 +618,13 @@ static HGLOBAL clip_build_hdrop_from_temp(const wchar_t *temp_dir)
     wchar_t *ptr;
     int i;
 
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", temp_dir);
+    if (!clip_join_path(pattern, temp_dir, L"*")) return NULL;
     h = FindFirstFileW(pattern, &fd);
     if (h == INVALID_HANDLE_VALUE) return NULL;
 
     do {
         if (wcscmp(fd.cFileName, L".") == 0 || wcscmp(fd.cFileName, L"..") == 0) continue;
-        swprintf_s(paths[count], MAX_PATH, L"%s\\%s", temp_dir, fd.cFileName);
+        if (!clip_join_path(paths[count], temp_dir, fd.cFileName)) continue;
         count++;
         if (count >= CLIP_MAX_FORMATS) break;
     } while (FindNextFileW(h, &fd));
@@ -536,6 +712,7 @@ static void clip_send_format_list(VmClipboard clip)
     SOCKET s;
     UINT fmt;
     BYTE buf[16384];
+    UINT sent_fmts[CLIP_MAX_FORMATS];
     int offset = 4;
     UINT32 count = 0;
     DWORD seq;
@@ -593,6 +770,7 @@ static void clip_send_format_list(VmClipboard clip)
                 memcpy(buf + offset, name, name_len);
                 offset += name_len;
             }
+            sent_fmts[count] = fmt;
             count++;
         }
     }
@@ -621,6 +799,8 @@ static void clip_send_format_list(VmClipboard clip)
     InterlockedExchange(&clip->reader_suppress, 1);
 
     EnterCriticalSection(&clip->writer_cs);
+    memcpy(clip->offered_fmts, sent_fmts, count * sizeof(UINT));
+    clip->offered_count = count;
     clip_send_all(s, &hdr, sizeof(hdr));
     clip_send_all(s, buf, offset);
     LeaveCriticalSection(&clip->writer_cs);
@@ -664,31 +844,59 @@ static DWORD WINAPI clip_push_thread_proc(LPVOID param)
 
 /* ---- Writer channel: handle DATA_REQ from guest ---- */
 
+static void clip_send_empty_response(VmClipboard clip, SOCKET s, UINT fmt)
+{
+    ClipHeader hdr;
+    hdr.magic = CLIP_MAGIC;
+    hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
+    hdr.format = fmt;
+    hdr.data_size = 0;
+    EnterCriticalSection(&clip->writer_cs);
+    clip_send_all(s, &hdr, sizeof(hdr));
+    LeaveCriticalSection(&clip->writer_cs);
+}
+
 static void clip_handle_data_request(VmClipboard clip, UINT fmt)
 {
     ClipHeader hdr;
     SOCKET s = clip->writer_socket;
+    BOOL offered = FALSE;
+    UINT i;
+    int rate;
 
     if (s == INVALID_SOCKET) return;
 
-    clip_log(clip, L"CLIP: Data request from guest for format %u.", fmt);
-
-    /* When host->guest sharing is off (or the window is unfocused), return
-       empty — don't leak host clipboard to the guest. */
+    /* Every request is answered (the guest waits for the response), but
+       refusals answer empty. When host->guest sharing is off (or the window
+       is unfocused), return empty — don't leak host clipboard to the guest. */
     if (!clip->sync_enabled || !clip->share_host_to_guest) {
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_send_empty_response(clip, s, fmt);
+        return;
+    }
+
+    rate = clip_rate_check(&clip->req_window, &clip->req_count, CLIP_MAX_DATA_REQS_PER_SEC);
+    if (rate <= 0) {
+        if (rate < 0)
+            clip_log(clip, L"CLIP: Too many clipboard requests from the guest - answering them empty for a moment.");
+        clip_send_empty_response(clip, s, fmt);
+        return;
+    }
+
+    /* Serve only formats the host offered in its last FORMAT_LIST. */
+    EnterCriticalSection(&clip->writer_cs);
+    for (i = 0; i < clip->offered_count; i++) {
+        if (clip->offered_fmts[i] == fmt) { offered = TRUE; break; }
+    }
+    LeaveCriticalSection(&clip->writer_cs);
+    if (!offered) {
+        clip_send_empty_response(clip, s, fmt);
         return;
     }
 
     if (fmt == CF_HDROP) {
         wchar_t paths[CLIP_MAX_FORMATS][MAX_PATH];
         int path_count = 0;
+        UINT refused = 0;
 
         /* Snapshot the dropped paths while the clipboard is open, then release
            it again. Holding OpenClipboard() across a multi-gigabyte transfer
@@ -700,19 +908,37 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
                 HDROP hDrop = (HDROP)hData;
                 UINT file_count = DragQueryFileW(hDrop, 0xFFFFFFFF, NULL, 0);
                 UINT fi;
+                /* Files go to a guest only when the host user copied them.
+                   A file list this process put on the clipboard came from a
+                   guest and points into a clipboard temp folder; any other
+                   path in it is never sent. */
+                BOOL from_guest = clip_hdrop_is_from_guest();
                 if (file_count > CLIP_MAX_FORMATS) file_count = CLIP_MAX_FORMATS;
-                for (fi = 0; fi < file_count; fi++)
-                    DragQueryFileW(hDrop, fi, paths[path_count++], MAX_PATH);
+                for (fi = 0; fi < file_count; fi++) {
+                    if (DragQueryFileW(hDrop, fi, paths[path_count], MAX_PATH) == 0) continue;
+                    if (from_guest && !clip_path_in_clip_temp(paths[path_count])) {
+                        refused++;
+                        continue;
+                    }
+                    path_count++;
+                }
             }
             CloseClipboard();
         }
 
-        if (path_count == 0) goto send_empty;
+        if (refused > 0)
+            clip_log(clip, L"CLIP: Refused to send %u file(s) outside the clipboard folder to the guest.",
+                     refused);
+        clip_log(clip, L"CLIP: Guest requested the copied files (%d item(s)).", path_count);
+
+        if (path_count == 0) {
+            clip_send_empty_response(clip, s, fmt);
+            return;
+        }
 
         {
-            int i;
             EnterCriticalSection(&clip->writer_cs);
-            for (i = 0; i < path_count; i++) {
+            for (i = 0; i < (UINT)path_count; i++) {
                 const wchar_t *path = paths[i];
                 const wchar_t *name;
                 name = wcsrchr(path, L'\\');
@@ -726,16 +952,6 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
             clip_send_all(s, &hdr, sizeof(hdr));
             LeaveCriticalSection(&clip->writer_cs);
         }
-        return;
-
-    send_empty:
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
         return;
     }
 
@@ -758,13 +974,7 @@ static void clip_handle_data_request(VmClipboard clip, UINT fmt)
         if (ptr) GlobalUnlock(hData);
         CloseClipboard();
     } else {
-        hdr.magic = CLIP_MAGIC;
-        hdr.msg_type = CLIP_MSG_FORMAT_DATA_RESP;
-        hdr.format = fmt;
-        hdr.data_size = 0;
-        EnterCriticalSection(&clip->writer_cs);
-        clip_send_all(s, &hdr, sizeof(hdr));
-        LeaveCriticalSection(&clip->writer_cs);
+        clip_send_empty_response(clip, s, fmt);
     }
 }
 
@@ -858,6 +1068,29 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
 
 /* ---- Reader channel: file data receive ---- */
 
+/* One log line per copy when part of it is dropped (a guest can send
+   thousands of entries; one line each would flood the log). */
+static void clip_log_copy_drop(VmClipboard clip, const wchar_t *what)
+{
+    if (clip->copy_drop_logged) return;
+    clip->copy_drop_logged = TRUE;
+    clip_log(clip, L"Clipboard: part of a copy from the VM was dropped (%s).", what);
+}
+
+/* TRUE while the host is fetching CF_HDROP from the guest: the only time
+   the guest's file entries are wanted. */
+static BOOL clip_reader_hdrop_pending(VmClipboard clip)
+{
+    BOOL pending;
+    int idx;
+    EnterCriticalSection(&clip->reader_cs);
+    idx = clip->reader_fetch_idx;
+    pending = idx >= 0 && idx < clip->reader_fmt_count &&
+              clip->reader_fmts[idx].local_id == CF_HDROP;
+    LeaveCriticalSection(&clip->reader_cs);
+    return pending;
+}
+
 static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHeader *hdr)
 {
     ClipFileInfo fi;
@@ -867,65 +1100,63 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
     if (!clip_recv_exact(s, &fi, sizeof(fi))) return FALSE;
 
     if (fi.path_len == 0 || fi.path_len > (MAX_PATH - 1) * sizeof(wchar_t)) {
-        UINT32 skip_hdr = hdr->data_size - (UINT32)sizeof(fi);
-        BYTE skip[4096];
-        while (skip_hdr > 0) {
-            int chunk = skip_hdr > 4096 ? 4096 : (int)skip_hdr;
-            if (!clip_recv_exact(s, skip, chunk)) return FALSE;
-            skip_hdr -= chunk;
-        }
-        { UINT64 rem = fi.file_size;
-          while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; } }
-        return TRUE;
+        if (!clip_recv_discard(s, hdr->data_size - (UINT32)sizeof(fi))) return FALSE;
+        return clip_recv_discard(s, fi.file_size);
     }
+    /* The header covers exactly the entry info and its path. */
+    if (hdr->data_size != sizeof(fi) + fi.path_len) return FALSE;
 
     if (!clip_recv_exact(s, rel_path, (int)fi.path_len)) return FALSE;
     rel_path[fi.path_len / sizeof(wchar_t)] = L'\0';
 
-    /* Accept files only while guest->host sharing is on, within the
-       per-copy budget, and only if the host disk keeps 1 GB free; anything
-       else is read off the wire and dropped. */
+    /* Accept entries only while the host is fetching the guest's files with
+       guest->host sharing on, for a safe relative path that fits under the
+       temp folder, within the per-copy budget, and only if the host disk
+       keeps 1 GB free; anything else is read off the wire and dropped. */
     {
-        BOOL accept = clip->sync_enabled && clip->share_guest_to_host;
+        BOOL accept = clip->sync_enabled && clip->share_guest_to_host &&
+                      clip_reader_hdrop_pending(clip);
         ULARGE_INTEGER free_bytes;
+        if (accept && (!clip_path_is_safe(rel_path) ||
+                       !clip_join_path(full_path, clip->temp_dir, rel_path))) {
+            accept = FALSE;
+            clip_log_copy_drop(clip, L"unsafe or too long file name");
+        }
+        if (accept && clip->recv_entries == 0) {
+            accept = FALSE;
+            clip_log_copy_drop(clip, L"too many files");
+        }
+        if (accept && fi.is_directory && fi.file_size != 0) {
+            accept = FALSE;   /* a folder carries no data */
+        }
         if (accept && !fi.is_directory) {
             if (fi.file_size > clip->recv_budget) {
                 accept = FALSE;
-                clip_log(clip, L"Clipboard: file from the VM dropped (copy exceeds the size limit).");
+                clip_log_copy_drop(clip, L"copy exceeds the size limit");
             } else if (GetDiskFreeSpaceExW(clip->temp_dir, &free_bytes, NULL, NULL) &&
                        free_bytes.QuadPart < fi.file_size + 1024ULL * 1024 * 1024) {
                 accept = FALSE;
-                clip_log(clip, L"Clipboard: file from the VM dropped (not enough free disk space).");
+                clip_log_copy_drop(clip, L"not enough free disk space");
             } else {
                 clip->recv_budget -= fi.file_size;
             }
         }
-        if (!accept) {
-            BYTE skip[4096];
-            UINT64 rem = fi.file_size;
-            while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-              if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; }
-            return TRUE;
-        }
+        if (!accept)
+            return clip_recv_discard(s, fi.file_size);
+        clip->recv_entries--;
     }
 
-    if (!clip_path_is_safe(rel_path)) {
-        BYTE skip[4096];
-        UINT64 rem = fi.file_size;
-        while (rem > 0) { int c = rem > 4096 ? 4096 : (int)rem;
-          if (!clip_recv_exact(s, skip, c)) return FALSE; rem -= c; }
-        return TRUE;
+    /* Folders the entry's path needs and the guest did not send first also
+       count against the per-copy entry limit. */
+    {
+        UINT32 made = clip_ensure_parent_dir(full_path);
+        clip->recv_entries -= made < clip->recv_entries ? made : clip->recv_entries;
     }
-
-    swprintf_s(full_path, MAX_PATH, L"%s\\%s", clip->temp_dir, rel_path);
 
     if (fi.is_directory) {
-        clip_ensure_parent_dir(full_path);
         CreateDirectoryW(full_path, NULL);
     } else {
         HANDLE hFile;
-        clip_ensure_parent_dir(full_path);
         hFile = CreateFileW(full_path, GENERIC_WRITE, 0, NULL,
                             CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
         if (hFile != INVALID_HANDLE_VALUE) {
@@ -951,7 +1182,7 @@ static BOOL clip_reader_recv_file_data(VmClipboard clip, SOCKET s, const ClipHea
             if (!write_ok) {
                 CloseHandle(hFile);
                 DeleteFileW(full_path);
-                clip_log(clip, L"Clipboard: could not write a file from the VM (disk full?).");
+                clip_log_copy_drop(clip, L"could not write a file, disk full?");
                 HeapFree(GetProcessHeap(), 0, chunk);
                 return TRUE;
             }
@@ -990,7 +1221,7 @@ static void clip_reader_request_next(VmClipboard clip, SOCKET s)
     ClipHeader hdr;
 
     if (clip->reader_fetch_idx >= clip->reader_fmt_count) {
-        if (clip->hwnd && IsWindow(clip->hwnd))
+        if (clip->reader_fmt_count > 0 && clip->hwnd && IsWindow(clip->hwnd))
             PostMessageW(clip->hwnd, WM_CLIP_READER_APPLY, 0, 0);
         return;
     }
@@ -1012,10 +1243,9 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
     switch (hdr->msg_type) {
 
     case CLIP_MSG_FORMAT_LIST: {
-        clip->recv_budget = CLIP_MAX_TRANSFER_BYTES;   /* a new copy from the guest */
         BYTE *buf;
         UINT32 count, i;
-        int off;
+        int off, rate, announced = 0;
 
         /* Need at least the 4-byte leading count; reject short frames so the
            `*(UINT32 *)buf` read below cannot over-read the allocation. */
@@ -1027,6 +1257,17 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         /* Echo suppression */
         if (InterlockedExchange(&clip->reader_suppress, 0)) {
             clip_log(clip, L"CLIP-R: FORMAT_LIST suppressed (echo from host->guest).");
+            HeapFree(GetProcessHeap(), 0, buf);
+            return TRUE;
+        }
+
+        /* A guest announcing clipboard changes in a tight loop would keep the
+           host clipboard, every clipboard listener on the host and this log
+           busy. Lists over the limit are dropped. */
+        rate = clip_rate_check(&clip->list_window, &clip->list_count, CLIP_MAX_GUEST_LISTS_PER_SEC);
+        if (rate <= 0) {
+            if (rate < 0)
+                clip_log(clip, L"CLIP-R: Too many clipboard changes from the guest - ignoring them for a moment.");
             HeapFree(GetProcessHeap(), 0, buf);
             return TRUE;
         }
@@ -1048,20 +1289,33 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         for (i = 0; i < count && off + 8 <= (int)hdr->data_size; i++) {
             UINT32 fmt_id   = *(UINT32 *)(buf + off); off += 4;
             UINT32 name_len = *(UINT32 *)(buf + off); off += 4;
-            UINT local_id = fmt_id;
+            UINT local_id = 0;
+            int j;
 
             /* off is in [8, data_size] here; reject a name_len that runs past
                the buffer (or whose signed cast would corrupt off) before the
-               unconditional `off += name_len` advance below. */
+               `off += name_len` advance below. */
             if (name_len > (UINT32)((int)hdr->data_size - off)) break;
+            announced++;
 
-            if (name_len > 0 && name_len < 256 && off + (int)name_len <= (int)hdr->data_size) {
+            /* Keep only allow-listed formats (see clip_guest_format_to_local);
+               a name too long for any of them is dropped. */
+            if (name_len == 0) {
+                local_id = clip_guest_format_to_local(fmt_id, NULL);
+            } else if (name_len < 256) {
                 char name[256];
                 memcpy(name, buf + off, name_len);
                 name[name_len] = '\0';
-                local_id = RegisterClipboardFormatA(name);
+                local_id = clip_guest_format_to_local(fmt_id, name);
             }
             off += (int)name_len;
+            if (local_id == 0) continue;
+
+            /* One slot per host format: a guest repeating one cannot make the
+               host fetch it again. */
+            for (j = 0; j < clip->reader_fmt_count; j++)
+                if (clip->reader_fmts[j].local_id == local_id) break;
+            if (j < clip->reader_fmt_count) continue;
 
             clip->reader_fmts[clip->reader_fmt_count].local_id = local_id;
             clip->reader_fmts[clip->reader_fmt_count].remote_id = fmt_id;
@@ -1071,6 +1325,11 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
             clip->reader_fmt_count++;
         }
         clip->reader_fetch_idx = 0;
+        /* A new copy from the guest: fresh per-copy limits. */
+        clip->copy_bytes_left = CLIP_MAX_COPY_BYTES;
+        clip->copy_drop_logged = FALSE;
+        clip->recv_budget = CLIP_MAX_TRANSFER_BYTES;
+        clip->recv_entries = CLIP_MAX_TRANSFER_ENTRIES;
         LeaveCriticalSection(&clip->reader_cs);
 
         HeapFree(GetProcessHeap(), 0, buf);
@@ -1078,31 +1337,73 @@ static BOOL clip_reader_handle_message(VmClipboard clip, SOCKET s, const ClipHea
         clip_remove_dir_recursive(clip->temp_dir);
         CreateDirectoryW(clip->temp_dir, NULL);
 
-        clip_log(clip, L"CLIP-R: Received format list (%d formats), fetching data...",
-                 clip->reader_fmt_count);
+        clip_log(clip, L"CLIP-R: Received format list (%d of %d formats accepted), fetching data...",
+                 clip->reader_fmt_count, announced);
         clip_reader_request_next(clip, s);
         return TRUE;
     }
 
     case CLIP_MSG_FORMAT_DATA_RESP: {
-        int idx = clip->reader_fetch_idx;
+        int idx;
+        UINT local_id = 0;
+        BOOL expected, hdrop = FALSE;
+        BYTE *data = NULL;
 
-        if (idx >= 0 && idx < clip->reader_fmt_count) {
-            if (hdr->format == CF_HDROP && hdr->data_size == 0) {
-                clip->reader_fmts[idx].is_hdrop = TRUE;
-            } else if (hdr->data_size > 0 && hdr->data_size <= CLIP_MAX_PAYLOAD) {
-                BYTE *data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
-                if (data && clip_recv_exact(s, data, (int)hdr->data_size)) {
-                    clip->reader_fmts[idx].data = data;
-                    clip->reader_fmts[idx].data_size = hdr->data_size;
-                } else {
-                    if (data) HeapFree(GetProcessHeap(), 0, data);
+        EnterCriticalSection(&clip->reader_cs);
+        idx = clip->reader_fetch_idx;
+        expected = idx >= 0 && idx < clip->reader_fmt_count &&
+                   hdr->format == clip->reader_fmts[idx].remote_id;
+        if (expected) local_id = clip->reader_fmts[idx].local_id;
+        LeaveCriticalSection(&clip->reader_cs);
+
+        /* Not the format being fetched (a late answer to a request made
+           before the guest's last FORMAT_LIST, or nothing was asked): drop it
+           and keep waiting for the answer to the current request. */
+        if (!expected)
+            return clip_recv_discard(s, hdr->data_size);
+
+        if (local_id == CF_HDROP) {
+            /* The files arrived as FILE_DATA; this empty response only ends
+               the transfer, and the host builds the file list itself from its
+               temp folder. Bytes here would be a guest-made DROPFILES list
+               naming arbitrary host paths: never use them. */
+            if (hdr->data_size > 0) {
+                if (!clip_recv_discard(s, hdr->data_size)) return FALSE;
+                clip_log_copy_drop(clip, L"file list with data");
+            } else {
+                hdrop = TRUE;
+            }
+        } else if (hdr->data_size > 0) {
+            if (hdr->data_size > CLIP_MAX_PAYLOAD || hdr->data_size > clip->copy_bytes_left) {
+                if (!clip_recv_discard(s, hdr->data_size)) return FALSE;
+                clip_log_copy_drop(clip, L"clipboard data too large");
+            } else {
+                data = (BYTE *)HeapAlloc(GetProcessHeap(), 0, hdr->data_size);
+                if (!data) {
+                    if (!clip_recv_discard(s, hdr->data_size)) return FALSE;
+                } else if (!clip_recv_exact(s, data, (int)hdr->data_size)) {
+                    HeapFree(GetProcessHeap(), 0, data);
                     return FALSE;
+                } else {
+                    clip->copy_bytes_left -= hdr->data_size;
                 }
             }
-            clip->reader_fetch_idx++;
-            clip_reader_request_next(clip, s);
         }
+
+        EnterCriticalSection(&clip->reader_cs);
+        if (idx < clip->reader_fmt_count) {   /* not dropped meanwhile by on_reader_apply */
+            clip->reader_fmts[idx].is_hdrop = hdrop;
+            if (data) {
+                clip->reader_fmts[idx].data = data;
+                clip->reader_fmts[idx].data_size = hdr->data_size;
+                data = NULL;
+            }
+            clip->reader_fetch_idx = idx + 1;
+        }
+        LeaveCriticalSection(&clip->reader_cs);
+        if (data) HeapFree(GetProcessHeap(), 0, data);
+
+        clip_reader_request_next(clip, s);
         return TRUE;
     }
 
@@ -1167,7 +1468,10 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
             if (!clip_reader_handle_message(clip, s, &hdr)) break;
         }
 
+        EnterCriticalSection(&clip->reader_cs);
         clip_reader_free_pending(clip);
+        clip->reader_fmt_count = 0;
+        LeaveCriticalSection(&clip->reader_cs);
         clip_remove_dir_recursive(clip->temp_dir);
         /* Atomically claim the socket so the reader thread and clip_stop()
            never double-close the same handle (App Verifier invalid-handle). */
@@ -1373,69 +1677,83 @@ ASB_API void vm_clipboard_on_clipboard_update(VmClipboard clip)
 
 ASB_API void vm_clipboard_on_reader_apply(VmClipboard clip)
 {
-    int i;
+    HGLOBAL handles[CLIP_MAX_FORMATS];
+    int i, usable = 0;
     if (!clip) return;
 
     EnterCriticalSection(&clip->reader_cs);
     if (!clip->share_guest_to_host) {
         clip_reader_free_pending(clip);
+        clip->reader_fmt_count = 0;
         LeaveCriticalSection(&clip->reader_cs);
         return;
     }
-    if (clip->reader_fmt_count == 0) {
-        LeaveCriticalSection(&clip->reader_cs);
-        return;
-    }
-
-    InterlockedExchange(&clip->writer_suppress, 1);
-
-    if (!OpenClipboard(clip->hwnd)) {
-        InterlockedExchange(&clip->writer_suppress, 0);
-        clip_reader_free_pending(clip);
+    /* Apply a copy once, and only when all of it has arrived: the message
+       for one copy can be handled while the next copy is being fetched. */
+    if (clip->reader_fmt_count == 0 || clip->reader_fetch_idx < clip->reader_fmt_count) {
         LeaveCriticalSection(&clip->reader_cs);
         return;
     }
 
-    EmptyClipboard();
-
+    /* Build every handle before touching the clipboard, so a copy that
+       brought nothing usable leaves the host clipboard as it was. Data gets
+       two zero bytes past its end: text from the guest need not be
+       terminated, and host apps read it as a C string. */
     for (i = 0; i < clip->reader_fmt_count; i++) {
+        handles[i] = NULL;
         if (clip->reader_fmts[i].is_hdrop) {
-            HGLOBAL hDrop = clip_build_hdrop_from_temp(clip->temp_dir);
-            if (hDrop)
-                SetClipboardData(clip->reader_fmts[i].local_id, hDrop);
+            handles[i] = clip_build_hdrop_from_temp(clip->temp_dir);
         } else if (clip->reader_fmts[i].data && clip->reader_fmts[i].data_size > 0) {
-            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, clip->reader_fmts[i].data_size);
-            if (hMem) {
-                void *ptr = GlobalLock(hMem);
-                if (ptr) {
-                    memcpy(ptr, clip->reader_fmts[i].data, clip->reader_fmts[i].data_size);
-                    GlobalUnlock(hMem);
-                    SetClipboardData(clip->reader_fmts[i].local_id, hMem);
-                } else {
-                    GlobalFree(hMem);
-                }
+            HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE | GMEM_ZEROINIT,
+                                       (SIZE_T)clip->reader_fmts[i].data_size + sizeof(wchar_t));
+            void *ptr = hMem ? GlobalLock(hMem) : NULL;
+            if (ptr) {
+                memcpy(ptr, clip->reader_fmts[i].data, clip->reader_fmts[i].data_size);
+                GlobalUnlock(hMem);
+                handles[i] = hMem;
+            } else if (hMem) {
+                GlobalFree(hMem);
             }
         }
+        if (handles[i]) usable++;
     }
 
-    /* The host clipboard now holds the guest's own content, and the guest
-       already has it. Remember the new sequence number as "already pushed" so
-       the next focus change does not push it straight back - that would make
-       the guest delete and re-download its own file. Read it while the
-       clipboard is still ours, so no other app can have changed it in
-       between and made us record somebody else's content. */
-    {
-        DWORD seq = GetClipboardSequenceNumber();
-        if (seq != 0) {
-            InterlockedExchange(&clip->pushed_seq, (LONG)seq);
-            InterlockedExchange(&clip->pushed_seq_valid, 1);
+    if (usable > 0) {
+        InterlockedExchange(&clip->writer_suppress, 1);
+        if (OpenClipboard(clip->hwnd)) {
+            EmptyClipboard();
+            for (i = 0; i < clip->reader_fmt_count; i++) {
+                /* On success the clipboard owns the handle. */
+                if (handles[i] && SetClipboardData(clip->reader_fmts[i].local_id, handles[i]))
+                    handles[i] = NULL;
+            }
+
+            /* The host clipboard now holds the guest's own content, and the
+               guest already has it. Remember the new sequence number as
+               "already pushed" so the next focus change does not push it
+               straight back - that would make the guest delete and re-download
+               its own file. Read it while the clipboard is still ours, so no
+               other app can have changed it in between and made us record
+               somebody else's content. */
+            {
+                DWORD seq = GetClipboardSequenceNumber();
+                if (seq != 0) {
+                    InterlockedExchange(&clip->pushed_seq, (LONG)seq);
+                    InterlockedExchange(&clip->pushed_seq_valid, 1);
+                    InterlockedExchange(&g_guest_content_seq, (LONG)seq);
+                }
+            }
+
+            CloseClipboard();
+            clip_log(clip, L"CLIP-R: Applied %d formats to host clipboard.", usable);
         }
+        InterlockedExchange(&clip->writer_suppress, 0);
     }
 
-    CloseClipboard();
-    InterlockedExchange(&clip->writer_suppress, 0);
+    for (i = 0; i < clip->reader_fmt_count; i++)
+        if (handles[i]) GlobalFree(handles[i]);
 
-    clip_log(clip, L"CLIP-R: Applied %d formats to host clipboard.", clip->reader_fmt_count);
     clip_reader_free_pending(clip);
+    clip->reader_fmt_count = 0;
     LeaveCriticalSection(&clip->reader_cs);
 }
