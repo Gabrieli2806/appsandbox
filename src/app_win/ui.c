@@ -88,6 +88,11 @@ static UINT64 g_display_vm_ids[ASB_MAX_VMS];
 static unsigned g_core_subscription;
 static LONG g_refresh_pending;
 static int g_command_depth;
+/* Nesting of main_wnd_proc calls, and of display teardowns that dispatch
+   messages while they wait for a viewer thread. The exit sequence only runs
+   from the outermost message dispatch (see exit_may_run). */
+static int g_wndproc_depth;
+static int g_pump_depth;
 #define WM_CORE_CHANGED (WM_APP + 32)
 
 /* Custom window messages */
@@ -234,6 +239,7 @@ static void ui_show_alert(const wchar_t *message);
 static void ui_alert(const wchar_t *kind, const wchar_t *title, const wchar_t *message);
 static void ui_notice(const wchar_t *kind, const wchar_t *message);
 static void exit_tick(HWND hwnd);
+static BOOL exit_may_run(void);
 static void safe_destroy_rdp(int idx);
 static void safe_destroy_idd(int idx);
 static void reconcile_displays(void);
@@ -279,8 +285,10 @@ static void safe_destroy_rdp(int idx)
     if (idx >= 0 && idx < ASB_MAX_VMS && g_displays[idx]) {
         VmDisplay *d = g_displays[idx];
         g_displays[idx] = NULL;
+        ++g_pump_depth;
         vm_display_disconnect(d);
         vm_display_destroy(d);
+        --g_pump_depth;
     }
 }
 
@@ -289,7 +297,9 @@ static void safe_destroy_idd(int idx)
     if (idx >= 0 && idx < ASB_MAX_VMS && g_idd_displays[idx]) {
         VmDisplayIdd *d = g_idd_displays[idx];
         g_idd_displays[idx] = NULL;
+        ++g_pump_depth;
         vm_display_idd_destroy(d);
+        --g_pump_depth;
     }
 }
 
@@ -1734,8 +1744,9 @@ static void bg_op_finish(BgOp *op)
     for (i = 0; i < g_deferred_api_count; i++)
         if (g_hwnd_main) PostMessageW(g_hwnd_main, WM_ASB_API_REQUEST, 0, g_deferred_api[i]);
     g_deferred_api_count = 0;
-    /* Inside another dialog the exit timer continues once it closes. */
-    if (g_exit_waiting && g_hwnd_main && !g_command_depth) exit_tick(g_hwnd_main);
+    /* Inside a dialog, an API request or a nested dispatch the exit timer
+       continues on its next tick. */
+    if (g_exit_waiting && g_hwnd_main && exit_may_run()) exit_tick(g_hwnd_main);
 }
 
 /* Run an operation for the listed VMs on the worker thread (inline when no
@@ -1801,6 +1812,19 @@ static void post_exit_progress(BOOL active, int remaining)
     webview2_post(buf);
 }
 
+/* The exit sequence starts VM operations, opens dialogs and finally
+   destroys the window. It only runs from the outermost message dispatch:
+   not inside a dialog or command (g_command_depth), a local API request,
+   a display teardown that dispatches messages while it waits, or a nested
+   main_wnd_proc call. Otherwise WM_DESTROY could run under a handler that
+   still uses the state it frees, or the worker could act on a VM that the
+   UI thread is changing. The 1 s timer retries. */
+static BOOL exit_may_run(void)
+{
+    return !g_command_depth && !g_pump_depth && g_wndproc_depth <= 1 &&
+           !asb_api_busy() && !g_destroying;
+}
+
 static void exit_finish(HWND hwnd)
 {
     KillTimer(hwnd, IDT_EXIT_WAIT);
@@ -1837,7 +1861,7 @@ static void exit_begin(HWND hwnd, BOOL for_session)
         ? L"Windows is signing out, restarting or updating App Sandbox: shutting the VMs down first."
         : L"Shutting the VMs down; App Sandbox exits when they have stopped.");
     SetTimer(hwnd, IDT_EXIT_WAIT, 1000, NULL);
-    exit_tick(hwnd);
+    if (exit_may_run()) exit_tick(hwnd);   /* otherwise the first tick does it */
 }
 
 /* Some VMs did not stop in time, or could not be asked to. */
@@ -1914,12 +1938,11 @@ static void exit_timeout(HWND hwnd, const UINT64 *ids, int n)
 
 /* Once a second while exiting: ask VMs that run to shut down, exit when
    none runs, ask what to do when they take too long. */
-static void exit_tick(HWND hwnd)
+static void exit_tick_run(HWND hwnd)
 {
     UINT64 ask[ASB_MAX_VMS], active[ASB_MAX_VMS];
     int i, n_ask = 0, n_active = 0, waiting = 0, count = asb_vm_count();
 
-    if (!g_exit_waiting) return;
     for (i = 0; i < count; i++) {
         VmInstance *v = asb_vm_instance(asb_vm_get(i));
         if (!v || !(v->running || v->starting)) continue;
@@ -1939,6 +1962,15 @@ static void exit_tick(HWND hwnd)
     }
     if (waiting > 0 && GetTickCount64() - g_exit_started < EXIT_WAIT_LIMIT_MS) return;
     exit_timeout(hwnd, active, n_active);
+}
+
+static void exit_tick(HWND hwnd)
+{
+    static BOOL ticking;   /* an operation finished inline re-enters here */
+    if (!g_exit_waiting || ticking) return;
+    ticking = TRUE;
+    exit_tick_run(hwnd);
+    ticking = FALSE;
 }
 
 /* Tray Exit and closing the window: decide with the user what happens to
@@ -3535,7 +3567,21 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
 /* ---- Window procedure ---- */
 
+static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+
+/* Counts nested calls: a handler that dispatches messages while it waits
+   (a viewer teardown, an HCS call, a dialog) re-enters the window
+   procedure, and exit_may_run keeps the exit sequence out of those. */
 static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    LRESULT result;
+    ++g_wndproc_depth;
+    result = main_wnd_proc_handle(hwnd, msg, wp, lp);
+    --g_wndproc_depth;
+    return result;
+}
+
+static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     if (g_show_main_msg && msg == g_show_main_msg) {
         /* Another launch found this instance running (for example after the
@@ -3573,7 +3619,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_TIMER:
         if (wp == IDT_LAUNCH_VM) { launch_vm_tick(hwnd); return 0; }
         if (wp == IDT_EXIT_WAIT) {
-            if (!g_command_depth) exit_tick(hwnd);   /* not inside one of its own dialogs */
+            if (exit_may_run()) exit_tick(hwnd);
             return 0;
         }
         if (wp == IDT_OPEN_CONSOLE) {
@@ -3864,7 +3910,9 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     }
 
     case WM_BG_OP_DONE:
-        if (lp) bg_op_finish((BgOp *)lp);
+        /* Only for the operation in progress: WM_DESTROY frees it itself, and
+           its teardown dispatches messages that may still include this one. */
+        if (lp && !g_destroying && (BgOp *)lp == g_bg_op) bg_op_finish((BgOp *)lp);
         return 0;
 
     case WM_TRAYICON:
@@ -3894,6 +3942,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DESTROY:
     {
         int i;
+        BOOL worker_stuck = FALSE;
         g_destroying = TRUE;
         KillTimer(hwnd, IDT_EXIT_WAIT);
         if (g_exit_block_reason) {
@@ -3903,8 +3952,16 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         /* Let a stop or delete in progress finish before the core shuts down. */
         if (g_bg_thread) {
             if (WaitForSingleObject(g_bg_thread, 60000) == WAIT_OBJECT_0) {
-                free(g_bg_op);         /* its WM_BG_OP_DONE is never handled now */
+                MSG done;
+                /* Its WM_BG_OP_DONE may already be queued: drop it, then
+                   free the operation here. */
+                while (PeekMessageW(&done, hwnd, WM_BG_OP_DONE, WM_BG_OP_DONE, PM_REMOVE)) {}
+                free(g_bg_op);
                 g_bg_op = NULL;
+            } else {
+                /* Still inside a core call: the core is not cleaned up
+                   under it. Ending the process closes what is left. */
+                worker_stuck = TRUE;
             }
             CloseHandle(g_bg_thread);
             g_bg_thread = NULL;
@@ -3922,7 +3979,7 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             safe_destroy_rdp(i);
             safe_destroy_idd(i);
         }
-        asb_cleanup();
+        if (!worker_stuck) asb_cleanup();
         g_hwnd_main = NULL;
         PostQuitMessage(0);
         return 0;

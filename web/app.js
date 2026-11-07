@@ -584,7 +584,7 @@ function openDiskLocationModal() {
     var createOverlay = document.getElementById('create-vm-overlay');
     if (!createOverlay.classList.contains('active') || diskDirectoryBeforeEdit !== null) return;
     diskDirectoryBeforeEdit = document.getElementById('disk-directory').value;
-    document.getElementById('disk-location-overlay').classList.add('active');
+    setOverlayActive(document.getElementById('disk-location-overlay'), true);
     createOverlay.inert = true;
     revalidateDiskDirectory();
     document.getElementById('disk-directory').focus();
@@ -602,7 +602,7 @@ function closeDiskLocationModal(save) {
     var previousPath = selectedDiskDirectory();
     input.value = save ? input.value.trim() : diskDirectoryBeforeEdit;
     diskDirectoryBeforeEdit = null;
-    document.getElementById('disk-location-overlay').classList.remove('active');
+    setOverlayActive(document.getElementById('disk-location-overlay'), false);
     document.getElementById('create-vm-overlay').inert = false;
     if (selectedDiskDirectory() !== previousPath) revalidateDiskDirectory();
     document.getElementById('btn-disk-location').focus();
@@ -1034,7 +1034,7 @@ function openCreateModal() {
     onNetModeChange();
     applyOsTypeUI();   /* fires updateCreateButtons + revalidateVmName */
 
-    document.getElementById('create-vm-overlay').classList.add('active');
+    setOverlayActive(document.getElementById('create-vm-overlay'), true);
     setTimeout(function() {
         if (diskDirectoryBeforeEdit === null) document.getElementById('vm-name').focus();
     }, 0);
@@ -1045,7 +1045,7 @@ function closeCreateModal() {
     var wasOpen = overlay.classList.contains('active');
     closeDiskLocationModal(false);
     closeTemplateDropdown();
-    overlay.classList.remove('active');
+    setOverlayActive(overlay, false);
     clearTimeout(diskSpaceTimer);
     diskSpaceTimer = null;
     diskSpacePending = false;
@@ -1108,6 +1108,13 @@ function syncModalInert() {
     document.querySelectorAll('.modal-overlay').forEach(function(o) {
         o.inert = o.classList.contains('active') && o !== top;
     });
+}
+/* Open or close a dialog. The page and lower dialogs become inert, or stop
+   being inert, at once, so a focus() call that follows reaches its target
+   (the observer below would only update them after the current task). */
+function setOverlayActive(overlay, on) {
+    overlay.classList.toggle('active', !!on);
+    syncModalInert();
 }
 (function() {
     var observer = new MutationObserver(syncModalInert);
@@ -2157,12 +2164,12 @@ function openEditVmModal(idx) {
     setGpuSelection('edit-gpu-mode', vm);
     document.getElementById('edit-net-mode').value = String(vm.networkMode);
     updateEditVmModal();
-    document.getElementById('edit-vm-overlay').classList.add('active');
+    setOverlayActive(document.getElementById('edit-vm-overlay'), true);
     document.getElementById('edit-ram-size').focus();
 }
 
 function closeEditVmModal() {
-    document.getElementById('edit-vm-overlay').classList.remove('active');
+    setOverlayActive(document.getElementById('edit-vm-overlay'), false);
     restoreVmModalFocus(editVmState, '.edit');
     editVmState = null;
 }
@@ -2421,13 +2428,13 @@ function openSnapshotModal(idx) {
     document.getElementById('snapshot-title').textContent = 'Snapshots — ' + vm.name;
     document.getElementById('snapshot-warn').textContent = '';
     renderSnapshotModal();
-    document.getElementById('snapshot-overlay').classList.add('active');
+    setOverlayActive(document.getElementById('snapshot-overlay'), true);
     var choice = document.querySelector('#snapshot-tree [aria-pressed="true"]:not(:disabled)');
     (choice || document.querySelector('#snapshot-overlay .modal-buttons button:last-child')).focus();
 }
 
 function closeSnapshotModal() {
-    document.getElementById('snapshot-overlay').classList.remove('active');
+    setOverlayActive(document.getElementById('snapshot-overlay'), false);
     restoreVmModalFocus(snapshotModal, '.snap-open');
     snapshotModal = null;
 }
@@ -2766,7 +2773,7 @@ function showDocument(msg) {
     document.getElementById('document-title').textContent = msg.title || 'Document';
     document.getElementById('document-text').textContent = msg.message || '';
     if (!overlay.classList.contains('active')) overlay._previousFocus = document.activeElement;
-    overlay.classList.add('active');
+    setOverlayActive(overlay, true);
     document.getElementById('document-text').scrollTop = 0;
     overlay.querySelector('.modal-buttons .primary').focus();
 }
@@ -2774,7 +2781,7 @@ function showDocument(msg) {
 function closeDocument() {
     var overlay = document.getElementById('document-overlay');
     if (!overlay.classList.contains('active')) return;
-    overlay.classList.remove('active');
+    setOverlayActive(overlay, false);
     if (overlay._previousFocus && overlay._previousFocus.isConnected) overlay._previousFocus.focus();
     overlay._previousFocus = null;
 }
@@ -2800,7 +2807,7 @@ function setPrereqDialog(html, buttons) {
     });
     if (!overlay.classList.contains('active')) {
         overlay._previousFocus = document.activeElement;
-        overlay.classList.add('active');
+        setOverlayActive(overlay, true);
     }
     var focus = box.querySelector('.primary') || box.querySelector('button');
     if (focus) focus.focus();
@@ -2809,7 +2816,7 @@ function setPrereqDialog(html, buttons) {
 function closePrereqDialog() {
     var overlay = document.getElementById('prereq-overlay');
     if (!overlay.classList.contains('active')) return;
-    overlay.classList.remove('active');
+    setOverlayActive(overlay, false);
     if (overlay._previousFocus && overlay._previousFocus.isConnected) overlay._previousFocus.focus();
     overlay._previousFocus = null;
 }
@@ -2957,7 +2964,7 @@ function showModal(title, message, confirmText, opts) {
         inputEl.onkeydown = null;
         inputEl.oninput = null;
     }
-    document.getElementById('modal-overlay').classList.add('active');
+    setOverlayActive(document.getElementById('modal-overlay'), true);
     if (!opts.input) confirmBtn.focus();
 
     return new Promise(function(resolve) {
@@ -2967,7 +2974,7 @@ function showModal(title, message, confirmText, opts) {
 }
 
 function modalResolve(result) {
-    document.getElementById('modal-overlay').classList.remove('active');
+    setOverlayActive(document.getElementById('modal-overlay'), false);
     if (pendingConfirm) {
         var done = pendingConfirm;
         pendingConfirm = null;
