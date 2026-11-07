@@ -18,19 +18,25 @@ let diskSpacePending = false;
 let diskDirectoryBeforeEdit = null;
 let rowCache = {};
 let rowSigCache = {};
+let createPending = false;   /* createVm sent, waiting for createResult (Windows host) */
+let createOpener = null;     /* control that opened the create dialog */
+let prereqState = null;      /* null | 'missing' | 'enabling' | 'reboot' | 'failed' */
+let exitState = null;        /* {remaining, session} while App Sandbox shuts VMs down to exit */
 
 /* ---- Collapsible sections ---- */
 function toggleSection(id) {
     var section = document.getElementById(id);
     var collapsed = section.classList.toggle('collapsed');
-    localStorage.setItem('collapse_' + id, collapsed ? '1' : '0');
+    storePref('collapse_' + id, collapsed ? '1' : '0');
+    if (!collapsed && id === 'log-section') {
+        var panel = document.getElementById('log-panel');
+        panel.scrollTop = panel.scrollHeight;
+    }
 }
 (function restoreCollapse() {
     var defaults = { 'log-section': '1' };
     Object.keys(defaults).forEach(function(id) {
-        var val = localStorage.getItem('collapse_' + id);
-        if (val === null) val = defaults[id];
-        if (val === '1') document.getElementById(id).classList.add('collapsed');
+        if (storedPref('collapse_' + id, defaults[id]) === '1') document.getElementById(id).classList.add('collapsed');
     });
 })();
 
@@ -69,10 +75,12 @@ var hostBridge = (function() {
     return { send: send, isWebView2: isWebView2, isWKWebView: isWKWebView, isMac: isWKWebView };
 })();
 
+/* Returns false when the command was not sent (its VM or template is gone). */
 function sendCmd(action, data) {
-    if (data && data.vmId && vmIndexById(data.vmId) < 0) return;
-    if (data && data.templateId && !currentTemplates.some(function(t) { return t.id === data.templateId; })) return;
+    if (data && data.vmId && vmIndexById(data.vmId) < 0) return false;
+    if (data && data.templateId && !currentTemplates.some(function(t) { return t.id === data.templateId; })) return false;
     hostBridge.send(action, data);
+    return true;
 }
 
 if (hostBridge.isMac) {
@@ -158,14 +166,18 @@ window.onHostMessage = function(msg) {
         case 'confirmResult': if (pendingConfirm) pendingConfirm.resolve(msg.confirmed); break;
         case 'adapters':      populateAdapters(msg.adapters, msg.defaultIndex); break;
         case 'templates':     populateTemplates(msg.templates); break;
-        case 'alert':         showModal('Error', msg.message, 'OK'); break;
-        case 'prereqRequired': setCoreStarting(false); onPrereqRequired(); break;
-        case 'prereqReboot':   onPrereqReboot(); break;
+        case 'alert':         showAlert(msg); break;
+        case 'notice':        showToast(msg.kind, msg.message); break;
+        case 'createResult':  onCreateResult(msg); break;
+        case 'exitProgress':  onExitProgress(msg); break;
+        case 'document':      showDocument(msg); break;
+        case 'prereqRequired': setPrereqState('missing'); setCoreStarting(false); onPrereqRequired(); break;
+        case 'prereqReboot':   setPrereqState('reboot'); onPrereqReboot(); break;
         case 'prereqProgress': onPrereqProgress(msg); break;
         case 'prereqResult':   onPrereqResult(msg); break;
         case 'vmIcon':         onVmIcon(msg); break;
-        case 'coreLoading':    setCoreStarting(true); break;
-        case 'coreReady':      setCoreStarting(false); break;
+        case 'coreLoading':    setPrereqState(null); setCoreStarting(true); break;
+        case 'coreReady':      setPrereqState(null); setCoreStarting(false); break;
     }
 };
 
@@ -183,19 +195,33 @@ if (hostBridge.isWebView2) {
    it is ready the list shows a loading state and "New VM" waits. */
 function setCoreStarting(on) {
     coreStarting = !!on;
+    updateLibraryButtons();
+    renderVmTable();
+}
+
+/* New VM and Import wait for the core, and for Virtual Machine Platform. */
+function updateLibraryButtons() {
+    var off = coreStarting || !!prereqState;
     ['btn-new-sandbox', 'btn-import-vm'].forEach(function(id) {
         var b = document.getElementById(id);
-        if (b) b.disabled = coreStarting;
+        if (!b) return;
+        if (!b.hasAttribute('data-title')) b.setAttribute('data-title', b.title || '');
+        b.disabled = off;
+        b.title = prereqState ? 'Virtual Machine Platform must be on first' : b.getAttribute('data-title');
     });
+}
+
+function setPrereqState(state) {
+    prereqState = state;
+    updateLibraryButtons();
     renderVmTable();
 }
 
 function onFullState(msg) {
     coreStarting = false;
-    ['btn-new-sandbox', 'btn-import-vm'].forEach(function(id) {
-        var nb = document.getElementById(id);
-        if (nb) nb.disabled = false;
-    });
+    prereqState = null;
+    closePrereqDialog();
+    updateLibraryButtons();
     updateVmList(msg.vms || []);
     renderVmTable();
     revalidateVmName();
@@ -389,39 +415,45 @@ function populateTemplates(templates) {
     currentTemplates = templates || [];
     var list = document.getElementById('template-dropdown-list');
     var hidden = document.getElementById('template-select');
-    list.innerHTML = '';
+    list.textContent = '';
 
-    /* Default (None) item — always shows "None" inside the list */
-    var noneItem = document.createElement('div');
-    noneItem.className = 'template-dropdown-item';
-    noneItem.innerHTML = '<span class="tpl-name">(None)</span>';
-    noneItem.addEventListener('click', function() { selectTemplate('', templateDefaultLabel()); });
-    list.appendChild(noneItem);
+    /* One row per choice: a button that selects it, and for templates a
+       button that deletes it. All reachable with Tab; Escape closes. */
+    function addRow(value, label, template) {
+        var row = document.createElement('div');
+        row.className = 'template-dropdown-item';
+        row.setAttribute('role', 'option');
+        row.setAttribute('data-value', value);
+        row.setAttribute('aria-selected', hidden.value === value ? 'true' : 'false');
+        var pick = document.createElement('button');
+        pick.type = 'button';
+        pick.className = 'tpl-name';
+        pick.textContent = label;
+        pick.addEventListener('click', function() {
+            selectTemplate(value, value ? label : templateDefaultLabel());
+            document.getElementById('template-dropdown-selected').focus();
+        });
+        row.appendChild(pick);
+        if (template) {
+            var del = document.createElement('button');
+            del.type = 'button';
+            del.className = 'tpl-delete';
+            del.setAttribute('aria-label', 'Delete template ' + template.name);
+            del.title = 'Delete template';
+            del.innerHTML = '<svg aria-hidden="true" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"></path></svg>';
+            del.addEventListener('click', function(e) {
+                e.stopPropagation();
+                closeTemplateDropdown();
+                onDeleteTemplate(template.name, template.id);
+            });
+            row.appendChild(del);
+        }
+        list.appendChild(row);
+    }
 
+    addRow('', '(None)', null);
     templatesForSelectedOS().forEach(function(t) {
-        var item = document.createElement('div');
-        item.className = 'template-dropdown-item';
-
-        var nameSpan = document.createElement('span');
-        nameSpan.className = 'tpl-name';
-        nameSpan.textContent = t.name + ' [' + t.osType + ']';
-        item.appendChild(nameSpan);
-
-        var delBtn = document.createElement('span');
-        delBtn.className = 'tpl-delete';
-        delBtn.textContent = '\uD83D\uDDD1\uFE0F';
-        delBtn.title = 'Delete template';
-        delBtn.addEventListener('click', function(e) {
-            e.stopPropagation();
-            closeTemplateDropdown();
-            onDeleteTemplate(t.name, t.id);
-        });
-        item.appendChild(delBtn);
-
-        item.addEventListener('click', function() {
-            selectTemplate(t.name, t.name + ' [' + t.osType + ']');
-        });
-        list.appendChild(item);
+        addRow(t.name, t.name + ' [' + t.osType + ']', t);
     });
 
     /* If the currently selected template was deleted, reset */
@@ -450,15 +482,44 @@ function selectTemplate(value, label) {
     if (template && template.hddGb) {
         disk.value = Math.max(Number(disk.value), template.hddGb);
     }
+    document.querySelectorAll('#template-dropdown-list .template-dropdown-item').forEach(function(row) {
+        row.setAttribute('aria-selected', String(row.getAttribute('data-value') === value));
+    });
     updateCreateButtons();
+}
+
+function templateDropdownOpen() {
+    return document.getElementById('template-dropdown').classList.contains('open');
 }
 
 function closeTemplateDropdown() {
     document.getElementById('template-dropdown').classList.remove('open');
+    document.getElementById('template-dropdown-selected').setAttribute('aria-expanded', 'false');
+}
+
+function openTemplateDropdown(focusFirst) {
+    document.getElementById('template-dropdown').classList.add('open');
+    document.getElementById('template-dropdown-selected').setAttribute('aria-expanded', 'true');
+    if (focusFirst) {
+        var first = document.querySelector('#template-dropdown-list .tpl-name');
+        if (first) first.focus();
+    }
 }
 
 document.getElementById('template-dropdown-selected').addEventListener('click', function() {
-    document.getElementById('template-dropdown').classList.toggle('open');
+    if (templateDropdownOpen()) closeTemplateDropdown(); else openTemplateDropdown(false);
+});
+document.getElementById('template-dropdown-selected').addEventListener('keydown', function(e) {
+    if (e.key === 'ArrowDown') { e.preventDefault(); openTemplateDropdown(true); }
+});
+document.getElementById('template-dropdown-list').addEventListener('keydown', function(e) {
+    if (e.key !== 'ArrowDown' && e.key !== 'ArrowUp') return;
+    var picks = Array.prototype.slice.call(this.querySelectorAll('.tpl-name'));
+    var i = picks.indexOf(document.activeElement);
+    if (i < 0) return;
+    e.preventDefault();
+    var next = picks[Math.max(0, Math.min(picks.length - 1, i + (e.key === 'ArrowDown' ? 1 : -1)))];
+    if (next) next.focus();
 });
 
 /* Close dropdown when clicking outside */
@@ -470,8 +531,8 @@ document.addEventListener('click', function(e) {
 
 function onDeleteTemplate(name, id) {
     showModal(
-        'Confirm Delete',
-        'Are you sure you want to delete template "' + name + '"?\n\nThis will permanently delete the template disk image.',
+        'Delete template?',
+        'Delete template "' + name + '"?\n\nIts disk image is deleted permanently.',
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
@@ -558,6 +619,7 @@ document.getElementById('disk-location-overlay').addEventListener('click', funct
 
 /* ---- Create buttons state ---- */
 
+/* First problem in the form, checked in the order the fields appear, or null. */
 function createValidationError(isTemplate) {
     var osType = document.getElementById('os-type').value;
     if (isTemplate && osType !== 'Windows' && osType !== 'macOS')
@@ -565,47 +627,76 @@ function createValidationError(isTemplate) {
     if (isTemplate && document.getElementById('template-select').value)
         return 'Select an OS image to build a new template.';
     if (osType === 'Other' && isTemplate) return 'Manual-install VMs cannot be templates.';
-    var error = validateVmName(document.getElementById('vm-name').value.trim()) ||
-        validateDiskDirectory(document.getElementById('disk-directory').value.trim());
-    if (!error && osType !== 'Other')
-        error = validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
-                validatePassword(document.getElementById('admin-pass').value);
+    var error = validateVmName(document.getElementById('vm-name').value.trim());
     if (error) return error;
-    if (osType !== 'Other' &&
-        document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
-        return 'Passwords do not match.';
-
-    var numericFields = [
-        ['hdd-size', 'Disk size must be a whole number of at least 1 GB.'],
-        ['ram-size', 'RAM must be an even number of at least 512 MB.'],
-        ['cpu-cores', 'CPU cores must be a whole number of at least 1.']
-    ];
-    for (var i = 0; i < numericFields.length; i++) {
-        var input = document.getElementById(numericFields[i][0]);
-        if (input.value === '' || !input.validity.valid) return numericFields[i][1];
-    }
-
-    var path = selectedDiskDirectory();
-    var diskKnown = diskSpaceInfo && diskSpaceInfo.path === path;
-    if (diskKnown && diskSpaceInfo.freeGb < 0) return 'Disk folder is unavailable.';
-    if (diskSpacePending && !diskKnown) return 'Checking disk folder...';
 
     var hasImage = document.getElementById('image-path').value.trim() !== '';
     var hasTemplate = (osType === 'Windows' || osType === 'macOS') &&
         document.getElementById('template-select').value !== '';
     if (osType !== 'macOS' && !hasImage && (isTemplate || !hasTemplate))
-        return 'Select an OS image or an available template.';
+        return (osType === 'Windows' && !isTemplate && !hostBridge.isMac)
+            ? 'Choose an installer ISO (Browse\u2026) or a template to continue.'
+            : 'Choose an installer ISO (Browse\u2026) to continue.';
+
+    error = validateDiskDirectory(document.getElementById('disk-directory').value.trim());
+    if (error) return error;
+    var numericFields = [
+        ['hdd-size', 'Disk size must be a whole number of at least 1 GB.'],
+        ['ram-size', 'Memory must be an even number of at least 512 MB.'],
+        ['cpu-cores', 'Processors must be a whole number of at least 1.']
+    ];
+    for (var i = 0; i < numericFields.length; i++) {
+        var input = document.getElementById(numericFields[i][0]);
+        if (input.value === '' || !input.validity.valid) return numericFields[i][1];
+    }
+    var path = selectedDiskDirectory();
+    var diskKnown = diskSpaceInfo && diskSpaceInfo.path === path;
+    if (diskKnown && diskSpaceInfo.freeGb < 0) return 'The disk location is unavailable. Choose another one.';
+    if (diskSpacePending && !diskKnown) return 'Checking the disk location\u2026';
+
+    if (osType !== 'Other') {
+        error = validateUsername(document.getElementById('admin-user').value.trim(), isTemplate) ||
+                validatePassword(document.getElementById('admin-pass').value);
+        if (error) return error;
+        if (document.getElementById('admin-pass').value !== document.getElementById('admin-confirm').value)
+            return document.getElementById('admin-confirm').value
+                ? 'The passwords don\u2019t match.' : 'Type the password again in Confirm.';
+    }
     return null;
 }
 
+/* Error from the host for the last Create (kept until the form changes). */
+let createHostError = '';
+
+/* Create stays disabled until the form is complete; the line above the
+   buttons says what is missing (or what the host refused). */
 function updateCreateButtons() {
-    document.getElementById('btn-create').disabled = !!createValidationError(false);
-    document.getElementById('btn-create-template').disabled = !!createValidationError(true);
+    var error = createValidationError(false);
+    var templateError = createValidationError(true);
+    var create = document.getElementById('btn-create');
+    var template = document.getElementById('btn-create-template');
+    create.disabled = createPending || !!error;
+    create.title = error || '';
+    create.textContent = createPending ? 'Creating\u2026' : 'Create VM';
+    template.disabled = createPending || !!templateError;
+    template.title = templateError || '';
+    var hint = document.getElementById('create-hint');
+    if (createHostError) {
+        hint.textContent = createHostError;
+        hint.className = 'form-hint error';
+    } else {
+        hint.textContent = createPending ? 'Creating the VM\u2026' : (error || '');
+        hint.className = 'form-hint';
+    }
 }
 
 /* Wire up change events */
-document.getElementById('create-vm-overlay').addEventListener('input', updateCreateButtons);
-document.getElementById('create-vm-overlay').addEventListener('change', updateCreateButtons);
+function onCreateFormEdited() {
+    createHostError = '';
+    updateCreateButtons();
+}
+document.getElementById('create-vm-overlay').addEventListener('input', onCreateFormEdited);
+document.getElementById('create-vm-overlay').addEventListener('change', onCreateFormEdited);
 document.getElementById('image-path').addEventListener('input', function() {
     if (this.value.trim() !== '') {
         selectTemplate('', templateDefaultLabel());
@@ -633,16 +724,26 @@ function revalidateUsername() {
     var u = document.getElementById('admin-user').value.trim();
     document.getElementById('admin-user-warn').textContent = validateUsername(u) || '';
 }
+/* The password warning appears once the user typed or left the field, so an
+   empty form does not open with errors; the hint line covers the rest. */
 function revalidatePassword() {
-    var p = document.getElementById('admin-pass').value;
-    document.getElementById('admin-pass-warn').textContent = validatePassword(p) || '';
+    var passEl = document.getElementById('admin-pass');
+    var confirm = document.getElementById('admin-confirm').value;
+    var p = passEl.value;
+    var error = (p || passEl.getAttribute('data-touched')) ? validatePassword(p) : null;
+    if (!error && confirm && confirm !== p) error = 'The passwords don\u2019t match.';
+    document.getElementById('admin-pass-warn').textContent = error || '';
 }
 document.getElementById('admin-user').addEventListener('input', revalidateUsername);
+document.getElementById('admin-pass').addEventListener('blur', function() {
+    this.setAttribute('data-touched', '1');
+    revalidatePassword();
+});
 
 function checkPasswordMatch() {
     var pass = document.getElementById('admin-pass').value;
     var confirm = document.getElementById('admin-confirm');
-    if (confirm.value === '' && pass === '') {
+    if (confirm.value === '') {
         confirm.classList.remove('pass-mismatch', 'pass-match');
         return;
     }
@@ -658,16 +759,21 @@ document.getElementById('admin-pass').addEventListener('input', function() {
     checkPasswordMatch();
     revalidatePassword();
 });
-document.getElementById('admin-confirm').addEventListener('input', checkPasswordMatch);
+document.getElementById('admin-confirm').addEventListener('input', function() {
+    checkPasswordMatch();
+    revalidatePassword();
+});
 checkPasswordMatch();
 
-function showPassword() {
-    document.getElementById('admin-pass').type = 'text';
-    document.getElementById('admin-confirm').type = 'text';
-}
-function hidePassword() {
-    document.getElementById('admin-pass').type = 'password';
-    document.getElementById('admin-confirm').type = 'password';
+/* Show or hide both password fields (a toggle button, usable from the keyboard). */
+function togglePasswordVisibility(show) {
+    var btn = document.getElementById('toggle-pass');
+    if (typeof show !== 'boolean') show = btn.getAttribute('aria-pressed') !== 'true';
+    document.getElementById('admin-pass').type = show ? 'text' : 'password';
+    document.getElementById('admin-confirm').type = show ? 'text' : 'password';
+    btn.setAttribute('aria-pressed', show ? 'true' : 'false');
+    btn.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+    btn.title = show ? 'Hide password' : 'Show password';
 }
 
 function onNetModeChange() {
@@ -705,7 +811,6 @@ function gatherConfig() {
         netAdapter:  hostBridge.isMac ? '' : document.getElementById('net-adapter').value,
         adminUser:   document.getElementById('admin-user').value.trim(),
         adminPass:   document.getElementById('admin-pass').value,
-        adminConfirm: document.getElementById('admin-confirm').value,
         testMode:    document.getElementById('test-mode').checked,
         sshEnabled:  document.getElementById('ssh-enabled').checked,
         sshDeployKey: document.getElementById('ssh-deploy-key').checked
@@ -723,6 +828,8 @@ function onSshToggle() {
 
 function clearCreateForm() {
     document.getElementById('image-path').value = '';
+    document.getElementById('admin-pass').value = '';
+    document.getElementById('admin-confirm').value = '';
     selectTemplate('', templateDefaultLabel());
     updateCreateButtons();
 }
@@ -816,7 +923,7 @@ function validateUsername(name, isTemplate) {
 }
 
 function validatePassword(pass) {
-    if (!pass) return 'Password is required.';
+    if (!pass) return 'Choose a password for the VM\u2019s administrator account.';
     if (pass.indexOf('\u0000') >= 0) return 'Password cannot contain NUL characters.';
     var bytes;
     try {
@@ -840,29 +947,58 @@ function validatePassword(pass) {
     return null;
 }
 
-function onCreateVm() {
-    var error = createValidationError(false);
-    if (error) { sendCmd('log', { message: error }); updateCreateButtons(); return; }
+/* Windows host: the dialog stays open until the host answers with
+   createResult, and shows the reason when the VM was not accepted. The Mac
+   host reports problems with an alert, so the dialog closes at once there. */
+function submitCreate(isTemplate) {
+    if (createPending) return;
+    var error = createValidationError(isTemplate);
+    if (error) { updateCreateButtons(); return; }
     var cfg = gatherConfig();
-    sendCmd('createVm', cfg);
-    clearCreateForm();
-    closeCreateModal();
+    if (isTemplate) cfg.isTemplate = true;
+    if (hostBridge.isMac) {
+        sendCmd('createVm', cfg);
+        clearCreateForm();
+        closeCreateModal();
+        return;
+    }
+    createHostError = '';
+    createPending = true;
+    updateCreateButtons();
+    if (!sendCmd('createVm', cfg)) {
+        createPending = false;
+        createHostError = 'That template is no longer available. Choose another one.';
+        updateCreateButtons();
+    }
 }
 
-function onCreateTemplate() {
-    var error = createValidationError(true);
-    if (error) { sendCmd('log', { message: error }); updateCreateButtons(); return; }
-    var cfg = gatherConfig();
-    cfg.isTemplate = true;
-    sendCmd('createVm', cfg);
-    clearCreateForm();
-    closeCreateModal();
+function onCreateVm() { submitCreate(false); }
+function onCreateTemplate() { submitCreate(true); }
+
+function onCreateResult(msg) {
+    if (!createPending) return;
+    createPending = false;
+    var open = document.getElementById('create-vm-overlay').classList.contains('active');
+    if (msg.kind === 'ok') {
+        clearCreateForm();
+        if (open) closeCreateModal();
+        return;
+    }
+    if (!open) {
+        showAlert({ kind: 'error', title: 'Could not create the VM', message: msg.message });
+        return;
+    }
+    createHostError = msg.message || 'The VM could not be created. Details are in Activity.';
+    updateCreateButtons();
 }
 
 /* ---- Create Sandbox modal ---- */
 
 function openCreateModal() {
+    if (coreStarting || prereqState) return;
     closeDiskLocationModal(false);
+    createOpener = document.activeElement;
+    createHostError = '';
     /* Reset to defaults every time the modal opens */
     document.getElementById('vm-name').value = 'MyAppSandbox';
     document.getElementById('image-path').value = '';
@@ -872,9 +1008,13 @@ function openCreateModal() {
     document.getElementById('hdd-size').value = 64;
     setGpuSelection('gpu-mode', { gpuMode: 1 });
     document.getElementById('net-mode').value = '1';
+    /* A common default name; never a known password (the account is an
+       administrator, and reachable over SSH when that is turned on). */
     document.getElementById('admin-user').value = 'user';
-    document.getElementById('admin-pass').value = 'test123';
-    document.getElementById('admin-confirm').value = 'test123';
+    document.getElementById('admin-pass').value = '';
+    document.getElementById('admin-confirm').value = '';
+    document.getElementById('admin-pass').removeAttribute('data-touched');
+    togglePasswordVisibility(false);
     document.getElementById('test-mode').checked = false;
     document.getElementById('ssh-enabled').checked = false;
     document.getElementById('ssh-deploy-key').checked = false;
@@ -901,12 +1041,25 @@ function openCreateModal() {
 }
 
 function closeCreateModal() {
+    var overlay = document.getElementById('create-vm-overlay');
+    var wasOpen = overlay.classList.contains('active');
     closeDiskLocationModal(false);
-    document.getElementById('create-vm-overlay').classList.remove('active');
+    closeTemplateDropdown();
+    overlay.classList.remove('active');
     clearTimeout(diskSpaceTimer);
     diskSpaceTimer = null;
     diskSpacePending = false;
     ++diskSpaceRequestId;
+    /* Passwords do not stay in the page once the dialog is closed. */
+    document.getElementById('admin-pass').value = '';
+    document.getElementById('admin-confirm').value = '';
+    togglePasswordVisibility(false);
+    if (wasOpen) {
+        var back = createOpener && createOpener.isConnected && !createOpener.disabled
+            ? createOpener : document.getElementById('btn-new-sandbox');
+        createOpener = null;
+        if (back && !back.disabled) back.focus();
+    }
 }
 
 /* Close on backdrop click — but only when the press also STARTED on the backdrop.
@@ -924,10 +1077,10 @@ document.getElementById('create-vm-overlay').addEventListener('click', function(
 
 function trapModalFocus(event, overlay) {
     if (event.key !== 'Tab') return;
-    var controls = Array.from(overlay.querySelectorAll('button, input, select, [tabindex]')).filter(function(el) {
+    var controls = Array.from(overlay.querySelectorAll('button, input, select, textarea, a[href], [tabindex]')).filter(function(el) {
         return !el.disabled && el.tabIndex >= 0 && el.getClientRects().length;
     });
-    if (!controls.length) return;
+    if (!controls.length) { event.preventDefault(); return; }
     var first = controls[0], last = controls[controls.length - 1];
     if (!overlay.contains(document.activeElement) ||
         (event.shiftKey && document.activeElement === first) ||
@@ -937,40 +1090,67 @@ function trapModalFocus(event, overlay) {
     }
 }
 
+/* Open dialogs in stacking order: later in the page is on top. */
+function activeOverlays() {
+    return Array.prototype.slice.call(document.querySelectorAll('.modal-overlay.active'));
+}
+function topOverlay() {
+    var list = activeOverlays();
+    return list.length ? list[list.length - 1] : null;
+}
+
+/* While a dialog is open, the page and any dialog under it are inert (no
+   focus, no clicks, hidden from screen readers). */
+function syncModalInert() {
+    var top = topOverlay();
+    var app = document.querySelector('.app');
+    if (app) app.inert = !!top;
+    document.querySelectorAll('.modal-overlay').forEach(function(o) {
+        o.inert = o.classList.contains('active') && o !== top;
+    });
+}
+(function() {
+    var observer = new MutationObserver(syncModalInert);
+    document.querySelectorAll('.modal-overlay').forEach(function(o) {
+        observer.observe(o, { attributes: true, attributeFilter: ['class'] });
+    });
+})();
+
+/* Escape closes the dialog on top, as its Cancel or Close button would. */
+function closeOverlay(overlay) {
+    switch (overlay.id) {
+        case 'modal-overlay': modalResolve(false); break;
+        case 'disk-location-overlay': closeDiskLocationModal(false); break;
+        case 'edit-vm-overlay': closeEditVmModal(); break;
+        case 'snapshot-overlay': closeSnapshotModal(); break;
+        case 'create-vm-overlay': closeCreateModal(); break;
+        case 'document-overlay': closeDocument(); break;
+        case 'prereq-overlay': if (prereqState !== 'enabling') closePrereqDialog(); break;
+    }
+}
+
 document.addEventListener('keydown', function(e) {
-    var confirmOverlay = document.getElementById('modal-overlay');
-    if (confirmOverlay.classList.contains('active')) {
-        if (e.key === 'Escape') { e.preventDefault(); modalResolve(false); }
-        else trapModalFocus(e, confirmOverlay);
+    var top = topOverlay();
+    if (!top) return;
+    if (e.key === 'Tab') { trapModalFocus(e, top); return; }
+    if (e.key === 'Escape') {
+        e.preventDefault();
+        if (top.id === 'create-vm-overlay' && templateDropdownOpen()) {
+            closeTemplateDropdown();
+            document.getElementById('template-dropdown-selected').focus();
+            return;
+        }
+        closeOverlay(top);
         return;
     }
-    var diskOverlay = document.getElementById('disk-location-overlay');
-    if (diskOverlay.classList.contains('active')) {
-        if (e.key === 'Escape') { e.preventDefault(); closeDiskLocationModal(false); }
-        else if (e.key === 'Enter' && e.target.id === 'disk-directory') {
+    if (e.key === 'Enter') {
+        if (top.id === 'disk-location-overlay' && e.target.id === 'disk-directory') {
             e.preventDefault();
             closeDiskLocationModal(true);
-        } else trapModalFocus(e, diskOverlay);
-        return;
-    }
-    var editOverlay = document.getElementById('edit-vm-overlay');
-    if (editOverlay.classList.contains('active')) {
-        if (e.key === 'Escape') { e.preventDefault(); closeEditVmModal(); }
-        else if (e.key === 'Enter' && e.target.tagName === 'INPUT') {
+        } else if (top.id === 'edit-vm-overlay' && e.target.tagName === 'INPUT') {
             e.preventDefault();
             saveEditVm();
-        } else trapModalFocus(e, editOverlay);
-        return;
-    }
-    var snapshotOverlay = document.getElementById('snapshot-overlay');
-    if (snapshotOverlay.classList.contains('active')) {
-        if (e.key === 'Escape') { e.preventDefault(); closeSnapshotModal(); }
-        else trapModalFocus(e, snapshotOverlay);
-        return;
-    }
-    if (e.key !== 'Escape') return;
-    if (document.getElementById('create-vm-overlay').classList.contains('active')) {
-        closeCreateModal();
+        }
     }
 });
 
@@ -998,10 +1178,13 @@ function osIcon(osType) {
     return ICONS.monitor;
 }
 
-function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting || vm.updatingTools || vm.copyingDisk); }
+function isBusy(vm) { return !!(vm.buildingVhdx || vm.starting || vm.updatingTools || vm.copyingDisk || vm.pendingOp); }
 
 /* Status label + style for a VM (kind: running | busy | stopping | stopped). */
 function vmStatus(vm) {
+    if (vm.pendingOp === 'deleting') return { label: 'Deleting', kind: 'busy' };
+    if (vm.pendingOp === 'stopping') return { label: 'Stopping', kind: 'stopping' };
+    if (vm.pendingOp === 'shuttingDown') return { label: 'Shutting down', kind: 'stopping' };
     if (vm.copyingDisk)
         return { label: (vm.installComplete ? 'Exporting ' : 'Importing ') + (vm.copyProgress || 0) + '%', kind: 'busy' };
     if (vm.updatingTools) return { label: 'Updating components', kind: 'busy' };
@@ -1101,7 +1284,8 @@ function primaryAction(vm) {
         return { label: 'Connect', disabled: bld || vm.isTemplate,
                  run: function() { sendCmd('connectIddVm', { vmId: vm.id }); } };
     }
-    return { label: 'Start', disabled: bld,
+    return { label: 'Start', disabled: bld || !!exitState || !!prereqState,
+             title: exitState ? 'App Sandbox is shutting its VMs down to exit' : '',
              run: function() { onStartVm(vmIndexById(vm.id)); } };
 }
 
@@ -1111,6 +1295,7 @@ function showVmMenu(vm, anchor) {
     var bld = isBusy(vm);
     var menu = el('div', 'menu-pop');
     menu.setAttribute('role', 'menu');
+    menu.setAttribute('aria-label', vm.name);
     function item(label, enabled, fn, cls) {
         var b = el('button', cls || '', label);
         b.type = 'button';
@@ -1121,7 +1306,7 @@ function showVmMenu(vm, anchor) {
     }
     item('Open settings', true, function() { openVmDetail(vm.id); });
     item('Shut down', vm.running && !bld, function() { sendCmd('shutdownVm', { vmId: vm.id }); });
-    item('Force stop', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); });
+    item('Force stop\u2026', vm.running && !bld, function() { onStopVm(vmIndexById(vm.id)); });
     if (!hostBridge.isMac) {
         item('Snapshots…', !bld, function() { openSnapshotModal(vmIndexById(vm.id)); });
         item('Export…', !vm.running && !bld && !vm.isTemplate, function() { sendCmd('exportVm', { vmId: vm.id }); });
@@ -1132,11 +1317,26 @@ function showVmMenu(vm, anchor) {
             item('Use default icon', true, function() { sendCmd('clearVmIcon', { vmId: vm.id }); });
         item('Create desktop shortcut', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'desktop' }); });
         item('Add to Start menu', !vm.isTemplate, function() { sendCmd('createShortcut', { vmId: vm.id, where: 'start' }); });
+        item('Open VM folder', !!vm.vmFolder && vm.pendingOp !== 'deleting', function() { sendCmd('openVmFolder', { vmId: vm.id }); });
+        item('Copy VM folder path', !!vm.vmFolder, function() { sendCmd('copyVmPath', { vmId: vm.id }); });
     }
     if (vm.sshEnabled)
         item('Open SSH terminal', sshReady(vm), function() { sendCmd('sshConnect', { vmId: vm.id }); });
     menu.appendChild(document.createElement('hr'));
     item('Delete VM…', !bld, function() { onDeleteVm(vmIndexById(vm.id)); }, 'danger-item');
+
+    /* Arrow keys, Home and End move between the enabled items. */
+    menu.addEventListener('keydown', function(e) {
+        var items = Array.prototype.slice.call(menu.querySelectorAll('button:not(:disabled)'));
+        var i = items.indexOf(document.activeElement), next = null;
+        if (!items.length) return;
+        if (e.key === 'ArrowDown') next = items[(i + 1) % items.length];
+        else if (e.key === 'ArrowUp') next = items[(i - 1 + items.length) % items.length];
+        else if (e.key === 'Home') next = items[0];
+        else if (e.key === 'End') next = items[items.length - 1];
+        else if (e.key === 'Tab') { closeVmMenu(); return; }
+        if (next) { e.preventDefault(); next.focus(); }
+    });
 
     document.body.appendChild(menu);
     var r = anchor.getBoundingClientRect();
@@ -1207,10 +1407,23 @@ function buildVmCard(vm) {
 
     card.appendChild(main);
 
+    if (vm.lastError) {
+        var err = el('div', 'vm-card-error');
+        err.setAttribute('role', 'alert');
+        err.appendChild(el('span', '', vm.lastError));
+        var x = el('button', 'notice-dismiss', '\u00d7');
+        x.type = 'button';
+        x.setAttribute('aria-label', 'Dismiss this message');
+        x.onclick = function(e) { e.stopPropagation(); dismissVmError(vm.id); };
+        err.appendChild(x);
+        card.appendChild(err);
+    }
+
     var actions = el('div', 'vm-card-actions');
     var pa = primaryAction(vm);
     var pb = el('button', 'primary grow', pa.label);
     pb.type = 'button';
+    if (pa.title) pb.title = pa.title;
     if (pa.disabled) pb.disabled = true;
     else pb.onclick = pa.run;
     actions.appendChild(pb);
@@ -1251,6 +1464,8 @@ function renderVmTable() {
     document.getElementById('nav-vm-count').textContent = vms.length;
     document.getElementById('vm-summary').textContent = coreStarting && !vms.length
         ? 'Starting…'
+        : prereqState === 'reboot' && !vms.length ? 'Restart Windows to finish setup'
+        : prereqState && !vms.length ? 'Virtual Machine Platform is off'
         : vms.length
             ? running + ' running · ' + (vms.length - running) + ' stopped'
             : 'No virtual machines yet';
@@ -1281,10 +1496,14 @@ function renderVmTable() {
         loading.appendChild(el('h2', '', 'Starting App Sandbox…'));
         loading.appendChild(el('p', 'muted', 'Checking Windows features and your GPUs, and finding your virtual machines.'));
         grid.appendChild(loading);
+    } else if (vms.length === 0 && prereqState) {
+        grid.appendChild(buildPrereqState());
     } else if (vms.length === 0) {
         var empty = el('div', 'empty-state');
         empty.appendChild(el('h2', '', 'Create your first virtual machine'));
-        empty.appendChild(el('p', 'muted', 'Windows 11, Ubuntu or macOS, set up automatically from an installer image.'));
+        empty.appendChild(el('p', 'muted', hostBridge.isMac
+            ? 'Windows 11 or macOS, set up automatically from an installer image.'
+            : 'Windows 11 or Ubuntu, set up automatically from an installer image, or any other OS you install from its ISO.'));
         var btn = el('button', 'primary with-icon', 'New VM');
         btn.type = 'button';
         btn.onclick = openCreateModal;
@@ -1292,12 +1511,12 @@ function renderVmTable() {
         grid.appendChild(empty);
     }
 
-    var pos = 0;
+    var pos = 0, shown = 0;
     vms.forEach(function(vm, i) {
         var card = rowCache[vm.id];
         var sig = [
             i === selectedVm, vm.name, vm.running, vm.starting, vm.buildingVhdx, vm.vhdxStaging, vm.updatingTools,
-            vm.copyingDisk,
+            vm.copyingDisk, vm.pendingOp || '', vm.lastError || '', !!exitState, !!prereqState, !!vm.vmFolder,
             vm.shuttingDown, vm.installComplete, vm.isTemplate,
             vm.sshEnabled, vm.sshState, vm.sshPort, vm.osType, vm.ramMb, vm.hddGb, vm.cpuCores,
             vm.gpuMode, vm.gpuId, vm.gpuName, vm.networkMode, vm.hasSnapshots,
@@ -1321,9 +1540,20 @@ function renderVmTable() {
 
         var visible = vmMatchesFilter(vm);
         card.hidden = !visible;
+        if (visible) shown++;
         if (grid.children[pos] !== card) grid.insertBefore(card, grid.children[pos] || null);
         pos++;
     });
+    if (vms.length && !shown) {
+        var none = el('div', 'empty-state');
+        var q = (document.getElementById('vm-search').value || '').trim();
+        none.appendChild(el('h2', '', q ? 'No VMs match \u201c' + q + '\u201d' : 'No VMs here'));
+        var clear = el('button', '', 'Show all VMs');
+        clear.type = 'button';
+        clear.onclick = function() { document.getElementById('vm-search').value = ''; setVmFilter('all'); };
+        none.appendChild(clear);
+        grid.appendChild(none);
+    }
 
     renderVmDetail();
     renderSettingsView();
@@ -1393,7 +1623,7 @@ function renderVmDetail() {
     /* Header actions: rebuilt only when they would change. */
     var actions = document.getElementById('vmd-actions');
     var bld = isBusy(vm);
-    var sig = [vm.id, vm.running, bld, vm.isTemplate, vm.sshEnabled, sshReady(vm)].join('|');
+    var sig = [vm.id, vm.running, bld, vm.isTemplate, vm.sshEnabled, sshReady(vm), !!exitState, !!prereqState].join('|');
     renderToolsCard(vm);
     if (actions.getAttribute('data-sig') !== sig) {
         actions.setAttribute('data-sig', sig);
@@ -1401,6 +1631,7 @@ function renderVmDetail() {
         var pa = primaryAction(vm);
         var pb = el('button', 'primary', pa.label);
         pb.type = 'button';
+        if (pa.title) pb.title = pa.title;
         if (pa.disabled) pb.disabled = true; else pb.onclick = pa.run;
         actions.appendChild(pb);
         if (vm.sshEnabled) {
@@ -1416,12 +1647,12 @@ function renderVmDetail() {
         if (!vm.running || bld) sd.disabled = true;
         else sd.onclick = function() { sendCmd('shutdownVm', { vmId: vm.id }); };
         actions.appendChild(sd);
-        var fs = el('button', 'danger-outline', 'Force stop');
+        var fs = el('button', 'danger-outline', 'Force stop\u2026');
         fs.type = 'button';
         if (!vm.running || bld) fs.disabled = true;
         else fs.onclick = function() { onStopVm(vmIndexById(vm.id)); };
         actions.appendChild(fs);
-        var del = el('button', 'danger-outline', 'Delete');
+        var del = el('button', 'danger-outline', 'Delete\u2026');
         del.type = 'button';
         if (bld) del.disabled = true;
         else del.onclick = function() { onDeleteVm(vmIndexById(vm.id)); };
@@ -1444,19 +1675,33 @@ function renderVmDetail() {
         p.hidden = p.getAttribute('data-panel') !== detailTab;
     });
 
+    var errBox = document.getElementById('vmd-error');
+    errBox.hidden = !vm.lastError;
+    document.getElementById('vmd-error-text').textContent = vm.lastError || '';
+
     var overview = [
         ['Status', vmStatus(vm).label],
         ['Operating system', vm.osType + (vm.isTemplate ? ' (template)' : '')],
-        ['In-VM agent', !vm.running ? 'VM is off' : vm.agentOnline ? 'Connected' : 'Not connected'],
+        ['In-VM agent', vm.osType === 'Other' ? 'Not used (manual install)'
+            : !vm.running ? 'VM is off' : vm.agentOnline ? 'Connected' : 'Not connected'],
         ['Network', hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None') + (vm.networkMode === 2 && vm.netAdapter ? ' · ' + vm.netAdapter : '')]
     ];
+    /* NAT: the address the VM gets (a manual-install VM needs it set by hand;
+       the gateway is the .1 of its /24). */
+    if (vm.natIp) {
+        var gw = vm.natIp.replace(/\.\d+$/, '.1');
+        overview.push(['IP address', vm.natIp + '/24 · gateway ' + gw]);
+    }
     if (vm.sshEnabled) overview.push(['SSH', 'localhost:' + vm.sshPort]);
     if (vm.diskDirectory) overview.push(['Disk folder', vm.diskDirectory]);
     fillRows(document.getElementById('vmd-overview'), overview);
+    var files = document.getElementById('vmd-files-card');
+    files.hidden = hostBridge.isMac || !vm.vmFolder;
+    document.getElementById('vmd-folder').textContent = vm.vmFolder || '';
 
     fillRows(document.getElementById('vmd-hardware'), [
         ['Processors', vm.cpuCores + ' vCPU'],
-        ['Memory', vm.ramMb + ' MB'],
+        ['Memory', ramLabel(vm.ramMb) + (vm.ramMb >= 1024 ? ' (' + vm.ramMb + ' MB)' : '')],
         ['Disk', vm.hddGb + ' GB'],
         ['GPU', gpuLabel(vm)],
         ['Network', hostBridge.isMac ? 'NAT' : (netNames[vm.networkMode] || 'None')]
@@ -1780,10 +2025,53 @@ function renderSettingsView() {
         rows.push(['Memory', ramLabel(lastHostInfo.hostRamMb)]);
         if (Array.isArray(lastHostInfo.gpus) && lastHostInfo.gpus.length)
             rows.push(['GPUs', lastHostInfo.gpus.map(function(g) { return g.name; }).join(', ')]);
-        if (lastHostInfo.defaultDiskDirectory) rows.push(['Default VM folder', lastHostInfo.defaultDiskDirectory]);
-        if (lastHostInfo.freeGb >= 0) rows.push(['Free space there', lastHostInfo.freeGb + ' GB']);
+        /* Windows host: the folder itself is under Folders and logs. */
+        if (hostBridge.isMac && lastHostInfo.defaultDiskDirectory) rows.push(['Default VM folder', lastHostInfo.defaultDiskDirectory]);
+        if (lastHostInfo.freeGb >= 0) rows.push(['Free space in the default VM folder', lastHostInfo.freeGb + ' GB']);
     }
     fillRows(document.getElementById('set-host'), rows);
+    if (!hostBridge.isMac) renderFoldersAndAbout(lastHostInfo);
+}
+
+/* "0.1.9.123" -> "0.1.9 (build 123)". */
+function formatVersion(v) {
+    var parts = String(v || '').split('.');
+    if (parts.length === 4 && parts[3] !== '0') return parts.slice(0, 3).join('.') + ' (build ' + parts[3] + ')';
+    if (parts.length === 4) return parts.slice(0, 3).join('.');
+    return v || 'unknown';
+}
+
+function setText(id, text) {
+    var e = document.getElementById(id);
+    if (e) e.textContent = text;
+}
+
+/* Settings > Folders and logs, and About (Windows host). */
+function renderFoldersAndAbout(info) {
+    if (!info) return;
+    var vmDir = info.defaultDiskDirectory || '', dataDir = info.dataDirectory || '';
+    var same = !!vmDir && vmDir.replace(/\\+$/, '').toLowerCase() === dataDir.replace(/\\+$/, '').toLowerCase();
+    setText('set-folder-vms-path', vmDir);
+    setText('set-folder-vms-label', same ? 'VM and app data folder' : 'Default VM folder');
+    setText('set-folder-vms-help', same
+        ? 'New VMs are created here unless you choose another disk location in New VM. It also holds the settings (vms.cfg), the local API\u2019s token, headless.log and caches.'
+        : 'New VMs are created here unless you choose another disk location in New VM.');
+    document.getElementById('set-folder-data').hidden = same;
+    setText('set-folder-data-path', dataDir);
+    setText('set-folder-log-path', info.logFile || '');
+    setText('set-folder-app-path', info.packaged ? '' : (info.appDirectory || ''));
+    setText('set-folder-app-help', info.packaged
+        ? 'Installed from the Microsoft Store: Windows keeps the app\u2019s folder private.'
+        : 'Where AppSandbox.exe and the guest components are.');
+    document.getElementById('set-folder-app-btn').disabled = !!info.packaged;
+
+    setText('about-version', 'Version ' + formatVersion(info.appVersion) +
+        (info.packaged ? ' \u00b7 Microsoft Store' : ''));
+    var project = info.projectRepo || '', upstream = info.upstreamRepo || '';
+    setText('about-license', project && upstream && project.toLowerCase() !== upstream.toLowerCase()
+        ? 'MIT License. ' + project + ' is a fork of ' + upstream + ' by James Stringer.'
+        : 'MIT License, by James Stringer and contributors.');
+    setText('about-project', project ? 'github.com/' + project : 'Source code, releases and documentation.');
 }
 
 /* Sidebar resource meters. */
@@ -1987,13 +2275,14 @@ document.getElementById('edit-ram-size').addEventListener('change', function() {
     updateEditVmModal();
 });
 
-['edit-vm-overlay', 'snapshot-overlay'].forEach(function(id) {
+['edit-vm-overlay', 'snapshot-overlay', 'document-overlay'].forEach(function(id) {
     var backdropPress = false;
     var overlay = document.getElementById(id);
     overlay.addEventListener('mousedown', function(e) { backdropPress = e.target === overlay; });
     overlay.addEventListener('click', function(e) {
         if (backdropPress && e.target === overlay) {
             if (id === 'edit-vm-overlay') closeEditVmModal();
+            else if (id === 'document-overlay') closeDocument();
             else closeSnapshotModal();
         }
         backdropPress = false;
@@ -2007,17 +2296,17 @@ function onStopVm(idx) {
     if (!vm) return;
     if (vm.isTemplate) {
         showModal(
-            'Cancel Template Build',
-            'Stopping a template build will delete the incomplete template "' + vm.name + '".\n\nAre you sure?',
-            'Stop & Delete'
+            'Cancel the template build?',
+            'Stopping a template build deletes the incomplete template "' + vm.name + '".',
+            'Stop and delete'
         ).then(function(confirmed) {
-            if (confirmed) {
-                sendCmd('stopVm', { vmId: vm.id });
-                sendCmd('deleteVm', { vmId: vm.id });
-            }
+            if (!confirmed) return;
+            /* The Windows host turns a running VM off as part of deleting it. */
+            if (hostBridge.isMac) sendCmd('stopVm', { vmId: vm.id });
+            sendCmd('deleteVm', { vmId: vm.id });
         });
     } else {
-        if (localStorage.getItem('suppress_force_stop_warn') === '1') {
+        if (storedPref('suppress_force_stop_warn', '') === '1') {
             sendCmd('stopVm', { vmId: vm.id });
         } else {
             showForceStopModal(idx);
@@ -2028,22 +2317,14 @@ function onStopVm(idx) {
 function showForceStopModal(idx) {
     var vm = vms[idx];
     if (!vm) return;
-    document.getElementById('modal-title').textContent = 'Force Stop';
-    document.getElementById('modal-message').textContent =
-        'Force Stop will immediately power-off "' + vms[idx].name + '" which may result in corruption of its data.';
-    document.getElementById('modal-confirm-btn').textContent = 'Force Stop';
-
-    var cb = document.getElementById('modal-dont-show');
-    if (cb) { cb.checked = false; cb.parentElement.style.display = ''; }
-
-    document.getElementById('modal-overlay').classList.add('active');
-    pendingConfirm = { resolve: function(confirmed) {
-        if (confirmed) {
-            if (cb && cb.checked) localStorage.setItem('suppress_force_stop_warn', '1');
-            sendCmd('stopVm', { vmId: vm.id });
-        }
-        if (cb) cb.parentElement.style.display = 'none';
-    }};
+    showModal('Force stop?',
+        'Force stop turns "' + vm.name + '" off at once, like pulling the plug. Unsaved work in it is lost and its disk can be damaged. Use Shut down when you can.',
+        'Force stop', { dontShowAgain: true }
+    ).then(function(result) {
+        if (!result) return;
+        if (result.dontShowAgain) storePref('suppress_force_stop_warn', '1');
+        sendCmd('stopVm', { vmId: vm.id });
+    });
 }
 
 /* ---- Delete VM ---- */
@@ -2052,14 +2333,23 @@ function onDeleteVm(idx) {
     var vm = vms[idx];
     if (!vm) return;
     showModal(
-        'Confirm Delete',
-        'Are you sure you want to delete VM "' + vm.name + '"?\n\nThis will permanently delete all disk data and snapshots.',
+        'Delete VM?',
+        'Delete "' + vm.name + '" with its disk and snapshots? This cannot be undone.' +
+            (vm.running && !hostBridge.isMac ? '\n\nThe VM is running; it is turned off first.' : ''),
         'Delete'
     ).then(function(confirmed) {
         if (confirmed) {
             sendCmd('deleteVm', { vmId: vm.id });
         }
     });
+}
+
+function dismissVmError(id) {
+    var vm = vms[vmIndexById(id)];
+    if (!vm) return;
+    vm.lastError = '';
+    sendCmd('dismissVmError', { vmId: id });
+    renderVmTable();
 }
 
 /* ---- Snapshots ---- */
@@ -2262,9 +2552,9 @@ function snapshotActionIndex(context) {
 function takeSnapshot() {
     var context = snapshotActionContext();
     if (!context) return;
-    showModal('New Snapshot', 'Freeze the current disk as a new snapshot; the VM continues on a new branch of it. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
+    showModal('New snapshot', 'Freeze the current disk as a new snapshot; the VM continues on a new branch of it. Snapshots are frozen points in time that you can create independent branches from.', 'Create', {
         confirmClass: 'primary',
-        input: { label: 'Snapshot name:', value: 'Snapshot ' + ((context.vm.snapshots || []).length + 1) }
+        input: { label: 'Snapshot name', value: 'Snapshot ' + ((context.vm.snapshots || []).length + 1) }
     }).then(function(result) {
         if (result === false) return;
         var idx = snapshotActionIndex(context);
@@ -2280,7 +2570,7 @@ function renameSnapshot() {
     if (!target) return;
     showModal('Rename', 'Enter a new name:', 'Rename', {
         confirmClass: 'primary',
-        input: { label: 'Name:', value: target.name || '' }
+        input: { label: 'Name', value: target.name || '' }
     }).then(function(result) {
         if (result === false || result === target.name) return;
         var idx = snapshotActionIndex(context);
@@ -2302,12 +2592,12 @@ function deleteSnapshot() {
             return snapshotParent(snap) === p.snapIndex;
         });
         if (child) {
-            showModal('Cannot Delete Snapshot', 'Snapshot "' + child.name + '" was taken on "' + target.name +
-                '" and depends on its disk. Delete "' + child.name + '" first.', 'OK', { confirmClass: 'primary' });
+            showModal('Snapshot in use', 'Snapshot "' + child.name + '" was taken on "' + target.name +
+                '" and depends on its disk. Delete "' + child.name + '" first.', 'OK', { alert: true, confirmClass: 'primary' });
             return;
         }
     }
-    showModal(p.branch ? 'Delete Branch' : 'Delete Snapshot',
+    showModal(p.branch ? 'Delete branch?' : 'Delete snapshot?',
         p.branch ? 'Delete branch "' + (target.name || '') + '"? Its parent disk will be kept.'
             : 'Delete snapshot "' + target.name + '" and all its branches?', 'Delete'
     ).then(function(confirmed) {
@@ -2331,15 +2621,15 @@ function onStartVm(idx) {
         var now = new Date();
         var pad = function(n) { return n < 10 ? '0' + n : '' + n; };
         var defaultName = now.getFullYear() + '-' + pad(now.getMonth()+1) + '-' + pad(now.getDate()) + ' ' + pad(now.getHours()) + ':' + pad(now.getMinutes()) + ':' + pad(now.getSeconds());
-        showModal('New Branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
-            confirmClass: 'primary', input: { label: 'Branch name:', value: defaultName }
+        showModal('New branch', 'A new branch will be created from ' + parentName + '. Branches are independent working copies \u2014 changes in one branch don\u2019t affect others or modify the base snapshot.', 'Boot', {
+            confirmClass: 'primary', input: { label: 'Branch name', value: defaultName }
         }).then(function(result) {
             if (result === false) return;
             var currentIdx = vmIndexById(id);
             var current = vms[currentIdx];
             if (!current || current.running || current.buildingVhdx) return;
             if (tree !== snapshotTreeSignature(current)) {
-                showModal('Snapshots Changed', 'Select the disk again before starting the VM.', 'OK', { confirmClass: 'primary' });
+                showModal('Snapshots changed', 'Select the disk again before starting the VM.', 'OK', { alert: true, confirmClass: 'primary' });
                 return;
             }
             selectedSnap.delete(id);
@@ -2352,44 +2642,236 @@ function onStartVm(idx) {
 
 /* ---- Log ---- */
 
+/* The panel keeps the newest lines only (appsandbox.log has them all), and
+   follows new lines only while it is scrolled to the bottom. */
+const LOG_MAX_LINES = 1000;
+
+function logLineIsError(msg) {
+    return /^\s*error\b/i.test(msg) || /\bfailed\b/i.test(msg);
+}
+
 function appendLog(msg) {
     var panel = document.getElementById('log-panel');
+    var atBottom = panel.scrollHeight - panel.scrollTop - panel.clientHeight < 24;
     var div = document.createElement('div');
-    div.className = 'log-line';
+    div.className = 'log-line' + (logLineIsError(msg) ? ' log-error' : '');
     div.textContent = msg;
     panel.appendChild(div);
+    while (panel.childElementCount > LOG_MAX_LINES) panel.removeChild(panel.firstChild);
     document.getElementById('log-last').textContent = msg;
-    panel.scrollTop = panel.scrollHeight;
+    if (atBottom) panel.scrollTop = panel.scrollHeight;
+}
+
+function clearLog() {
+    document.getElementById('log-panel').textContent = '';
+    document.getElementById('log-last').textContent = '';
+}
+
+function copyText(text) {
+    if (navigator.clipboard && navigator.clipboard.writeText)
+        return navigator.clipboard.writeText(text);
+    return new Promise(function(resolve, reject) {
+        var area = document.createElement('textarea');
+        area.value = text;
+        area.style.position = 'fixed';
+        area.style.opacity = '0';
+        document.body.appendChild(area);
+        area.select();
+        var ok = false;
+        try { ok = document.execCommand('copy'); } catch (e) {}
+        document.body.removeChild(area);
+        if (ok) resolve(); else reject();
+    });
+}
+
+function copyLog() {
+    var lines = Array.prototype.map.call(document.getElementById('log-panel').children,
+        function(d) { return d.textContent; });
+    copyText(lines.join('\n')).then(function() {
+        showToast('info', 'Activity copied (' + lines.length + ' lines).');
+    }, function() {
+        showToast('error', 'Activity could not be copied.');
+    });
+}
+
+/* ---- Notices (non-blocking) ---- */
+
+/* kind: info | warning | error. Errors stay until dismissed; others go after
+   a few seconds. opts.id reuses one notice (exit progress), opts.sticky has
+   no close button and stays. */
+function showToast(kind, message, opts) {
+    opts = opts || {};
+    var host = document.getElementById('toasts');
+    var t = opts.id ? document.getElementById(opts.id) : null;
+    if (!t) {
+        t = el('div', 'toast');
+        if (opts.id) t.id = opts.id;
+        host.appendChild(t);
+    }
+    t.className = 'toast ' + (kind || 'info');
+    t.setAttribute('role', kind === 'error' ? 'alert' : 'status');
+    t.textContent = '';
+    t.appendChild(el('span', 'toast-text', message || ''));
+    (opts.actions || []).forEach(function(a) {
+        var b = el('button', 'small-btn', a.label);
+        b.type = 'button';
+        b.onclick = a.run;
+        t.appendChild(b);
+    });
+    if (!opts.sticky) {
+        var x = el('button', 'notice-dismiss', '\u00d7');
+        x.type = 'button';
+        x.setAttribute('aria-label', 'Dismiss');
+        x.onclick = function() { if (t.parentNode) t.parentNode.removeChild(t); };
+        t.appendChild(x);
+    }
+    clearTimeout(t._timer);
+    if (!opts.sticky && kind !== 'error')
+        t._timer = setTimeout(function() { if (t.parentNode) t.parentNode.removeChild(t); }, 7000);
+    while (host.children.length > 4) host.removeChild(host.firstChild);
+    return t;
+}
+
+/* Exit after shutting VMs down: progress, and a way to change one's mind. */
+function onExitProgress(msg) {
+    var toast = document.getElementById('toast-exit');
+    if (!msg.active) {
+        exitState = null;
+        if (toast && toast.parentNode) toast.parentNode.removeChild(toast);
+        renderVmTable();
+        return;
+    }
+    var changed = !exitState;
+    exitState = { remaining: msg.remaining, session: !!msg.session };
+    var text = msg.remaining > 0
+        ? 'Shutting down ' + msg.remaining + (msg.remaining === 1 ? ' VM' : ' VMs') +
+          '; App Sandbox exits when ' + (msg.remaining === 1 ? 'it has' : 'they have') + ' stopped.'
+        : 'The VMs have stopped. App Sandbox is exiting\u2026';
+    if (toast) {
+        toast.querySelector('.toast-text').textContent = text;
+    } else {
+        showToast('info', text, { id: 'toast-exit', sticky: true,
+            actions: msg.session ? [] : [{ label: 'Don\u2019t exit', run: function() { sendCmd('cancelExit'); } }] });
+    }
+    if (changed) renderVmTable();
+}
+
+/* ---- Documents (license, third-party notices) ---- */
+
+let documentShown = null;
+
+function showDocument(msg) {
+    var overlay = document.getElementById('document-overlay');
+    documentShown = msg.kind || null;
+    document.getElementById('document-title').textContent = msg.title || 'Document';
+    document.getElementById('document-text').textContent = msg.message || '';
+    if (!overlay.classList.contains('active')) overlay._previousFocus = document.activeElement;
+    overlay.classList.add('active');
+    document.getElementById('document-text').scrollTop = 0;
+    overlay.querySelector('.modal-buttons .primary').focus();
+}
+
+function closeDocument() {
+    var overlay = document.getElementById('document-overlay');
+    if (!overlay.classList.contains('active')) return;
+    overlay.classList.remove('active');
+    if (overlay._previousFocus && overlay._previousFocus.isConnected) overlay._previousFocus.focus();
+    overlay._previousFocus = null;
+}
+
+function openDocumentOnline() {
+    if (documentShown) sendCmd('openLink', { which: documentShown });
 }
 
 /* ---- Prerequisite check ---- */
 
+/* The Virtual Machine Platform dialog. message is fixed text from this file. */
+function setPrereqDialog(html, buttons) {
+    var overlay = document.getElementById('prereq-overlay');
+    var box = document.getElementById('prereq-buttons');
+    document.getElementById('prereq-message').innerHTML = html;
+    box.textContent = '';
+    box.hidden = !buttons.length;
+    buttons.forEach(function(b) {
+        var btn = el('button', b.primary ? 'primary' : '', b.label);
+        btn.type = 'button';
+        btn.addEventListener('click', b.run);
+        box.appendChild(btn);
+    });
+    if (!overlay.classList.contains('active')) {
+        overlay._previousFocus = document.activeElement;
+        overlay.classList.add('active');
+    }
+    var focus = box.querySelector('.primary') || box.querySelector('button');
+    if (focus) focus.focus();
+}
+
+function closePrereqDialog() {
+    var overlay = document.getElementById('prereq-overlay');
+    if (!overlay.classList.contains('active')) return;
+    overlay.classList.remove('active');
+    if (overlay._previousFocus && overlay._previousFocus.isConnected) overlay._previousFocus.focus();
+    overlay._previousFocus = null;
+}
+
+/* The library's empty state while Virtual Machine Platform is off or waits
+   for a restart: say so, instead of offering to create a first VM. */
+function buildPrereqState() {
+    var box = el('div', 'empty-state');
+    box.setAttribute('role', 'status');
+    if (prereqState === 'enabling') {
+        box.appendChild(el('span', 'spinner'));
+        box.appendChild(el('h2', '', 'Turning on Virtual Machine Platform\u2026'));
+        box.appendChild(el('p', 'muted', 'This can take a minute.'));
+        return box;
+    }
+    var btn;
+    if (prereqState === 'reboot') {
+        box.appendChild(el('h2', '', 'Restart Windows to finish setup'));
+        box.appendChild(el('p', 'muted', 'Virtual Machine Platform is on, but Windows must restart before VMs can run. Your VMs appear here afterwards.'));
+        btn = el('button', 'primary', 'Restart now\u2026');
+        btn.onclick = confirmRestart;
+    } else {
+        box.appendChild(el('h2', '', 'Turn on Virtual Machine Platform'));
+        box.appendChild(el('p', 'muted', 'App Sandbox runs VMs with this Windows feature, and it is off on this PC. ' +
+            'VMs you already have, and their disks, are not affected: they appear here once it is on.' +
+            (prereqState === 'failed' ? ' Turning it on from App Sandbox did not work; turn it on in Settings > System > Optional features > More Windows features, then restart Windows.' : '')));
+        btn = el('button', 'primary', 'Turn on\u2026');
+        btn.onclick = onPrereqRequired;
+    }
+    btn.type = 'button';
+    box.appendChild(btn);
+    return box;
+}
+
 function onPrereqRequired() {
-    document.getElementById('prereq-message').innerHTML =
-        'App Sandbox requires the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs. This feature is not currently enabled.';
-    document.getElementById('prereq-buttons').innerHTML =
-        '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Cancel</button>' +
-        '<button class="primary" onclick="enableFeature()">Enable</button>';
-    document.getElementById('prereq-buttons').style.display = '';
-    document.getElementById('prereq-overlay').classList.add('active');
+    setPrereqDialog('<p>App Sandbox needs the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs, and it is not on. ' +
+        'VMs you already have, and their disks, are not affected.</p>', [
+        { label: 'Not now', run: closePrereqDialog },
+        { label: 'Turn on', primary: true, run: enableFeature }
+    ]);
 }
 
 function onPrereqReboot() {
-    document.getElementById('prereq-message').innerHTML =
-        '<strong>Virtual Machine Platform</strong> has been enabled but a reboot is required before VMs can be created or started.';
-    document.getElementById('prereq-buttons').innerHTML =
-        '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Later</button>' +
-        '<button class="primary" onclick="sendCmd(\'enableFeatureReboot\')">Reboot Now</button>';
-    document.getElementById('prereq-buttons').style.display = '';
-    document.getElementById('prereq-overlay').classList.add('active');
+    setPrereqDialog('<p><strong>Virtual Machine Platform</strong> is on, but Windows must restart before VMs can be created or started.</p>', [
+        { label: 'Later', run: closePrereqDialog },
+        { label: 'Restart now\u2026', primary: true, run: confirmRestart }
+    ]);
+}
+
+function confirmRestart() {
+    closePrereqDialog();
+    showModal('Restart Windows now?', 'Save your work in other apps first: Windows restarts right away.',
+        'Restart now', { confirmClass: 'primary' }).then(function(ok) {
+        if (ok) sendCmd('enableFeatureReboot');
+    });
 }
 
 function enableFeature() {
-    document.getElementById('prereq-message').innerHTML =
-        'Enabling <strong>Virtual Machine Platform</strong>. This may take a minute...' +
+    setPrereqState('enabling');
+    setPrereqDialog('<p>Turning on <strong>Virtual Machine Platform</strong>. This can take a minute\u2026</p>' +
         '<div class="prereq-progress"><div class="prereq-progress-bar" id="prereq-bar"></div></div>' +
-        '<div class="prereq-pct" id="prereq-pct">0%</div>';
-    document.getElementById('prereq-buttons').style.display = 'none';
+        '<div class="prereq-pct" id="prereq-pct">0%</div>', []);
     sendCmd('enableFeature');
 }
 
@@ -2402,43 +2884,67 @@ function onPrereqProgress(msg) {
 
 function onPrereqResult(msg) {
     if (msg.ok && !msg.reboot) {
-        document.getElementById('prereq-overlay').classList.remove('active');
+        closePrereqDialog();
+        setPrereqState(null);
     } else if (msg.ok && msg.reboot) {
-        document.getElementById('prereq-message').innerHTML =
-            '<strong>Virtual Machine Platform</strong> has been enabled. A reboot is required for the change to take effect.';
-        document.getElementById('prereq-buttons').innerHTML =
-            '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Later</button>' +
-            '<button class="primary" onclick="sendCmd(\'enableFeatureReboot\')">Reboot Now</button>';
-        document.getElementById('prereq-buttons').style.display = '';
+        setPrereqState('reboot');
+        setPrereqDialog('<p><strong>Virtual Machine Platform</strong> is on. Windows must restart for the change to take effect.</p>', [
+            { label: 'Later', run: closePrereqDialog },
+            { label: 'Restart now\u2026', primary: true, run: confirmRestart }
+        ]);
     } else {
-        document.getElementById('prereq-message').innerHTML =
-            'Failed to enable <strong>Virtual Machine Platform</strong>.<br><br>' +
-            'Try enabling it manually:<br>' +
-            'Settings &gt; System &gt; Optional Features &gt; More Windows Features &gt; Virtual Machine Platform';
-        document.getElementById('prereq-buttons').innerHTML =
-            '<button onclick="document.getElementById(\'prereq-overlay\').classList.remove(\'active\')">Close</button>';
-        document.getElementById('prereq-buttons').style.display = '';
+        setPrereqState('failed');
+        setPrereqDialog('<p><strong>Virtual Machine Platform</strong> could not be turned on.</p>' +
+            '<p>Turn it on yourself: Settings &gt; System &gt; Optional features &gt; More Windows features &gt; Virtual Machine Platform, then restart Windows.</p>', [
+            { label: 'Close', primary: true, run: closePrereqDialog }
+        ]);
     }
 }
 
 /* ---- Modal ---- */
 
+/* Alerts from the host wait while another dialog is open, instead of
+   replacing it (its answer would be lost). */
+let alertQueue = [];
+
+function showAlert(msg) {
+    var kind = msg.kind || 'error';
+    var title = msg.title || (kind === 'error' ? 'Something went wrong'
+        : kind === 'warning' ? 'Check this first' : 'App Sandbox');
+    if (pendingConfirm || document.getElementById('modal-overlay').classList.contains('active')) {
+        alertQueue.push({ title: title, message: msg.message || '' });
+        return;
+    }
+    showModal(title, msg.message || '', 'OK', { alert: true, confirmClass: 'primary' });
+}
+
+function showNextAlert() {
+    if (!alertQueue.length || pendingConfirm) return;
+    var next = alertQueue.shift();
+    showModal(next.title, next.message, 'OK', { alert: true, confirmClass: 'primary' });
+}
+
+/* One dialog for confirmations, questions with a text field and alerts.
+   opts: confirmClass, alert (only an OK button), input {label, value},
+   dontShowAgain (resolves {dontShowAgain} when confirmed). */
 function showModal(title, message, confirmText, opts) {
-    var previousFocus = document.activeElement;
+    opts = opts || {};
+    var previousFocus = pendingConfirm ? pendingConfirm.previousFocus : document.activeElement;
     document.getElementById('modal-title').textContent = title;
     document.getElementById('modal-message').textContent = message;
     var confirmBtn = document.getElementById('modal-confirm-btn');
     confirmBtn.textContent = confirmText || 'Confirm';
-    confirmBtn.className = (opts && opts.confirmClass) || 'danger';
-    var cb = document.getElementById('modal-dont-show');
-    if (cb) cb.parentElement.style.display = 'none';
+    confirmBtn.className = opts.confirmClass || 'danger';
+    document.getElementById('modal-cancel-btn').hidden = !!opts.alert;
+    document.getElementById('modal-dont-show-row').hidden = !opts.dontShowAgain;
+    document.getElementById('modal-dont-show').checked = false;
     var inputRow = document.getElementById('modal-input-row');
     var inputEl = document.getElementById('modal-input');
-    if (opts && opts.input) {
-        inputRow.style.display = 'block';
+    if (opts.input) {
+        inputRow.hidden = false;
         inputEl.value = opts.input.value || '';
-        if (opts.input.label) document.getElementById('modal-input-label').textContent = opts.input.label;
-        inputEl.onkeydown = function(e) { if (e.key === 'Enter') modalResolve(true); };
+        document.getElementById('modal-input-label').textContent = opts.input.label || 'Name';
+        inputEl.onkeydown = function(e) { if (e.key === 'Enter') { e.preventDefault(); modalResolve(true); } };
         inputEl.oninput = function() {
             /* Strip characters that would break the INI-style .dat file */
             var clean = inputEl.value.replace(/[\n\r\t\[\]\\]/g, '');
@@ -2447,33 +2953,40 @@ function showModal(title, message, confirmText, opts) {
         inputEl.maxLength = 127;
         setTimeout(function() { inputEl.select(); inputEl.focus(); }, 50);
     } else {
-        inputRow.style.display = 'none';
+        inputRow.hidden = true;
+        inputEl.onkeydown = null;
+        inputEl.oninput = null;
     }
     document.getElementById('modal-overlay').classList.add('active');
-    if (!(opts && opts.input)) confirmBtn.focus();
+    if (!opts.input) confirmBtn.focus();
 
     return new Promise(function(resolve) {
-        pendingConfirm = { resolve: resolve, hasInput: !!(opts && opts.input), previousFocus: previousFocus };
+        pendingConfirm = { resolve: resolve, hasInput: !!opts.input, dontShowAgain: !!opts.dontShowAgain,
+                           previousFocus: previousFocus };
     });
 }
 
 function modalResolve(result) {
     document.getElementById('modal-overlay').classList.remove('active');
     if (pendingConfirm) {
-        if (pendingConfirm.previousFocus && pendingConfirm.previousFocus.isConnected) {
-            pendingConfirm.previousFocus.focus();
+        var done = pendingConfirm;
+        pendingConfirm = null;
+        if (done.previousFocus && done.previousFocus.isConnected && !done.previousFocus.disabled) {
+            done.previousFocus.focus();
         } else if (snapshotModal) {
             document.querySelector('#snapshot-overlay .modal-buttons button:last-child').focus();
         } else if (editVmState) {
             document.getElementById('btn-save-edit-vm').focus();
         }
-        if (result && pendingConfirm.hasInput) {
-            pendingConfirm.resolve(document.getElementById('modal-input').value);
+        if (result && done.hasInput) {
+            done.resolve(document.getElementById('modal-input').value);
+        } else if (result && done.dontShowAgain) {
+            done.resolve({ dontShowAgain: document.getElementById('modal-dont-show').checked });
         } else {
-            pendingConfirm.resolve(result);
+            done.resolve(result);
         }
-        pendingConfirm = null;
     }
+    if (alertQueue.length) setTimeout(showNextAlert, 0);
 }
 
 /* ---- Minimum size reporting ---- */

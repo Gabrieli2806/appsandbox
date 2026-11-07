@@ -111,7 +111,22 @@
         <div class="tab-panels">
             <div class="tab-panel" data-panel="overview">
                 <h2 class="panel-title">Overview</h2>
+                <div id="vmd-error" class="notice error" role="alert" hidden>
+                    <span id="vmd-error-text"></span>
+                    <button type="button" class="notice-dismiss" aria-label="Dismiss" onclick="dismissVmError(detailVmId)">&times;</button>
+                </div>
                 <div class="card rows" id="vmd-overview"></div>
+                <div class="card win-only" id="vmd-files-card">
+                    <div class="card-head">
+                        <h3>Files</h3>
+                        <p class="muted">The VM's disk, snapshots, display settings and icon.</p>
+                        <span class="path-value" id="vmd-folder"></span>
+                    </div>
+                    <div class="action-row">
+                        <button type="button" onclick="sendCmd('openVmFolder', { vmId: detailVmId })">Open VM folder</button>
+                        <button type="button" onclick="sendCmd('copyVmPath', { vmId: detailVmId })">Copy path</button>
+                    </div>
+                </div>
                 <div class="card win-only" id="vmd-tools-card">
                     <div class="card-head">
                         <h3>Guest components</h3>
@@ -224,11 +239,11 @@
     <h2 class="group-title win-only">Behavior</h2>
     <div class="card rows win-only">
         <div class="row">
-            <div class="row-text"><span class="row-label">When closing the window with VMs running</span><span class="muted small">VMs keep running in the tray. Open App Sandbox again to bring the window back.</span></div>
+            <div class="row-text"><span class="row-label">When closing the window with VMs running</span><span class="muted small">Ask: choose between keeping the VMs running in the tray and shutting them down to exit. Keep running: the window closes and the VMs keep running; open App Sandbox again to bring it back. Exit from the tray icon always asks.</span></div>
             <label class="sr-only" for="set-close">When closing the window</label>
             <select id="set-close" onchange="setCloseBehavior(this.value)">
                 <option value="ask">Ask every time</option>
-                <option value="tray">Minimize to the tray</option>
+                <option value="tray">Keep running in the tray</option>
             </select>
         </div>
     </div>
@@ -259,6 +274,51 @@
     </div>
     <h2 class="group-title">This computer</h2>
     <div class="card rows" id="set-host"></div>
+    <h2 class="group-title win-only">Folders and logs</h2>
+    <div class="card rows win-only" id="set-folders">
+        <div class="row" id="set-folder-vms">
+            <div class="row-text"><span class="row-label" id="set-folder-vms-label">Default VM folder</span><span class="muted small" id="set-folder-vms-help">New VMs are created here unless you choose another disk location in New VM.</span><span class="path-value" id="set-folder-vms-path"></span></div>
+            <button type="button" onclick="sendCmd('openFolder', { which: 'vms' })">Open</button>
+        </div>
+        <div class="row" id="set-folder-data">
+            <div class="row-text"><span class="row-label">App Sandbox data</span><span class="muted small">Settings (vms.cfg), the local API's token, headless.log and caches.</span><span class="path-value" id="set-folder-data-path"></span></div>
+            <button type="button" onclick="sendCmd('openFolder', { which: 'data' })">Open</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Activity log</span><span class="muted small">appsandbox.log: everything shown under Activity, kept between sessions.</span><span class="path-value" id="set-folder-log-path"></span></div>
+            <button type="button" onclick="sendCmd('openFolder', { which: 'log' })">Show in folder</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">App folder</span><span class="muted small" id="set-folder-app-help">Where AppSandbox.exe and the guest components are.</span><span class="path-value" id="set-folder-app-path"></span></div>
+            <button type="button" id="set-folder-app-btn" onclick="sendCmd('openFolder', { which: 'app' })">Show in folder</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Diagnostic info</span><span class="muted small">App version, Windows build, GPUs, Hyper-V platform status and the state of your VMs, for bug reports. No passwords or account names.</span></div>
+            <button type="button" onclick="sendCmd('copyDiagnostics')">Copy</button>
+        </div>
+    </div>
+    <h2 class="group-title win-only">About</h2>
+    <div class="card rows win-only" id="set-about">
+        <div class="row">
+            <div class="row-text"><span class="row-label">App Sandbox</span><span class="muted small" id="about-version">Version</span></div>
+            <button type="button" onclick="sendCmd('openLink', { which: 'releases' })">Releases</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">License</span><span class="muted small" id="about-license">MIT License. Based on App Sandbox by James Stringer.</span></div>
+            <button type="button" onclick="sendCmd('showDocument', { which: 'license' })">View</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Third-party notices</span><span class="muted small">Components from other projects and their licenses.</span></div>
+            <button type="button" onclick="sendCmd('showDocument', { which: 'notices' })">View</button>
+        </div>
+        <div class="row">
+            <div class="row-text"><span class="row-label">Project page</span><span class="muted small" id="about-project">Source code, releases and documentation.</span></div>
+            <div class="action-row">
+                <button type="button" onclick="sendCmd('openLink', { which: 'issues' })">Report a problem</button>
+                <button type="button" onclick="sendCmd('openLink', { which: 'project' })">Open</button>
+            </div>
+        </div>
+    </div>
 </section>
 
 <!-- Activity log -->
@@ -270,31 +330,23 @@
         Activity
     </button>
     <span id="log-last" class="log-last"></span>
-    <div id="log-panel"></div>
+    <span class="activity-tools">
+        <button type="button" class="small-btn" onclick="copyLog()">Copy</button>
+        <button type="button" class="small-btn" onclick="clearLog()">Clear</button>
+    </span>
+    <div id="log-panel" role="log" aria-label="Activity log"></div>
 </section>
 
 </main>
 </div>
 
-<!-- Prerequisite modal -->
-<div class="modal-overlay" id="prereq-overlay">
-    <div class="modal">
-        <h3>Virtual Machine Platform Required</h3>
-        <p id="prereq-message">App Sandbox requires the <strong>Virtual Machine Platform</strong> Windows feature to create and run VMs. This feature is not currently enabled.</p>
-        <div class="modal-buttons" id="prereq-buttons">
-            <button onclick="document.getElementById('prereq-overlay').classList.remove('active')">Cancel</button>
-            <button class="primary" onclick="enableFeature()">Enable</button>
-        </div>
-    </div>
-</div>
-
-<!-- Create Sandbox modal -->
+<!-- Create VM modal -->
 <div class="modal-overlay" id="create-vm-overlay">
-    <div class="modal wide">
-        <h3>New Sandbox</h3>
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="create-vm-title">
+        <h3 id="create-vm-title">New VM</h3>
         <div class="modal-form-body">
         <div class="form-grid">
-            <label for="os-type">OS Type:</label>
+            <label for="os-type">Operating system</label>
             <div class="form-row">
                 <select id="os-type" onchange="applyOsTypeUI()">
                     <option value="Windows" selected>Windows</option>
@@ -304,26 +356,26 @@
                 </select>
             </div>
 
-            <label for="vm-name">VM Name:</label>
+            <label for="vm-name">VM name</label>
             <div class="form-row">
-                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" autocorrect="off" autocapitalize="off" spellcheck="false">
-                <span class="field-warn" id="vm-name-warn"></span>
+                <input type="text" id="vm-name" value="MyAppSandbox" class="input-md" aria-describedby="vm-name-warn" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <span class="field-warn" id="vm-name-warn" aria-live="polite"></span>
             </div>
 
-            <label class="needs-iso">OS Image:</label>
+            <label class="needs-iso" for="image-path">Installer image</label>
             <div class="image-row needs-iso">
-                <input type="text" id="image-path" placeholder="Path to ISO..." autocorrect="off" autocapitalize="off" spellcheck="false">
-                <button id="btn-browse" onclick="sendCmd('browseImage')">Browse...</button>
-                <span class="or-separator templates-supported">OR</span>
-                <label class="templates-supported" style="text-align:left">Template:</label>
+                <input type="text" id="image-path" placeholder="Path to ISO&hellip;" autocorrect="off" autocapitalize="off" spellcheck="false">
+                <button type="button" id="btn-browse" onclick="sendCmd('browseImage')">Browse&hellip;</button>
+                <span class="or-separator templates-supported">or</span>
+                <label class="templates-supported" for="template-dropdown-selected" style="text-align:left">Template</label>
                 <div class="template-dropdown templates-supported" id="template-dropdown">
-                    <div class="template-dropdown-selected" id="template-dropdown-selected">(None)</div>
-                    <div class="template-dropdown-list" id="template-dropdown-list"></div>
+                    <button type="button" class="template-dropdown-selected" id="template-dropdown-selected" aria-haspopup="listbox" aria-expanded="false" aria-controls="template-dropdown-list">(None)</button>
+                    <div class="template-dropdown-list" id="template-dropdown-list" role="listbox" aria-label="Templates"></div>
                     <input type="hidden" id="template-select" value="">
                 </div>
             </div>
 
-            <label class="needs-linux-version">Distribution:</label>
+            <label class="needs-linux-version" for="linux-version">Distribution</label>
             <div class="form-row needs-linux-version">
                 <select id="linux-version">
                     <option value="ubuntu-26.04" selected>Ubuntu 26.04 LTS</option>
@@ -331,26 +383,26 @@
                 <span class="host-info">Downloaded on first create (~600 MB), cached on the host</span>
             </div>
 
-            <label for="hdd-size">HDD Size:</label>
+            <label for="hdd-size">Disk size</label>
             <div class="form-row">
                 <input type="number" id="hdd-size" value="64" min="1" class="input-sm"> GB
-                <button id="btn-disk-location" class="disk-location-btn" aria-haspopup="dialog" title="HDD Location" onclick="openDiskLocationModal()">HDD location...</button>
+                <button type="button" id="btn-disk-location" class="disk-location-btn" aria-haspopup="dialog" title="Disk location" onclick="openDiskLocationModal()">Disk location&hellip;</button>
                 <span class="host-info" id="host-hdd"></span>
             </div>
 
-            <label for="ram-size">RAM Size:</label>
+            <label for="ram-size">Memory</label>
             <div class="form-row">
                 <input type="number" id="ram-size" value="16384" min="512" step="2" class="input-sm"> MB
                 <span class="host-info" id="host-ram"></span>
             </div>
 
-            <label for="cpu-cores">CPU Cores:</label>
+            <label for="cpu-cores">Processors</label>
             <div class="form-row">
                 <input type="number" id="cpu-cores" value="8" min="1" class="input-sm">
                 <span class="host-info" id="host-cpu"></span>
             </div>
 
-            <label for="gpu-mode" class="needs-agent">GPU:</label>
+            <label for="gpu-mode" class="needs-agent">GPU</label>
             <div class="form-row needs-agent">
                 <select id="gpu-mode">
                     <option value="0">None</option>
@@ -358,7 +410,7 @@
                 </select>
             </div>
 
-            <label for="net-mode" class="windows-host-only">Network:</label>
+            <label for="net-mode" class="windows-host-only">Network</label>
             <div class="form-row windows-host-only">
                 <select id="net-mode" onchange="onNetModeChange()">
                     <option value="0">None</option>
@@ -366,59 +418,64 @@
                     <option value="2">External</option>
                     <option value="3">Internal</option>
                 </select>
-                <label id="net-adapter-label" style="text-align:left">Adapter:</label>
+                <label id="net-adapter-label" for="net-adapter" style="text-align:left">Adapter</label>
                 <select id="net-adapter"></select>
             </div>
 
-            <label class="needs-agent">Username:</label>
+            <label class="needs-agent" for="admin-user">Username</label>
             <div class="cred-row needs-agent">
-                <input type="text" id="admin-user" value="user" class="input-md" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" required>
-                <span class="field-warn" id="admin-user-warn"></span>
+                <input type="text" id="admin-user" value="user" class="input-md" aria-describedby="admin-user-warn" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" required>
+                <span class="field-warn" id="admin-user-warn" aria-live="polite"></span>
             </div>
 
-            <label class="needs-agent">Password:</label>
+            <label class="needs-agent" for="admin-pass">Password</label>
             <div class="cred-row needs-agent">
-                <input type="password" id="admin-pass" value="test123" required>
-                <label>Confirm:</label>
-                <input type="password" id="admin-confirm" value="test123" required>
-                <span class="toggle-pass" onmousedown="showPassword()" onmouseup="hidePassword()" onmouseleave="hidePassword()">&#x1F441;</span>
-                <span class="field-warn" id="admin-pass-warn"></span>
+                <input type="password" id="admin-pass" value="" placeholder="Choose a password" autocomplete="new-password" aria-describedby="admin-pass-warn create-pass-help" required>
+                <label for="admin-confirm">Confirm</label>
+                <input type="password" id="admin-confirm" value="" placeholder="Type it again" autocomplete="new-password" aria-describedby="admin-pass-warn" required>
+                <button type="button" class="toggle-pass" id="toggle-pass" aria-pressed="false" aria-label="Show password" title="Show password" onclick="togglePasswordVisibility()">
+                    <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.6-7 10-7 10 7 10 7-3.6 7-10 7S2 12 2 12z"></path><circle cx="12" cy="12" r="3"></circle></svg>
+                </button>
+                <span class="field-warn" id="admin-pass-warn" aria-live="polite"></span>
             </div>
+            <span class="needs-agent"></span>
+            <p class="muted small needs-agent form-help" id="create-pass-help">The administrator account in the VM. You sign in with it, and SSH uses it when you turn SSH on.</p>
 
-            <label class="needs-agent">Options:</label>
+            <span class="needs-agent form-label">Options</span>
             <div class="form-row needs-agent">
-                <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test Mode</label>
-                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH Server</label>
-                <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH Server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
+                <label class="needs-windows" title="Disable Secure Boot and enable test-signing (required to load the test-signed guest drivers)"><input type="checkbox" id="test-mode"> Test mode</label>
+                <label title="Exposes the VM's sshd on a host-loopback port, tunnelled over vsock"><input type="checkbox" id="ssh-enabled" onchange="onSshToggle()"> SSH server</label>
+                <label title="Deploy the AppSandbox SSH public key so you can connect with key auth (requires SSH server)"><input type="checkbox" id="ssh-deploy-key" disabled> Deploy SSH key</label>
             </div>
-            <p class="muted small manual-note" id="manual-note" hidden>Manual install: App Sandbox boots the ISO into an empty disk and opens the VM's console; you install the OS yourself. There is no GPU acceleration, shared clipboard, audio or adaptive resolution (those need App Sandbox's guest components). Secure Boot is off. With NAT, set the IP address shown in the VM's details by hand; Internal or External networking hands out addresses automatically. When the OS is installed, shut the VM down and choose "Remove installer ISO".</p>
+            <p class="muted small manual-note" id="manual-note" hidden>Manual install: App Sandbox boots the ISO into an empty disk and opens the VM's console; you install the OS yourself. There is no GPU acceleration, shared clipboard, audio or adaptive resolution (those need App Sandbox's guest components). Secure Boot is off. With NAT, set the IP address shown in the VM's Overview by hand; Internal or External networking hands out addresses automatically. When the OS is installed, shut the VM down and choose "Remove installer ISO".</p>
         </div>
         </div>
+        <p id="create-hint" class="form-hint" aria-live="polite"></p>
         <div class="modal-buttons">
-            <button onclick="closeCreateModal()">Cancel</button>
-            <button id="btn-create-template" class="templates-supported" disabled onclick="onCreateTemplate()">Build Template</button>
-            <button id="btn-create" class="primary" disabled onclick="onCreateVm()">Create Sandbox</button>
+            <button type="button" onclick="closeCreateModal()">Cancel</button>
+            <button type="button" id="btn-create-template" class="templates-supported" disabled onclick="onCreateTemplate()">Build template</button>
+            <button type="button" id="btn-create" class="primary" disabled onclick="onCreateVm()">Create VM</button>
         </div>
     </div>
 </div>
 
-<!-- HDD location modal -->
+<!-- Disk location modal -->
 <div class="modal-overlay" id="disk-location-overlay">
     <div class="modal" role="dialog" aria-modal="true" aria-labelledby="disk-location-title">
-        <h3 id="disk-location-title">HDD Location</h3>
+        <h3 id="disk-location-title">Disk location</h3>
         <p id="disk-directory-help">Choose an existing folder. Disks are stored in a subfolder named after the VM.</p>
         <div class="disk-directory-field">
-            <label for="disk-directory" class="disk-directory-label">Folder:</label>
+            <label for="disk-directory" class="disk-directory-label">Folder</label>
             <div class="disk-directory-row">
                 <input type="text" id="disk-directory" aria-describedby="disk-directory-help disk-directory-warn" autocorrect="off" autocapitalize="off" spellcheck="false">
-                <button id="btn-browse-disk-directory" onclick="sendCmd('browseDiskDirectory', { path: document.getElementById('disk-directory').value.trim() })">Browse...</button>
+                <button type="button" id="btn-browse-disk-directory" onclick="sendCmd('browseDiskDirectory', { path: document.getElementById('disk-directory').value.trim() })">Browse&hellip;</button>
             </div>
             <span id="disk-directory-warn" class="field-warn" aria-live="polite"></span>
             <span id="disk-location-space" class="host-info" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">
-            <button onclick="closeDiskLocationModal(false)">Cancel</button>
-            <button id="btn-save-disk-location" class="primary" onclick="closeDiskLocationModal(true)">Save</button>
+            <button type="button" onclick="closeDiskLocationModal(false)">Cancel</button>
+            <button type="button" id="btn-save-disk-location" class="primary" onclick="closeDiskLocationModal(true)">Save</button>
         </div>
     </div>
 </div>
@@ -428,19 +485,19 @@
         <h3 id="edit-vm-title">Edit</h3>
         <div class="modal-form-body">
             <div class="form-grid">
-                <label for="edit-ram-size">RAM Size:</label>
+                <label for="edit-ram-size">Memory</label>
                 <div class="form-row">
                     <input type="number" id="edit-ram-size" min="512" step="2" class="input-sm" aria-describedby="edit-vm-warn"> MB
                     <span class="host-info" id="edit-host-ram"></span>
                 </div>
 
-                <label for="edit-cpu-cores">CPU Cores:</label>
+                <label for="edit-cpu-cores">Processors</label>
                 <div class="form-row">
                     <input type="number" id="edit-cpu-cores" min="1" class="input-sm" aria-describedby="edit-vm-warn">
                     <span class="host-info" id="edit-host-cpu"></span>
                 </div>
 
-                <label for="edit-gpu-mode" class="win-only">GPU:</label>
+                <label for="edit-gpu-mode" class="win-only">GPU</label>
                 <div class="form-row win-only">
                     <select id="edit-gpu-mode">
                         <option value="0">None</option>
@@ -448,7 +505,7 @@
                     </select>
                 </div>
 
-                <label for="edit-net-mode" class="win-only">Network:</label>
+                <label for="edit-net-mode" class="win-only">Network</label>
                 <div class="form-row win-only">
                     <select id="edit-net-mode">
                         <option value="0">None</option>
@@ -461,8 +518,8 @@
             <span id="edit-vm-warn" class="field-warn" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">
-            <button onclick="closeEditVmModal()">Cancel</button>
-            <button id="btn-save-edit-vm" class="primary" onclick="saveEditVm()">Save</button>
+            <button type="button" onclick="closeEditVmModal()">Cancel</button>
+            <button type="button" id="btn-save-edit-vm" class="primary" onclick="saveEditVm()">Save</button>
         </div>
     </div>
 </div>
@@ -477,32 +534,58 @@
             <span id="snapshot-warn" class="field-warn" aria-live="polite"></span>
         </div>
         <div class="modal-buttons">
-            <button id="btn-snapshot-create" class="primary" onclick="takeSnapshot()">New Snapshot</button>
-            <button id="btn-snapshot-rename" onclick="renameSnapshot()">Rename</button>
-            <button id="btn-snapshot-delete" class="danger" onclick="deleteSnapshot()">Delete</button>
-            <button onclick="closeSnapshotModal()">Close</button>
+            <button type="button" id="btn-snapshot-create" class="primary" onclick="takeSnapshot()">New snapshot</button>
+            <button type="button" id="btn-snapshot-rename" onclick="renameSnapshot()">Rename</button>
+            <button type="button" id="btn-snapshot-delete" class="danger" onclick="deleteSnapshot()">Delete</button>
+            <button type="button" onclick="closeSnapshotModal()">Close</button>
         </div>
     </div>
 </div>
 
-<!-- Confirm modal -->
-<div class="modal-overlay" id="modal-overlay">
-    <div class="modal">
-        <h3 id="modal-title">Confirm</h3>
-        <p id="modal-message"></p>
-        <label style="display:none; font-size:12px; color:var(--text-dim); cursor:pointer; margin-bottom:8px;">
-            <input type="checkbox" id="modal-dont-show"> Don't show this again
-        </label>
-        <div id="modal-input-row" style="display:none; margin-bottom:12px;">
-            <label style="font-size:12px; color:var(--text-dim);" id="modal-input-label">Name:</label>
-            <input type="text" id="modal-input" style="width:100%; margin-top:4px;" autocorrect="off" autocapitalize="off" spellcheck="false">
+<!-- Document viewer (license, third-party notices) -->
+<div class="modal-overlay" id="document-overlay">
+    <div class="modal wide" role="dialog" aria-modal="true" aria-labelledby="document-title">
+        <h3 id="document-title">Third-party notices</h3>
+        <div class="modal-form-body">
+            <pre id="document-text" class="document-text" tabindex="0"></pre>
         </div>
         <div class="modal-buttons">
-            <button onclick="modalResolve(false)">Cancel</button>
-            <button class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
+            <button type="button" id="document-online" onclick="openDocumentOnline()">Open on GitHub</button>
+            <button type="button" class="primary" onclick="closeDocument()">Close</button>
         </div>
     </div>
 </div>
+
+<!-- Prerequisite modal -->
+<div class="modal-overlay" id="prereq-overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="prereq-title" aria-describedby="prereq-message">
+        <h3 id="prereq-title">Virtual Machine Platform required</h3>
+        <div id="prereq-message" class="prereq-message"></div>
+        <div class="modal-buttons" id="prereq-buttons"></div>
+    </div>
+</div>
+
+<!-- Confirm and message dialog -->
+<div class="modal-overlay" id="modal-overlay">
+    <div class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title" aria-describedby="modal-message">
+        <h3 id="modal-title">Confirm</h3>
+        <p id="modal-message"></p>
+        <label id="modal-dont-show-row" class="modal-check" hidden>
+            <input type="checkbox" id="modal-dont-show"> Don't show this again
+        </label>
+        <div id="modal-input-row" class="modal-input-row" hidden>
+            <label for="modal-input" id="modal-input-label">Name</label>
+            <input type="text" id="modal-input" autocorrect="off" autocapitalize="off" spellcheck="false">
+        </div>
+        <div class="modal-buttons">
+            <button type="button" id="modal-cancel-btn" onclick="modalResolve(false)">Cancel</button>
+            <button type="button" class="danger" onclick="modalResolve(true)" id="modal-confirm-btn">Delete</button>
+        </div>
+    </div>
+</div>
+
+<!-- Notices that do not interrupt (results, refused commands, exit progress) -->
+<div id="toasts" class="toasts" role="status" aria-live="polite"></div>
 
 <script src="app.js"></script>
 </body>

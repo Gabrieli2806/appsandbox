@@ -24,6 +24,7 @@
 #include <commctrl.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>
 #include <limits.h>
 #include <shlobj.h>
 
@@ -33,11 +34,30 @@
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "version.lib")
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "ole32.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #ifndef DWMWA_USE_IMMERSIVE_DARK_MODE
 #define DWMWA_USE_IMMERSIVE_DARK_MODE 20
 #endif
+
+/* Version and source repository, from Directory.Build.props / the CI build
+   (bare tokens, stringized here as asb_core.c and headless.c do). */
+#define UI_STR_(x)    #x
+#define UI_WIDEN_(s)  L ## s
+#define UI_WIDEN(s)   UI_WIDEN_(s)
+#define UI_WSTR(x)    UI_WIDEN(UI_STR_(x))
+#ifndef ASB_VERSION_SHORT
+#define ASB_VERSION_SHORT 0.0.0
+#endif
+#ifdef ASB_SOURCE_REPO
+#define UI_PROJECT_REPO UI_WSTR(ASB_SOURCE_REPO)
+#else
+#define UI_PROJECT_REPO L"jamesstringer90/appsandbox"
+#endif
+#define UI_UPSTREAM_REPO L"jamesstringer90/appsandbox"
 
 /* ---- UI-specific globals ---- */
 
@@ -46,9 +66,15 @@ static HWND g_hwnd_main = NULL;
 static UINT g_show_main_msg;
 static HINSTANCE g_hInstance = NULL;
 
-/* Minimum window size */
-static int g_min_width = 0;
-static int g_min_height = 0;
+/* Minimum client size in CSS pixels (DIPs), reported by the page; converted
+   to physical pixels with the window's current DPI when Windows asks. */
+static int g_min_css_width = 0;
+static int g_min_css_height = 0;
+
+/* Window size at 100% scaling; scaled by the monitor's DPI and limited to
+   90% of its work area. */
+#define UI_DEFAULT_WIDTH  1575
+#define UI_DEFAULT_HEIGHT 900
 
 /* Borderless fullscreen state. */
 static BOOL g_borderless_fullscreen = FALSE;
@@ -81,6 +107,21 @@ static int g_command_depth;
 #define WM_PREREQ_DONE        (WM_APP + 17)
 #define WM_DISK_SPACE         (WM_APP + 19)
 #define WM_CORE_READY         (WM_APP + 20)  /* wp: 1 core started, 0 prerequisites missing */
+#define WM_BG_OP_DONE         (WM_APP + 21)  /* lp: BgOp* finished on the worker thread */
+
+/* Exit sequence: VMs were asked to shut down and the app exits once they
+   have stopped (tray Exit, closing the window, or Windows signing out). */
+#define IDT_EXIT_WAIT          0x4C58
+#define EXIT_WAIT_LIMIT_MS     (120 * 1000)
+static BOOL      g_exit_waiting;
+static BOOL      g_exit_for_session;     /* Windows is signing out, restarting or updating the app */
+static BOOL      g_exit_forced;          /* Force stop was chosen: exit when nothing runs */
+static BOOL      g_exit_block_reason;    /* ShutdownBlockReasonCreate is active */
+static ULONGLONG g_exit_started;
+static UINT64    g_exit_asked[ASB_MAX_VMS];    /* shutdown already requested */
+static int       g_exit_asked_count;
+static UINT64    g_exit_refused[ASB_MAX_VMS];  /* the request was not accepted */
+static int       g_exit_refused_count;
 
 /* Starting the core (prerequisite check, HCS/HCN, GPU enumeration through
    WMI, certificates, loading and re-attaching VMs) takes seconds, so it runs
@@ -103,6 +144,66 @@ static DWORD g_ui_thread_id;
 static BOOL g_is_home_edition = FALSE;
 static BOOL g_prereq_ok = FALSE;
 static BOOL g_prereq_reboot_pending = FALSE;
+
+/* ---- VM operations that wait on HCS ----
+   Force stop, delete and shut down can wait on vmcompute for many seconds.
+   They run on one worker thread so the window keeps responding. While one
+   runs, ui_command_active() is TRUE (the local API answers "busy") and
+   commands that change VMs are refused with a notice; the VM list keeps
+   refreshing. */
+typedef enum {
+    BG_SHUTDOWN = 1,   /* one VM, from its card, detail view or the tray */
+    BG_STOP,           /* force stop one VM */
+    BG_DELETE,         /* delete one VM (turned off first when running) */
+    BG_SHUTDOWN_ALL,   /* exit sequence: ask every listed VM to shut down */
+    BG_STOP_ALL        /* exit sequence: force stop every listed VM */
+} BgOpKind;
+
+typedef struct {
+    BgOpKind kind;
+    int      count;
+    UINT64   ids[ASB_MAX_VMS];
+    wchar_t  names[ASB_MAX_VMS][128];
+    HRESULT  results[ASB_MAX_VMS];
+} BgOp;
+
+static BgOp  *g_bg_op;       /* the operation in progress, owned by the UI thread */
+static HANDLE g_bg_thread;
+
+/* Local API requests that arrived while an operation ran: they wait for it,
+   as they waited while such operations ran on the UI thread. */
+static LPARAM g_deferred_api[8];
+static int    g_deferred_api_count;
+static BOOL   g_destroying;
+
+/* Per-VM message shown on its card and in its detail view (a start that
+   failed, a shutdown that was not accepted, ...). Cleared when the user
+   dismisses it or starts the VM again. */
+typedef struct {
+    UINT64  id;
+    wchar_t text[512];
+} VmNote;
+static VmNote g_vm_notes[ASB_MAX_VMS];
+
+/* Last state seen per VM, to notice a disk build or start that ended
+   without the VM running (the core reports those only in the log). */
+typedef struct {
+    UINT64  id;
+    wchar_t name[128];
+    BOOL    building;
+    BOOL    starting;
+} VmSeen;
+static VmSeen g_vm_seen[ASB_MAX_VMS];
+static int    g_vm_seen_count;
+
+/* Last log line that reads as an error, used as the reason in those messages. */
+static wchar_t   g_last_error_line[600];
+static ULONGLONG g_last_error_tick;
+
+/* While set, alerts raised on the UI thread are collected here instead of
+   being shown (create and start report them inline). */
+static wchar_t *g_alert_capture;
+static size_t   g_alert_capture_cap;
 
 static BOOL detect_home_edition(void)
 {
@@ -129,6 +230,13 @@ static void send_adapters(void);
 static void send_templates(void);
 static void toggle_borderless_fullscreen(HWND hwnd);
 static void on_webview2_accelerator(UINT virtual_key);
+static void ui_show_alert(const wchar_t *message);
+static void ui_alert(const wchar_t *kind, const wchar_t *title, const wchar_t *message);
+static void ui_notice(const wchar_t *kind, const wchar_t *message);
+static void exit_tick(HWND hwnd);
+static void safe_destroy_rdp(int idx);
+static void safe_destroy_idd(int idx);
+static void reconcile_displays(void);
 
 static void toggle_borderless_fullscreen(HWND hwnd)
 {
@@ -208,7 +316,10 @@ static void reconcile_displays(void)
     memcpy(g_display_vm_ids, ids, sizeof(ids));
 }
 
-BOOL ui_command_active(void) { return g_command_depth != 0; }
+/* TRUE while a command runs on the UI thread or a VM operation runs on the
+   worker thread; the local API then answers "busy" (API requests normally
+   wait for a worker operation instead, see WM_ASB_API_REQUEST). */
+BOOL ui_command_active(void) { return g_command_depth != 0 || g_bg_op != NULL; }
 void ui_refresh_from_core(void)
 {
     if (g_hwnd_main && InterlockedCompareExchange(&g_refresh_pending, 1, 0) == 0)
@@ -302,6 +413,48 @@ static DWORD WINAPI disk_space_thread(LPVOID param)
     return 0;
 }
 
+/* "major.minor.patch.build" from this exe's VERSIONINFO (CI stamps the build
+   number there), or the version the sources were compiled with. */
+static const wchar_t *app_version(void)
+{
+    static wchar_t version[64];
+    if (!version[0]) {
+        wchar_t exe[MAX_PATH];
+        DWORD unused = 0, size;
+        if (GetModuleFileNameW(NULL, exe, MAX_PATH) &&
+            (size = GetFileVersionInfoSizeW(exe, &unused)) != 0) {
+            void *data = malloc(size);
+            VS_FIXEDFILEINFO *info = NULL;
+            UINT len = 0;
+            if (data && GetFileVersionInfoW(exe, 0, size, data) &&
+                VerQueryValueW(data, L"\\", (void **)&info, &len) && info && len >= sizeof(*info))
+                swprintf_s(version, ARRAYSIZE(version), L"%u.%u.%u.%u",
+                           HIWORD(info->dwProductVersionMS), LOWORD(info->dwProductVersionMS),
+                           HIWORD(info->dwProductVersionLS), LOWORD(info->dwProductVersionLS));
+            free(data);
+        }
+        if (!version[0]) wcscpy_s(version, ARRAYSIZE(version), UI_WSTR(ASB_VERSION_SHORT));
+    }
+    return version;
+}
+
+/* appsandbox.log is written relative to the current directory (the exe's
+   folder for a zip install, %ProgramData%\AppSandbox for the Microsoft Store
+   version; see main.c). */
+static void log_file_path(wchar_t *out, size_t cap)
+{
+    DWORD n = GetFullPathNameW(L"appsandbox.log", (DWORD)cap, out, NULL);
+    if (!n || n >= cap) out[0] = 0;
+}
+
+static void app_directory(wchar_t *out, size_t cap)
+{
+    wchar_t *slash;
+    if (!GetModuleFileNameW(NULL, out, (DWORD)cap)) { out[0] = 0; return; }
+    slash = wcsrchr(out, L'\\');
+    if (slash) *slash = 0;
+}
+
 static void build_host_info_json(JsonBuilder *jb)
 {
     SYSTEM_INFO si;
@@ -341,6 +494,19 @@ static void build_host_info_json(JsonBuilder *jb)
     jb_bool(jb, L"viewerToolbar", asb_get_viewer_toolbar());
     jb_int(jb, L"viewerRenderer", asb_get_viewer_renderer());
     jb_bool(jb, L"hevcDecoder", vm_display_idd_hevc_supported());
+    {
+        wchar_t path[MAX_PATH];
+        jb_string(jb, L"appVersion", app_version());
+        jb_bool(jb, L"packaged", asb_running_packaged());
+        jb_string(jb, L"projectRepo", UI_PROJECT_REPO);
+        jb_string(jb, L"upstreamRepo", UI_UPSTREAM_REPO);
+        asb_program_data_dir(path, MAX_PATH);
+        jb_string(jb, L"dataDirectory", path);
+        log_file_path(path, MAX_PATH);
+        jb_string(jb, L"logFile", path);
+        app_directory(path, MAX_PATH);
+        jb_string(jb, L"appDirectory", path);
+    }
     jb_array_begin(jb, L"gpus");
     for (i = 0; gpu_list && i < gpu_list->count; i++) {
         if (i > 0) jb_append(jb, L",");
@@ -373,6 +539,76 @@ static void jb_size_gb(JsonBuilder *jb, const wchar_t *key, ULONGLONG bytes)
     else
         swprintf_s(buf, 32, L"%.1f", gb);
     jb_string(jb, key, buf);
+}
+
+/* The VM's own folder: the one holding its disk, or the parent of its
+   "snapshots" folder when it runs from a snapshot branch (as the core's
+   get_vm_disk_root). FALSE for a drive root or an unknown disk path. */
+static BOOL vm_root_folder(const VmInstance *v, wchar_t *out, size_t cap)
+{
+    wchar_t *slash;
+    size_t len;
+    BOOL branch;
+    if (!v || !v->vhdx_path[0] || wcslen(v->vhdx_path) >= cap) return FALSE;
+    wcscpy_s(out, cap, v->vhdx_path);
+    slash = wcsrchr(out, L'\\');
+    if (!slash) return FALSE;
+    branch = _wcsnicmp(slash + 1, L"branch_", 7) == 0 || _wcsnicmp(slash + 1, L"snapshot_", 9) == 0;
+    *slash = 0;
+    len = wcslen(out);
+    if (branch && len >= 10 && _wcsicmp(out + len - 10, L"\\snapshots") == 0)
+        out[len - 10] = 0;
+    return wcslen(out) > 3;
+}
+
+static const wchar_t *vm_note_get(UINT64 id)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; i++)
+        if (id && g_vm_notes[i].id == id) return g_vm_notes[i].text;
+    return NULL;
+}
+
+static void vm_note_clear(UINT64 id)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; i++)
+        if (id && g_vm_notes[i].id == id) ZeroMemory(&g_vm_notes[i], sizeof(g_vm_notes[i]));
+}
+
+static void vm_note_set(UINT64 id, const wchar_t *text)
+{
+    int i, slot = -1;
+    if (!id || !text) return;
+    for (i = 0; i < ASB_MAX_VMS && slot < 0; i++)
+        if (g_vm_notes[i].id == id) slot = i;
+    for (i = 0; i < ASB_MAX_VMS && slot < 0; i++)
+        if (!g_vm_notes[i].id) slot = i;
+    if (slot < 0) {
+        /* Notes of deleted VMs: reuse the slot of one that no longer exists. */
+        for (i = 0; i < ASB_MAX_VMS && slot < 0; i++)
+            if (!asb_find_vm_by_id(g_vm_notes[i].id)) slot = i;
+    }
+    if (slot < 0) slot = 0;
+    g_vm_notes[slot].id = id;
+    wcsncpy_s(g_vm_notes[slot].text, ARRAYSIZE(g_vm_notes[slot].text), text, _TRUNCATE);
+}
+
+/* "stopping" / "deleting" / "shuttingDown" while the worker thread runs that
+   operation for this VM, else NULL. */
+static const wchar_t *vm_pending_op(UINT64 id)
+{
+    int i;
+    if (!g_bg_op) return NULL;
+    for (i = 0; i < g_bg_op->count; i++) {
+        if (g_bg_op->ids[i] != id) continue;
+        switch (g_bg_op->kind) {
+        case BG_STOP: case BG_STOP_ALL: return L"stopping";
+        case BG_DELETE: return L"deleting";
+        default: return L"shuttingDown";
+        }
+    }
+    return NULL;
 }
 
 static void build_vm_json(JsonBuilder *jb, int i)
@@ -417,6 +653,20 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_bool(jb, L"sshKeyDeployed", v->ssh_key_deployed);
     jb_bool(jb, L"copyingDisk", v->copying_disk);
     jb_int(jb, L"copyProgress", (int)v->copy_progress);
+    {
+        wchar_t folder[MAX_PATH], nat_ip[32];
+        const wchar_t *note = vm_note_get(v->unique_id), *pending = vm_pending_op(v->unique_id);
+        int k;
+        jb_string(jb, L"vmFolder", vm_root_folder(v, folder, MAX_PATH) ? folder : L"");
+        /* NAT address (dotted ASCII) for VMs that need it set by hand. */
+        for (k = 0; k < (int)ARRAYSIZE(nat_ip) - 1 && k < (int)sizeof(v->nat_ip) &&
+                    ((v->nat_ip[k] >= '0' && v->nat_ip[k] <= '9') || v->nat_ip[k] == '.'); k++)
+            nat_ip[k] = (wchar_t)v->nat_ip[k];
+        nat_ip[k] = 0;
+        jb_string(jb, L"natIp", v->network_mode == ASB_NET_NAT ? nat_ip : L"");
+        jb_string(jb, L"lastError", note ? note : L"");
+        jb_string(jb, L"pendingOp", pending ? pending : L"");
+    }
 
     /* Display mode (Windows and Linux guests; the IDD window owns the settings file). */
     if (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0) {
@@ -539,12 +789,70 @@ static void build_vm_json(JsonBuilder *jb, int i)
     jb_object_end(jb);
 }
 
+/* " Reason: <last error log line>" when one arrived in the last 30 s. */
+static void recent_error_reason(wchar_t *out, size_t cap)
+{
+    out[0] = 0;
+    if (g_last_error_line[0] && GetTickCount64() - g_last_error_tick < 30000)
+        _snwprintf_s(out, cap, _TRUNCATE, L" Reason: %s", g_last_error_line);
+}
+
+/* A disk build or start that ends without the VM running is reported by the
+   core only in the log, or with an alert that names no VM. Compare with the
+   previous refresh: a VM that stopped instead of starting gets a note on its
+   card; a VM whose disk build removed it gets a message. */
+static void track_vm_transitions(void)
+{
+    VmSeen now[ASB_MAX_VMS];
+    int i, j, n = 0, count = asb_vm_count();
+
+    for (i = 0; i < count && n < ASB_MAX_VMS; i++) {
+        VmInstance *v = asb_vm_instance(asb_vm_get(i));
+        if (!v || !v->unique_id) continue;
+        now[n].id = v->unique_id;
+        wcsncpy_s(now[n].name, ARRAYSIZE(now[n].name), v->name, _TRUNCATE);
+        now[n].building = v->building_vhdx;
+        now[n].starting = v->starting;
+        for (j = 0; j < g_vm_seen_count; j++) {
+            if (g_vm_seen[j].id != v->unique_id) continue;
+            if ((g_vm_seen[j].building || g_vm_seen[j].starting) &&
+                !v->building_vhdx && !v->starting && !v->running &&
+                !v->copying_disk && !v->updating_tools) {
+                wchar_t reason[700], text[512];
+                recent_error_reason(reason, ARRAYSIZE(reason));
+                _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE,
+                             L"Did not start.%s Details are in Activity.", reason);
+                vm_note_set(v->unique_id, text);
+            }
+            break;
+        }
+        n++;
+    }
+    for (j = 0; j < g_vm_seen_count; j++) {
+        BOOL present = FALSE;
+        if (!g_vm_seen[j].building) continue;
+        for (i = 0; i < n && !present; i++) present = now[i].id == g_vm_seen[j].id;
+        if (!present) {
+            wchar_t reason[700], text[1024];
+            recent_error_reason(reason, ARRAYSIZE(reason));
+            _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE,
+                         L"\"%s\" could not be created, so it was removed from the list.%s "
+                         L"Details are in Activity.", g_vm_seen[j].name, reason);
+            ui_alert(L"error", L"Could not create the VM", text);
+        }
+    }
+    if (n) memcpy(g_vm_seen, now, n * sizeof(now[0]));
+    g_vm_seen_count = n;
+}
+
 static void send_vm_list(void)
 {
     wchar_t buf[131072];
     JsonBuilder jb;
-    int i, count = asb_vm_count();
+    int i, count;
 
+    track_vm_transitions();
+    count = asb_vm_count();
     jb_init(&jb, buf, ARRAYSIZE(buf));
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"vmListChanged");
@@ -675,6 +983,7 @@ static void send_full_state(void)
     JsonBuilder jb;
     int i, count;
 
+    track_vm_transitions();
     jb_init(&jb, buf, ARRAYSIZE(buf));
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"fullState");
@@ -738,12 +1047,25 @@ static void send_full_state(void)
     webview2_post(buf);
 }
 
-/* ---- UI logging ---- */
+/* ---- UI logging, alerts and notices ---- */
+
+/* Lines that explain why something failed; the newest one is quoted in the
+   messages built by track_vm_transitions. */
+static BOOL log_line_is_error(const wchar_t *msg)
+{
+    while (*msg == L' ' || *msg == L'\t') msg++;
+    return _wcsnicmp(msg, L"Error", 5) == 0 || wcsstr(msg, L"failed to start") != NULL ||
+           wcsstr(msg, L"Failed to start") != NULL || wcsstr(msg, L"Shutdown failed") != NULL;
+}
 
 static void ui_log_post(const wchar_t *msg)
 {
     wchar_t json[8192];
     JsonBuilder jb;
+    if (log_line_is_error(msg)) {
+        wcsncpy_s(g_last_error_line, ARRAYSIZE(g_last_error_line), msg, _TRUNCATE);
+        g_last_error_tick = GetTickCount64();
+    }
     jb_init(&jb, json, 8192);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"log");
@@ -752,30 +1074,141 @@ static void ui_log_post(const wchar_t *msg)
     webview2_post(json);
 }
 
-static void ui_show_alert(const wchar_t *message)
+/* Append to a JSON string body, escaping quotes, backslashes and every
+   control character (messages carry VM names, paths and core text). */
+static void json_escape_append(wchar_t *out, size_t cap, size_t *len, const wchar_t *s)
 {
-    if (GetCurrentThreadId() == g_ui_thread_id) {
-        /* Escape the text: messages can contain VM names and paths. */
-        wchar_t buf[2048], esc[1800];
-        size_t i, n = 0;
-        for (i = 0; message[i] && n + 7 < ARRAYSIZE(esc); i++) {
-            wchar_t c = message[i];
-            if (c == L'"' || c == L'\\') { esc[n++] = L'\\'; esc[n++] = c; }
-            else if (c == L'\n') { esc[n++] = L'\\'; esc[n++] = L'n'; }
-            else if (c < 32) { swprintf_s(esc + n, ARRAYSIZE(esc) - n, L"\\u%04x", c); n += 6; }
-            else esc[n++] = c;
+    for (; s && *s; s++) {
+        wchar_t c = *s;
+        if (*len + 7 >= cap) break;
+        if (c == L'"' || c == L'\\') { out[(*len)++] = L'\\'; out[(*len)++] = c; }
+        else if (c == L'\n') { out[(*len)++] = L'\\'; out[(*len)++] = L'n'; }
+        else if (c == L'\r') { out[(*len)++] = L'\\'; out[(*len)++] = L'r'; }
+        else if (c == L'\t') { out[(*len)++] = L'\\'; out[(*len)++] = L't'; }
+        else if (c < 32 || c == 0x2028 || c == 0x2029) {
+            swprintf_s(out + *len, cap - *len, L"\\u%04x", (unsigned)c);
+            *len += 6;
         }
-        esc[n] = 0;
-        swprintf_s(buf, ARRAYSIZE(buf), L"{\"type\":\"alert\",\"message\":\"%s\"}", esc);
-        webview2_post(buf);
+        else out[(*len)++] = c;
+    }
+    out[*len] = 0;
+}
+
+static void json_raw_append(wchar_t *out, size_t cap, size_t *len, const wchar_t *s)
+{
+    size_t n = wcslen(s);
+    if (*len + n >= cap) return;
+    wmemcpy(out + *len, s, n);
+    *len += n;
+    out[*len] = 0;
+}
+
+/* Post {"type":type,"kind":kind,"title":title,"message":message}. */
+static void post_text_message(const wchar_t *type, const wchar_t *kind,
+                              const wchar_t *title, const wchar_t *message)
+{
+    size_t len = 0, cap;
+    wchar_t *buf;
+    if (!type) return;
+    if (!kind) kind = L"";
+    if (!title) title = L"";
+    if (!message) message = L"";
+    cap = (wcslen(type) + wcslen(kind) + wcslen(title) + wcslen(message)) * 6 + 128;
+    buf = (wchar_t *)malloc(cap * sizeof(wchar_t));
+    if (!buf) return;
+    buf[0] = 0;
+    json_raw_append(buf, cap, &len, L"{\"type\":\"");
+    json_escape_append(buf, cap, &len, type);
+    json_raw_append(buf, cap, &len, L"\",\"kind\":\"");
+    json_escape_append(buf, cap, &len, kind);
+    json_raw_append(buf, cap, &len, L"\",\"title\":\"");
+    json_escape_append(buf, cap, &len, title);
+    json_raw_append(buf, cap, &len, L"\",\"message\":\"");
+    json_escape_append(buf, cap, &len, message);
+    json_raw_append(buf, cap, &len, L"\"}");
+    webview2_post(buf);
+    free(buf);
+}
+
+typedef struct {
+    wchar_t kind[16];
+    wchar_t title[128];
+    wchar_t message[1];   /* allocated to fit */
+} PendingAlert;
+
+/* A dialog in the page with one OK button. kind: "error" (titled "Something
+   went wrong" unless a title is given), "warning" or "info". Any thread. */
+static void ui_alert(const wchar_t *kind, const wchar_t *title, const wchar_t *message)
+{
+    if (!message) return;
+    if (GetCurrentThreadId() == g_ui_thread_id) {
+        if (g_alert_capture) {
+            /* create/start report these inline instead */
+            size_t used = wcslen(g_alert_capture);
+            if (used && used + 2 < g_alert_capture_cap) wcscat_s(g_alert_capture, g_alert_capture_cap, L"\n");
+            used = wcslen(g_alert_capture);
+            if (used + 1 < g_alert_capture_cap)
+                wcsncat_s(g_alert_capture, g_alert_capture_cap, message, _TRUNCATE);
+            return;
+        }
+        post_text_message(L"alert", kind ? kind : L"error", title, message);
     } else if (g_hwnd_main) {
-        size_t len = wcslen(message) + 1;
-        wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
-        if (copy) {
-            wcscpy_s(copy, len, message);
-            PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)copy);
+        size_t len = wcslen(message);
+        PendingAlert *pa = (PendingAlert *)calloc(1, sizeof(PendingAlert) + len * sizeof(wchar_t));
+        if (pa) {
+            wcsncpy_s(pa->kind, ARRAYSIZE(pa->kind), kind ? kind : L"error", _TRUNCATE);
+            wcsncpy_s(pa->title, ARRAYSIZE(pa->title), title ? title : L"", _TRUNCATE);
+            wcscpy_s(pa->message, len + 1, message);
+            if (!PostMessageW(g_hwnd_main, WM_SHOW_ALERT, 0, (LPARAM)pa)) free(pa);
         }
     }
+}
+
+/* Alerts from the core (errors the user must see). */
+static void ui_show_alert(const wchar_t *message)
+{
+    ui_alert(L"error", NULL, message);
+}
+
+/* A message in the page's notification area that does not interrupt (shortcut
+   created, path copied, a command refused while another runs). UI thread. */
+static void ui_notice(const wchar_t *kind, const wchar_t *message)
+{
+    post_text_message(L"notice", kind ? kind : L"info", NULL, message);
+}
+
+/* Collect UI-thread alerts while a create or start runs (see ui_alert). */
+static void alert_capture_begin(wchar_t *buf, size_t cap)
+{
+    buf[0] = 0;
+    g_alert_capture = buf;
+    g_alert_capture_cap = cap;
+}
+
+static void alert_capture_end(void)
+{
+    g_alert_capture = NULL;
+    g_alert_capture_cap = 0;
+}
+
+/* Plain-language reason for an HRESULT from a VM operation. */
+static void describe_hresult(HRESULT hr, wchar_t *out, size_t cap)
+{
+    if (hr == E_ACCESSDENIED)
+        wcscpy_s(out, cap, L"it is busy being created, started, updated, imported or exported. Try again when that finishes.");
+    else if (hr == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND) || hr == HRESULT_FROM_WIN32(ERROR_PATH_NOT_FOUND))
+        wcscpy_s(out, cap, L"one of its files (disk or installer ISO) was not found.");
+    else if (hr == HRESULT_FROM_WIN32(ERROR_SHARING_VIOLATION) || hr == HRESULT_FROM_WIN32(ERROR_LOCK_VIOLATION))
+        wcscpy_s(out, cap, L"its disk is in use by another program.");
+    else if (hr == HRESULT_FROM_WIN32(ERROR_DISK_FULL) || hr == HRESULT_FROM_WIN32(ERROR_HANDLE_DISK_FULL))
+        wcscpy_s(out, cap, L"the disk is full.");
+    else if (hr == E_OUTOFMEMORY || hr == HRESULT_FROM_WIN32(ERROR_NOT_ENOUGH_MEMORY) ||
+             hr == HRESULT_FROM_WIN32(ERROR_COMMITMENT_LIMIT))
+        wcscpy_s(out, cap, L"this PC does not have enough free memory.");
+    else if (hr == HRESULT_FROM_WIN32(ERROR_NOT_SUPPORTED))
+        wcscpy_s(out, cap, L"its guest agent is not connected, so it cannot be asked to shut down. Shut it down from inside the VM, or use Force stop.");
+    else
+        swprintf_s(out, cap, L"error 0x%08X.", (unsigned)hr);
 }
 
 /* ---- Display connections ---- */
@@ -1021,7 +1454,8 @@ static void launch_vm_tick(HWND hwnd)
     int i, idx = -1;
     VmInstance *v = NULL;
     if (!g_launch_vm[0]) { KillTimer(hwnd, IDT_LAUNCH_VM); return; }
-    if (!g_prereq_ok) {
+    /* Wait for start-up, and for a VM operation running on the worker thread. */
+    if (!g_prereq_ok || g_bg_op || g_command_depth) {
         if (++g_launch_tries > 200) { KillTimer(hwnd, IDT_LAUNCH_VM); g_launch_vm[0] = 0; }
         return;
     }
@@ -1036,7 +1470,7 @@ static void launch_vm_tick(HWND hwnd)
                    L"Delete the shortcut or create it again.", g_launch_vm);
         g_launch_vm[0] = 0;
         ShowWindow(hwnd, SW_RESTORE);
-        ui_show_alert(msg);
+        ui_alert(L"error", L"VM not found", msg);
         return;
     }
     g_launch_vm[0] = 0;
@@ -1044,7 +1478,7 @@ static void launch_vm_tick(HWND hwnd)
         do_connect_vm(idx);
     } else if (v->starting || asb_vm_is_building(asb_vm_get(idx))) {
         ShowWindow(hwnd, SW_RESTORE);
-        ui_show_alert(L"That VM is busy right now; try again in a moment.");
+        ui_alert(L"info", NULL, L"That VM is busy right now; try again in a moment.");
     } else {
         HRESULT hr = asb_vm_start(asb_vm_get(idx), -1, -1, NULL);
         if (FAILED(hr)) {
@@ -1190,6 +1624,676 @@ void ui_display_close(UINT64 id)
         g_display_vm_ids[i] = 0;
     }
     asb_events_changed();
+}
+
+/* ---- VM operations on the worker thread ---- */
+
+static BOOL id_listed(const UINT64 *list, int count, UINT64 id)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        if (list[i] == id) return TRUE;
+    return FALSE;
+}
+
+static void id_add(UINT64 *list, int *count, UINT64 id)
+{
+    if (!id_listed(list, *count, id) && *count < ASB_MAX_VMS) list[(*count)++] = id;
+}
+
+static void bg_op_run(BgOp *op)
+{
+    int i;
+    for (i = 0; i < op->count; i++) {
+        VmInstance *v = asb_find_vm_by_id(op->ids[i]);
+        if (!v) { op->results[i] = S_FALSE; continue; }
+        switch (op->kind) {
+        case BG_SHUTDOWN:
+        case BG_SHUTDOWN_ALL: op->results[i] = asb_vm_shutdown((AsbVm)v); break;
+        case BG_STOP:
+        case BG_STOP_ALL:     op->results[i] = asb_vm_stop((AsbVm)v); break;
+        case BG_DELETE:       op->results[i] = asb_vm_delete((AsbVm)v); break;
+        }
+    }
+}
+
+static DWORD WINAPI bg_op_thread(LPVOID param)
+{
+    BgOp *op = (BgOp *)param;
+    int tries;
+    bg_op_run(op);
+    /* The UI thread takes op back with WM_BG_OP_DONE. When the window is
+       gone, WM_DESTROY has waited for this thread and frees op. */
+    for (tries = 0; tries < 50; tries++) {
+        HWND hwnd = g_hwnd_main;
+        if (!hwnd || PostMessageW(hwnd, WM_BG_OP_DONE, 0, (LPARAM)op)) break;
+        Sleep(100);
+    }
+    return 0;
+}
+
+/* UI thread: report the results of a finished operation. */
+static void bg_op_finish(BgOp *op)
+{
+    int i;
+    if (g_bg_op == op) g_bg_op = NULL;
+    if (g_bg_thread) {
+        WaitForSingleObject(g_bg_thread, 5000);
+        CloseHandle(g_bg_thread);
+        g_bg_thread = NULL;
+    }
+    reconcile_displays();
+    for (i = 0; i < op->count; i++) {
+        HRESULT hr = op->results[i];
+        VmInstance *v = asb_find_vm_by_id(op->ids[i]);
+        wchar_t reason[300], text[512];
+        if (hr == S_FALSE) continue;            /* not running any more, or gone */
+        if (SUCCEEDED(hr)) {
+            if (op->kind == BG_SHUTDOWN && v) {
+                /* The guest accepted: close its windows while it shuts down. */
+                int idx = asb_vm_index((AsbVm)v);
+                safe_destroy_rdp(idx);
+                safe_destroy_idd(idx);
+            } else if (op->kind == BG_DELETE) {
+                ui_log(L"VM \"%s\" deleted.", op->names[i]);
+            }
+            continue;
+        }
+        describe_hresult(hr, reason, ARRAYSIZE(reason));
+        switch (op->kind) {
+        case BG_SHUTDOWN:
+        case BG_SHUTDOWN_ALL:
+            _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"Could not be asked to shut down: %s", reason);
+            if (op->kind == BG_SHUTDOWN_ALL) id_add(g_exit_refused, &g_exit_refused_count, op->ids[i]);
+            break;
+        case BG_STOP:
+        case BG_STOP_ALL:
+            _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE,
+                         L"Force stop reported a problem: %s Details are in Activity.", reason);
+            break;
+        default:
+            ui_log(L"VM deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
+            _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, hr == E_ACCESSDENIED
+                         ? L"Could not be deleted: %s"
+                         : L"Could not be deleted: %s Check that its disk folder is available and writable; details are in Activity.",
+                         reason);
+            break;
+        }
+        if (v) {
+            vm_note_set(op->ids[i], text);
+        } else {
+            wchar_t message[700];
+            _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE, L"\"%s\": %s", op->names[i], text);
+            ui_notice(L"error", message);
+        }
+    }
+    free(op);
+    send_vm_list();
+    ui_refresh_from_core();
+    /* Let API requests that waited for this operation run now. */
+    for (i = 0; i < g_deferred_api_count; i++)
+        if (g_hwnd_main) PostMessageW(g_hwnd_main, WM_ASB_API_REQUEST, 0, g_deferred_api[i]);
+    g_deferred_api_count = 0;
+    /* Inside another dialog the exit timer continues once it closes. */
+    if (g_exit_waiting && g_hwnd_main && !g_command_depth) exit_tick(g_hwnd_main);
+}
+
+/* Run an operation for the listed VMs on the worker thread (inline when no
+   thread can be created). FALSE when another one is still running. */
+static BOOL bg_op_start(BgOpKind kind, const UINT64 *ids, int count)
+{
+    BgOp *op;
+    HANDLE thread;
+    int i;
+    if (g_bg_op || count <= 0) return FALSE;
+    op = (BgOp *)calloc(1, sizeof(*op));
+    if (!op) return FALSE;
+    op->kind = kind;
+    op->count = count > ASB_MAX_VMS ? ASB_MAX_VMS : count;
+    for (i = 0; i < op->count; i++) {
+        VmInstance *v = asb_find_vm_by_id(ids[i]);
+        op->ids[i] = ids[i];
+        if (v) wcsncpy_s(op->names[i], ARRAYSIZE(op->names[i]), v->name, _TRUNCATE);
+    }
+    g_bg_op = op;
+    send_vm_list();   /* cards show "Stopping" / "Deleting" at once */
+    thread = CreateThread(NULL, 0, bg_op_thread, op, 0, NULL);
+    if (!thread) {
+        bg_op_run(op);
+        bg_op_finish(op);
+        return TRUE;
+    }
+    g_bg_thread = thread;
+    return TRUE;
+}
+
+static BOOL bg_op_start_one(BgOpKind kind, UINT64 id)
+{
+    return bg_op_start(kind, &id, 1);
+}
+
+/* ---- Exit: never turn VMs off without asking ----
+   Exiting the process turns every VM off (HCS terminates a compute system
+   when its last handle closes). Tray Exit and closing the window therefore
+   ask first, and "Shut down VMs and exit" asks each guest to shut down and
+   exits once they have stopped. When Windows signs out, restarts or the
+   package is updated, the same sequence runs while a shutdown block reason
+   holds Windows back. */
+
+static void count_vm_activity(int *running, int *busy)
+{
+    int i, count = asb_vm_count();
+    *running = *busy = 0;
+    for (i = 0; i < count; i++) {
+        VmInstance *v = asb_vm_instance(asb_vm_get(i));
+        if (!v) continue;
+        if (v->running) (*running)++;
+        if (v->starting || v->building_vhdx || v->copying_disk || v->updating_tools) (*busy)++;
+    }
+}
+
+static void post_exit_progress(BOOL active, int remaining)
+{
+    wchar_t buf[160];
+    swprintf_s(buf, ARRAYSIZE(buf),
+               L"{\"type\":\"exitProgress\",\"active\":%s,\"remaining\":%d,\"session\":%s}",
+               active ? L"true" : L"false", remaining, g_exit_for_session ? L"true" : L"false");
+    webview2_post(buf);
+}
+
+static void exit_finish(HWND hwnd)
+{
+    KillTimer(hwnd, IDT_EXIT_WAIT);
+    g_exit_waiting = FALSE;
+    post_exit_progress(FALSE, 0);
+    DestroyWindow(hwnd);
+}
+
+static void exit_cancel(HWND hwnd)
+{
+    if (!g_exit_waiting) return;
+    KillTimer(hwnd, IDT_EXIT_WAIT);
+    g_exit_waiting = g_exit_for_session = g_exit_forced = FALSE;
+    if (g_exit_block_reason) {
+        ShutdownBlockReasonDestroy(hwnd);
+        g_exit_block_reason = FALSE;
+    }
+    post_exit_progress(FALSE, 0);
+    ui_log(L"Exit cancelled; App Sandbox keeps running.");
+}
+
+static void exit_begin(HWND hwnd, BOOL for_session)
+{
+    if (g_exit_waiting) {
+        if (for_session) g_exit_for_session = TRUE;
+        return;
+    }
+    g_exit_waiting = TRUE;
+    g_exit_for_session = for_session;
+    g_exit_forced = FALSE;
+    g_exit_started = GetTickCount64();
+    g_exit_asked_count = g_exit_refused_count = 0;
+    ui_log(for_session
+        ? L"Windows is signing out, restarting or updating App Sandbox: shutting the VMs down first."
+        : L"Shutting the VMs down; App Sandbox exits when they have stopped.");
+    SetTimer(hwnd, IDT_EXIT_WAIT, 1000, NULL);
+    exit_tick(hwnd);
+}
+
+/* Some VMs did not stop in time, or could not be asked to. */
+static void exit_timeout(HWND hwnd, const UINT64 *ids, int n)
+{
+    wchar_t names[1024] = L"", content[1500], instruction[96];
+    TASKDIALOGCONFIG tdc;
+    TASKDIALOG_BUTTON buttons[3];
+    int i, btn = 0;
+    HRESULT hr;
+
+    /* Windows is ending the session: whatever still runs is turned off with
+       the app now. */
+    if (g_exit_for_session) { exit_finish(hwnd); return; }
+
+    KillTimer(hwnd, IDT_EXIT_WAIT);
+    for (i = 0; i < n; i++) {
+        VmInstance *v = asb_find_vm_by_id(ids[i]);
+        if (!v) continue;
+        if (names[0]) wcsncat_s(names, ARRAYSIZE(names), L", ", _TRUNCATE);
+        wcsncat_s(names, ARRAYSIZE(names), v->name, _TRUNCATE);
+    }
+    _snwprintf_s(content, ARRAYSIZE(content), _TRUNCATE,
+        L"Still running: %s\n\nA VM may be waiting for an app inside it to close, or it has no "
+        L"guest agent to receive the request. Force stop turns it off at once; unsaved work in "
+        L"it is lost.", names);
+    if (n == 1) wcscpy_s(instruction, ARRAYSIZE(instruction), L"A VM has not shut down");
+    else swprintf_s(instruction, ARRAYSIZE(instruction), L"%d VMs have not shut down", n);
+
+    buttons[0].nButtonID = 100; buttons[0].pszButtonText = L"Force stop and exit";
+    buttons[1].nButtonID = 101; buttons[1].pszButtonText = L"Keep waiting";
+    buttons[2].nButtonID = 102; buttons[2].pszButtonText = L"Don't exit";
+    ZeroMemory(&tdc, sizeof(tdc));
+    tdc.cbSize = sizeof(tdc);
+    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    tdc.pszWindowTitle = L"App Sandbox";
+    tdc.pszMainIcon = TD_WARNING_ICON;
+    tdc.pszMainInstruction = instruction;
+    tdc.pszContent = content;
+    tdc.cButtons = 3;
+    tdc.pButtons = buttons;
+    tdc.nDefaultButton = 101;
+
+    ++g_command_depth;
+    hr = TaskDialogIndirect(&tdc, &btn, NULL, NULL);
+    --g_command_depth;
+    if (!g_exit_waiting) return;
+    if (FAILED(hr) || btn == 102 || btn == IDCANCEL) { exit_cancel(hwnd); return; }
+
+    SetTimer(hwnd, IDT_EXIT_WAIT, 1000, NULL);
+    if (btn == 100) {
+        UINT64 running[ASB_MAX_VMS];
+        int count = asb_vm_count(), k = 0;
+        for (i = 0; i < count; i++) {
+            VmInstance *v = asb_vm_instance(asb_vm_get(i));
+            if (v && v->running) running[k++] = v->unique_id;
+        }
+        g_exit_forced = TRUE;
+        ui_log(L"Force stopping the VMs that did not shut down, then exiting.");
+        if (!bg_op_start(BG_STOP_ALL, running, k)) exit_tick(hwnd);
+    } else {
+        /* Keep waiting: ask the VMs that refused again (their guest agent
+           may have connected meanwhile) and restart the time limit. */
+        int k = 0;
+        for (i = 0; i < g_exit_asked_count; i++)
+            if (!id_listed(g_exit_refused, g_exit_refused_count, g_exit_asked[i]))
+                g_exit_asked[k++] = g_exit_asked[i];
+        g_exit_asked_count = k;
+        g_exit_refused_count = 0;
+        g_exit_started = GetTickCount64();
+    }
+}
+
+/* Once a second while exiting: ask VMs that run to shut down, exit when
+   none runs, ask what to do when they take too long. */
+static void exit_tick(HWND hwnd)
+{
+    UINT64 ask[ASB_MAX_VMS], active[ASB_MAX_VMS];
+    int i, n_ask = 0, n_active = 0, waiting = 0, count = asb_vm_count();
+
+    if (!g_exit_waiting) return;
+    for (i = 0; i < count; i++) {
+        VmInstance *v = asb_vm_instance(asb_vm_get(i));
+        if (!v || !(v->running || v->starting)) continue;
+        active[n_active++] = v->unique_id;
+        if (!v->running) { waiting++; continue; }   /* starting: asked once it runs */
+        if (!id_listed(g_exit_asked, g_exit_asked_count, v->unique_id)) ask[n_ask++] = v->unique_id;
+        else if (!id_listed(g_exit_refused, g_exit_refused_count, v->unique_id)) waiting++;
+    }
+    post_exit_progress(TRUE, n_active);
+    if (g_bg_op) return;                             /* requests are still being sent */
+    if (n_active == 0 || g_exit_forced) { exit_finish(hwnd); return; }
+    if (n_ask > 0) {
+        for (i = 0; i < n_ask; i++) id_add(g_exit_asked, &g_exit_asked_count, ask[i]);
+        if (!bg_op_start(BG_SHUTDOWN_ALL, ask, n_ask))
+            for (i = 0; i < n_ask; i++) id_add(g_exit_refused, &g_exit_refused_count, ask[i]);
+        return;
+    }
+    if (waiting > 0 && GetTickCount64() - g_exit_started < EXIT_WAIT_LIMIT_MS) return;
+    exit_timeout(hwnd, active, n_active);
+}
+
+/* Tray Exit and closing the window: decide with the user what happens to
+   running VMs and operations in progress. */
+static void confirm_exit(HWND hwnd, BOOL from_close)
+{
+    enum { BTN_TRAY = 200, BTN_SHUTDOWN, BTN_EXIT_NOW };
+    TASKDIALOGCONFIG tdc;
+    TASKDIALOG_BUTTON buttons[3];
+    wchar_t instruction[96], content[700];
+    int running = 0, busy = 0, nbuttons = 0, btn = 0;
+    BOOL checked = FALSE;
+    HRESULT hr;
+
+    if (g_exit_waiting) {                 /* already exiting: keep going in the tray */
+        ShowWindow(hwnd, SW_HIDE);
+        return;
+    }
+    count_vm_activity(&running, &busy);
+    if (!running && !busy) { DestroyWindow(hwnd); return; }
+    if (from_close && running && !busy && asb_get_suppress_tray_warn()) {
+        ShowWindow(hwnd, SW_HIDE);
+        return;
+    }
+
+    if (running) {
+        if (running == 1) wcscpy_s(instruction, ARRAYSIZE(instruction), L"A VM is still running");
+        else swprintf_s(instruction, ARRAYSIZE(instruction), L"%d VMs are still running", running);
+        wcscpy_s(content, ARRAYSIZE(content),
+                 L"Exiting App Sandbox turns its VMs off. Shut them down first so the apps and "
+                 L"files open in them are saved.");
+    } else {
+        wcscpy_s(instruction, ARRAYSIZE(instruction), L"A VM operation is still in progress");
+        content[0] = 0;
+    }
+    if (busy) {
+        wchar_t more[300];
+        swprintf_s(more, ARRAYSIZE(more),
+                   L"%s%d VM%s being created, started, imported, exported or updated. Exiting "
+                   L"stops that work and can leave an incomplete VM behind.",
+                   content[0] ? L"\n\n" : L"", busy, busy == 1 ? L" is" : L"s are");
+        wcsncat_s(content, ARRAYSIZE(content), more, _TRUNCATE);
+    }
+
+    buttons[nbuttons].nButtonID = BTN_TRAY;
+    buttons[nbuttons++].pszButtonText =
+        L"Keep running in the tray\nThe window closes and the VMs keep running. Open App Sandbox again from the notification area.";
+    if (running) {
+        buttons[nbuttons].nButtonID = BTN_SHUTDOWN;
+        buttons[nbuttons++].pszButtonText =
+            L"Shut down VMs and exit\nEach VM is asked to shut down. App Sandbox exits when they have stopped.";
+    } else {
+        buttons[nbuttons].nButtonID = BTN_EXIT_NOW;
+        buttons[nbuttons++].pszButtonText = L"Exit anyway\nStops the operation in progress.";
+    }
+
+    ZeroMemory(&tdc, sizeof(tdc));
+    tdc.cbSize = sizeof(tdc);
+    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
+    tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    tdc.pszWindowTitle = L"App Sandbox";
+    tdc.pszMainIcon = busy ? TD_WARNING_ICON : TD_INFORMATION_ICON;
+    tdc.pszMainInstruction = instruction;
+    tdc.pszContent = content;
+    tdc.cButtons = nbuttons;
+    tdc.pButtons = buttons;
+    tdc.nDefaultButton = (from_close || busy) ? BTN_TRAY : BTN_SHUTDOWN;
+    if (from_close && running && !busy)
+        tdc.pszVerificationText = L"Always keep VMs running in the tray when I close the window";
+
+    ++g_command_depth;
+    hr = TaskDialogIndirect(&tdc, &btn, NULL, &checked);
+    --g_command_depth;
+    if (FAILED(hr)) return;
+
+    if (btn == BTN_TRAY) {
+        if (checked) {
+            asb_set_suppress_tray_warn(TRUE);
+            asb_save();
+            send_host_info();
+        }
+        ShowWindow(hwnd, SW_HIDE);
+    } else if (btn == BTN_SHUTDOWN) {
+        if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        exit_begin(hwnd, FALSE);
+    } else if (btn == BTN_EXIT_NOW) {
+        DestroyWindow(hwnd);
+    }
+}
+
+/* Tray "Force stop": the same warning the page shows. */
+static BOOL confirm_force_stop(HWND hwnd, const wchar_t *name)
+{
+    TASKDIALOGCONFIG tdc;
+    TASKDIALOG_BUTTON button;
+    wchar_t content[600];
+    int btn = 0;
+    HRESULT hr;
+
+    _snwprintf_s(content, ARRAYSIZE(content), _TRUNCATE,
+        L"Force stop turns \"%s\" off at once, like pulling the plug. Unsaved work in it is lost "
+        L"and its disk can be damaged. Use Shut down when you can.", name);
+    button.nButtonID = IDOK;
+    button.pszButtonText = L"Force stop";
+    ZeroMemory(&tdc, sizeof(tdc));
+    tdc.cbSize = sizeof(tdc);
+    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
+    tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
+    tdc.pszWindowTitle = L"App Sandbox";
+    tdc.pszMainIcon = TD_WARNING_ICON;
+    tdc.pszMainInstruction = L"Force stop this VM?";
+    tdc.pszContent = content;
+    tdc.cButtons = 1;
+    tdc.pButtons = &button;
+    tdc.nDefaultButton = IDCANCEL;
+    ++g_command_depth;
+    hr = TaskDialogIndirect(&tdc, &btn, NULL, NULL);
+    --g_command_depth;
+    return SUCCEEDED(hr) && btn == IDOK;
+}
+
+/* ---- Folders, clipboard, diagnostics and links (Settings, VM menu) ----
+   Only paths App Sandbox owns are opened: its data folder, the default VM
+   folder, its log, its own folder and a VM's folder from vms.cfg. The page
+   names which one, never a path, and links come from a fixed list. */
+
+static BOOL path_is_directory(const wchar_t *path)
+{
+    DWORD attrs = path && path[0] ? GetFileAttributesW(path) : INVALID_FILE_ATTRIBUTES;
+    return attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static BOOL path_is_file(const wchar_t *path)
+{
+    DWORD attrs = path && path[0] ? GetFileAttributesW(path) : INVALID_FILE_ATTRIBUTES;
+    return attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+/* Show a folder in File Explorer. */
+static BOOL explorer_open_folder(const wchar_t *folder)
+{
+    if (!path_is_directory(folder)) return FALSE;
+    return (INT_PTR)ShellExecuteW(g_hwnd_main, L"open", folder, NULL, NULL, SW_SHOWNORMAL) > 32;
+}
+
+/* Show the folder holding path in File Explorer, with path selected. */
+static BOOL explorer_select(const wchar_t *path)
+{
+    PIDLIST_ABSOLUTE pidl;
+    HRESULT hr;
+    if (!path || !path[0] || GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
+    pidl = ILCreateFromPathW(path);
+    if (!pidl) return FALSE;
+    hr = SHOpenFolderAndSelectItems(pidl, 0, NULL, 0);
+    ILFree(pidl);
+    return SUCCEEDED(hr);
+}
+
+/* Open an https link through Explorer, so the browser does not run with
+   App Sandbox's administrator rights. */
+static void open_url(const wchar_t *url)
+{
+    wchar_t explorer[MAX_PATH], args[400];
+    UINT n = GetWindowsDirectoryW(explorer, MAX_PATH);
+    if (wcsncmp(url, L"https://", 8) != 0) return;
+    if (n && n < MAX_PATH - 16) {
+        wcscat_s(explorer, MAX_PATH, L"\\explorer.exe");
+        swprintf_s(args, ARRAYSIZE(args), L"\"%s\"", url);
+        if ((INT_PTR)ShellExecuteW(g_hwnd_main, L"open", explorer, args, NULL, SW_SHOWNORMAL) > 32)
+            return;
+    }
+    ShellExecuteW(g_hwnd_main, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+}
+
+/* Links of the About section, by name. */
+static void open_project_link(const wchar_t *which)
+{
+    wchar_t url[300];
+    if (wcscmp(which, L"project") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s", UI_PROJECT_REPO);
+    else if (wcscmp(which, L"issues") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s/issues", UI_PROJECT_REPO);
+    else if (wcscmp(which, L"releases") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s/releases", UI_PROJECT_REPO);
+    else if (wcscmp(which, L"license") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s/blob/main/LICENSE", UI_PROJECT_REPO);
+    else if (wcscmp(which, L"notices") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s/blob/main/THIRD-PARTY-NOTICES.md", UI_PROJECT_REPO);
+    else if (wcscmp(which, L"upstream") == 0)
+        swprintf_s(url, ARRAYSIZE(url), L"https://github.com/%s", UI_UPSTREAM_REPO);
+    else
+        return;
+    open_url(url);
+}
+
+static BOOL clipboard_set_text(const wchar_t *text)
+{
+    size_t bytes = (wcslen(text) + 1) * sizeof(wchar_t);
+    HGLOBAL mem;
+    BOOL ok = FALSE;
+    if (!OpenClipboard(g_hwnd_main)) return FALSE;
+    EmptyClipboard();
+    mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (mem) {
+        void *p = GlobalLock(mem);
+        if (p) {
+            memcpy(p, text, bytes);
+            GlobalUnlock(mem);
+            ok = SetClipboardData(CF_UNICODETEXT, mem) != NULL;
+        }
+        if (!ok) GlobalFree(mem);
+    }
+    CloseClipboard();
+    return ok;
+}
+
+/* A small UTF-8 text file shipped beside AppSandbox.exe (LICENSE,
+   THIRD-PARTY-NOTICES.md), or NULL. The caller frees it. */
+static wchar_t *read_text_beside_exe(const wchar_t *file_name)
+{
+    wchar_t path[MAX_PATH];
+    HANDLE f;
+    DWORD size, got = 0;
+    char *data;
+    wchar_t *text = NULL;
+
+    app_directory(path, MAX_PATH);
+    if (!path[0] || wcslen(path) + wcslen(file_name) + 2 >= MAX_PATH) return NULL;
+    wcscat_s(path, MAX_PATH, L"\\");
+    wcscat_s(path, MAX_PATH, file_name);
+    f = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return NULL;
+    size = GetFileSize(f, NULL);
+    if (size == INVALID_FILE_SIZE || size == 0 || size > 512 * 1024) { CloseHandle(f); return NULL; }
+    data = (char *)malloc(size);
+    if (data && ReadFile(f, data, size, &got, NULL) && got == size) {
+        const char *p = data;
+        int len = (int)size, n;
+        if (len >= 3 && (unsigned char)p[0] == 0xEF && (unsigned char)p[1] == 0xBB && (unsigned char)p[2] == 0xBF) {
+            p += 3;
+            len -= 3;
+        }
+        n = len > 0 ? MultiByteToWideChar(CP_UTF8, 0, p, len, NULL, 0) : 0;
+        if (n > 0 && (text = (wchar_t *)malloc((n + 1) * sizeof(wchar_t))) != NULL) {
+            MultiByteToWideChar(CP_UTF8, 0, p, len, text, n);
+            text[n] = 0;
+        }
+    }
+    free(data);
+    CloseHandle(f);
+    return text;
+}
+
+static void diag_append(wchar_t *buf, size_t cap, const wchar_t *fmt, ...)
+{
+    size_t len = wcslen(buf);
+    va_list args;
+    if (len + 1 >= cap) return;
+    va_start(args, fmt);
+    _vsnwprintf_s(buf + len, cap - len, _TRUNCATE, fmt, args);
+    va_end(args);
+}
+
+/* Text for bug reports: versions, Windows, hardware, Hyper-V platform state
+   and the VMs (no account names or passwords). */
+static void build_diagnostics(wchar_t *buf, size_t cap)
+{
+    typedef LONG (WINAPI *RtlGetVersionFn)(PRTL_OSVERSIONINFOW);
+    static const wchar_t *net_names[] = { L"none", L"NAT", L"external", L"internal" };
+    RTL_OSVERSIONINFOW os;
+    RtlGetVersionFn get_version;
+    SYSTEM_INFO si;
+    MEMORYSTATUSEX ms;
+    GpuList *gpus = asb_gpu_list();
+    wchar_t display_version[64] = L"", edition[64] = L"", sysdir[MAX_PATH], dll[MAX_PATH], path[MAX_PATH];
+    const wchar_t *arch;
+    DWORD ubr = 0, size;
+    int i, count = asb_vm_count();
+
+    buf[0] = 0;
+    diag_append(buf, cap, L"App Sandbox %s (%s)\r\n", app_version(),
+                asb_running_packaged() ? L"Microsoft Store package" : L"zip");
+
+    ZeroMemory(&os, sizeof(os));
+    os.dwOSVersionInfoSize = sizeof(os);
+    get_version = (RtlGetVersionFn)(void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+    if (get_version) get_version(&os);
+    size = sizeof(ubr);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"UBR",
+                     RRF_RT_REG_DWORD, NULL, &ubr, &size) != ERROR_SUCCESS)
+        ubr = 0;
+    size = sizeof(display_version);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"DisplayVersion",
+                     RRF_RT_REG_SZ, NULL, display_version, &size) != ERROR_SUCCESS)
+        display_version[0] = 0;
+    size = sizeof(edition);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion", L"EditionID",
+                     RRF_RT_REG_SZ, NULL, edition, &size) != ERROR_SUCCESS)
+        edition[0] = 0;
+    diag_append(buf, cap, L"Windows %lu.%lu build %lu.%lu %s %s\r\n",
+                os.dwMajorVersion, os.dwMinorVersion, os.dwBuildNumber, ubr, edition, display_version);
+
+    GetNativeSystemInfo(&si);
+    arch = si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? L"x64"
+         : si.wProcessorArchitecture == 12 /* PROCESSOR_ARCHITECTURE_ARM64 */ ? L"ARM64" : L"other";
+    ms.dwLength = sizeof(ms);
+    GlobalMemoryStatusEx(&ms);
+    diag_append(buf, cap, L"Host: %s, %lu logical processors, %llu MB memory\r\n",
+                arch, si.dwNumberOfProcessors, ms.ullTotalPhys / (1024ULL * 1024ULL));
+    if (gpus && gpus->count > 0) {
+        for (i = 0; i < gpus->count; i++)
+            diag_append(buf, cap, L"GPU: %s (%s)\r\n", gpus->gpus[i].name, gpus->gpus[i].location);
+    } else {
+        diag_append(buf, cap, L"GPU: none found for GPU partitioning\r\n");
+    }
+
+    if (!GetSystemDirectoryW(sysdir, MAX_PATH)) wcscpy_s(sysdir, MAX_PATH, L"C:\\Windows\\System32");
+    swprintf_s(dll, MAX_PATH, L"%s\\computecore.dll", sysdir);
+    diag_append(buf, cap, L"Host Compute Service (computecore.dll): %s\r\n",
+                !path_is_file(dll) ? L"missing" : GetModuleHandleW(L"computecore.dll") ? L"loaded" : L"present, not loaded");
+    swprintf_s(dll, MAX_PATH, L"%s\\computenetwork.dll", sysdir);
+    diag_append(buf, cap, L"Host Compute Network (computenetwork.dll): %s\r\n",
+                !path_is_file(dll) ? L"missing" : GetModuleHandleW(L"computenetwork.dll") ? L"loaded" : L"present, not loaded");
+    diag_append(buf, cap, L"Virtual Machine Platform: %s\r\n",
+                g_prereq_ok ? L"on" : g_prereq_reboot_pending ? L"turned on, restart pending"
+                : g_core_starting ? L"being checked" : L"off");
+
+    diag_append(buf, cap, L"VMs: %d\r\n", count);
+    for (i = 0; i < count; i++) {
+        VmInstance *v = asb_vm_instance(asb_vm_get(i));
+        wchar_t state[64];
+        if (!v) continue;
+        if (v->copying_disk) swprintf_s(state, ARRAYSIZE(state), L"copying disk %ld%%", (long)v->copy_progress);
+        else if (v->updating_tools) wcscpy_s(state, ARRAYSIZE(state), L"updating components");
+        else if (v->starting) wcscpy_s(state, ARRAYSIZE(state), L"starting");
+        else if (v->building_vhdx) swprintf_s(state, ARRAYSIZE(state), L"building disk %d%%", v->vhdx_progress);
+        else if (v->running) wcscpy_s(state, ARRAYSIZE(state), v->shutdown_requested ? L"shutting down" : L"running");
+        else wcscpy_s(state, ARRAYSIZE(state), L"stopped");
+        diag_append(buf, cap, L"- %s: %s%s, %s, %lu MB, %lu vCPU, GPU %s, network %s, agent %s%s\r\n",
+                    v->name, v->os_type, v->is_template ? L" template" : L"", state,
+                    v->ram_mb, v->cpu_cores,
+                    v->gpu_mode ? (v->gpu_name[0] ? v->gpu_name : L"default") : L"none",
+                    net_names[v->network_mode & 3],
+                    v->agent_online ? L"connected" : L"not connected",
+                    v->install_complete ? L"" : L", setup not finished");
+    }
+
+    log_file_path(path, MAX_PATH);
+    diag_append(buf, cap, L"Log: %s\r\n", path);
+    asb_program_data_dir(path, MAX_PATH);
+    diag_append(buf, cap, L"Data folder: %s\r\n", path);
+    app_directory(path, MAX_PATH);
+    diag_append(buf, cap, L"App folder: %s\r\n", path);
 }
 
 /* ---- System tray ---- */
@@ -1396,8 +2500,8 @@ static void tray_show_menu(HWND hwnd)
         vm_ids[i] = v->unique_id;
         tray_append(menu, 0, v->name, FALSE, TRUE, FALSE);
         tray_append(menu, TRAY_CMD_CONNECT_BASE + i,  L"\U0001F4FA  Connect",    FALSE, FALSE, TRUE);
-        tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shutdown",       FALSE, FALSE, TRUE);
-        tray_append(menu, TRAY_CMD_STOP_BASE + i,     L"\u2715  Force Stop",     FALSE, FALSE, TRUE);
+        tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shut down",      FALSE, FALSE, TRUE);
+        tray_append(menu, TRAY_CMD_STOP_BASE + i,     L"\u2715  Force stop\u2026", FALSE, FALSE, TRUE);
         tray_append(menu, 0, NULL, TRUE, FALSE, FALSE);
     }
 
@@ -1416,23 +2520,28 @@ static void tray_show_menu(HWND hwnd)
         ShowWindow(hwnd, SW_RESTORE);
         SetForegroundWindow(hwnd);
     } else if (cmd == TRAY_CMD_EXIT) {
-        DestroyWindow(hwnd);
+        confirm_exit(hwnd, FALSE);
     } else if (cmd >= TRAY_CMD_STOP_BASE) {
         int slot = cmd - TRAY_CMD_STOP_BASE;
         VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
-        int vi = vm ? asb_vm_index((AsbVm)vm) : -1;
-        if (vi < 0) return;
+        wchar_t name[256];
+        int vi;
+        if (!vm) return;
+        wcscpy_s(name, ARRAYSIZE(name), vm->name);
+        if (!confirm_force_stop(hwnd, name)) return;
+        /* Resolve again: the VM may have changed while the question was open. */
+        vm = asb_find_vm_by_id(vm_ids[slot]);
+        vi = vm ? asb_vm_index((AsbVm)vm) : -1;
+        if (vi < 0 || g_bg_op) return;
         reconcile_displays();
         safe_destroy_rdp(vi);
         safe_destroy_idd(vi);
-        asb_vm_stop((AsbVm)vm);
-        send_vm_list();
+        bg_op_start_one(BG_STOP, vm->unique_id);
     } else if (cmd >= TRAY_CMD_SHUTDOWN_BASE) {
         int slot = cmd - TRAY_CMD_SHUTDOWN_BASE;
         VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
-        if (!vm) return;
-        asb_vm_shutdown((AsbVm)vm);
-        send_vm_list();
+        if (!vm || g_bg_op) return;
+        bg_op_start_one(BG_SHUTDOWN, vm->unique_id);
     } else if (cmd >= TRAY_CMD_CONNECT_BASE) {
         int slot = cmd - TRAY_CMD_CONNECT_BASE;
         VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
@@ -1498,6 +2607,90 @@ static void start_core_async(void)
     else core_start_thread(NULL);   /* no thread: do it inline */
 }
 
+/* Answer to createVm: the dialog stays open until the VM is accepted and
+   shows the reason when it is not. */
+static void post_create_result(BOOL ok, const wchar_t *message)
+{
+    post_text_message(L"createResult", ok ? L"ok" : L"error", NULL, message ? message : L"");
+}
+
+/* A command that cannot run now: say why instead of dropping it. */
+static void reply_rejected(const wchar_t *action, const wchar_t *message)
+{
+    if (wcscmp(action, L"createVm") == 0) post_create_result(FALSE, message);
+    else ui_notice(L"info", message);
+}
+
+/* Commands that only read state or open something App Sandbox owns. They
+   also run while the core starts, while a VM operation runs on the worker
+   thread, or inside another command's dialog. */
+static BOOL action_is_passive(const wchar_t *action)
+{
+    static const wchar_t *const passive[] = {
+        L"uiReady", L"getState", L"setMinSize", L"selectVm", L"getVmIcon", L"getDiskSpace",
+        L"openFolder", L"openVmFolder", L"copyVmPath", L"copyDiagnostics", L"openLink",
+        L"showDocument", L"dismissVmError", L"cancelExit"
+    };
+    int i;
+    for (i = 0; i < (int)ARRAYSIZE(passive); i++)
+        if (wcscmp(action, passive[i]) == 0) return TRUE;
+    return FALSE;
+}
+
+/* GetOpenFileName may change the current directory, and appsandbox.log is
+   written relative to it: keep it where it was. */
+static BOOL open_file_dialog(OPENFILENAMEW *ofn)
+{
+    wchar_t cwd[MAX_PATH];
+    DWORD n = GetCurrentDirectoryW(MAX_PATH, cwd);
+    BOOL ok;
+    ofn->Flags |= OFN_NOCHANGEDIR;
+    ok = GetOpenFileNameW(ofn);
+    if (n && n < MAX_PATH) SetCurrentDirectoryW(cwd);
+    return ok;
+}
+
+static void notify_snapshot_failure(const wchar_t *what, HRESULT hr)
+{
+    wchar_t reason[300], message[500];
+    if (SUCCEEDED(hr)) return;
+    describe_hresult(hr, reason, ARRAYSIZE(reason));
+    _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE, L"%s: %s Details are in Activity.", what, reason);
+    ui_notice(L"error", message);
+}
+
+/* Smallest window size for the page's minimum, at the window's DPI, never
+   larger than the monitor's work area. */
+static SIZE min_window_size(HWND hwnd)
+{
+    SIZE size = { 0, 0 };
+    MONITORINFO mi;
+    RECT rc;
+    UINT dpi;
+    if (!hwnd || g_min_css_width <= 0 || g_min_css_height <= 0) return size;
+    dpi = GetDpiForWindow(hwnd);
+    if (!dpi) dpi = 96;
+    rc.left = rc.top = 0;
+    rc.right = MulDiv(g_min_css_width, (int)dpi, 96);
+    rc.bottom = MulDiv(g_min_css_height, (int)dpi, 96);
+    AdjustWindowRectExForDpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
+    size.cx = rc.right - rc.left;
+    size.cy = rc.bottom - rc.top;
+    mi.cbSize = sizeof(mi);
+    if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+        if (size.cx > mi.rcWork.right - mi.rcWork.left) size.cx = mi.rcWork.right - mi.rcWork.left;
+        if (size.cy > mi.rcWork.bottom - mi.rcWork.top) size.cy = mi.rcWork.bottom - mi.rcWork.top;
+    }
+    return size;
+}
+
+/* Run a VM operation on the worker thread; say so when it cannot start. */
+static void start_vm_op(BgOpKind kind, UINT64 id)
+{
+    if (!bg_op_start_one(kind, id))
+        ui_notice(L"info", L"Another VM operation is still running. Try again in a moment.");
+}
+
 static void handle_webview2_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
@@ -1505,76 +2698,79 @@ static void handle_webview2_message(const wchar_t *json)
     if (!json_get_string(json, L"action", action, 64))
         return;
 
-    /* While the core starts, only page bookkeeping is accepted; the UI
-       shows a loading state and its buttons are disabled. */
-    if (g_core_starting && wcscmp(action, L"uiReady") != 0 && wcscmp(action, L"getState") != 0)
-        return;
-
     if (wcscmp(action, L"uiReady") == 0) {
         /* JS has loaded and registered its message listener; deliver any
          * messages queued before WebView2 was ready (e.g. early ui_log lines). */
         webview2_flush_queue();
         if (g_prereq_ok) {            /* page reloaded after start-up */
-            send_full_state();
+            send_full_state();   /* an exit in progress reports again with its next tick */
+            return;
+        }
+        if (g_core_starting) {        /* page reloaded while the core starts */
+            webview2_post(L"{\"type\":\"coreLoading\"}");
             return;
         }
         start_core_async();
     } else if (wcscmp(action, L"createVm") == 0) {
-        if (!g_prereq_ok) {
-            webview2_post(g_prereq_reboot_pending
-                ? L"{\"type\":\"prereqReboot\"}"
-                : L"{\"type\":\"prereqRequired\"}");
-            return;
-        }
         AsbVmConfig cfg;
         wchar_t name_buf[256] = {0}, os_buf[32] = {0}, img_buf[MAX_PATH] = {0};
         wchar_t tpl_buf[256] = {0}, user_buf[128] = {0}, pass_buf[256] = {0};
         wchar_t adapter_buf[256] = {0}, disk_buf[MAX_PATH + 1] = {0};
-        wchar_t gpu_id[512] = {0};
+        wchar_t gpu_id[512] = {0}, captured[1024];
+        const wchar_t *error = NULL;
+        HRESULT hr;
         int val;
-        BOOL is_tpl = FALSE;
+        BOOL is_tpl = FALSE, manual_os;
+
+        if (!g_prereq_ok) {
+            webview2_post(g_prereq_reboot_pending
+                ? L"{\"type\":\"prereqReboot\"}"
+                : L"{\"type\":\"prereqRequired\"}");
+            post_create_result(FALSE, g_prereq_reboot_pending
+                ? L"Restart Windows to finish turning on Virtual Machine Platform, then create the VM."
+                : L"Turn on Virtual Machine Platform first; App Sandbox needs it to run VMs.");
+            return;
+        }
+        if (g_exit_waiting) {
+            post_create_result(FALSE, L"App Sandbox is shutting its VMs down to exit. Cancel that first.");
+            return;
+        }
 
         json_get_string(json, L"name", name_buf, 256);
         json_get_string(json, L"osType", os_buf, 32);
         json_get_string(json, L"imagePath", img_buf, MAX_PATH);
         json_get_string(json, L"templateName", tpl_buf, 256);
         /* Manual install ("Other"): no account is created. */
-        BOOL manual_os = _wcsicmp(os_buf, L"Other") == 0;
+        manual_os = _wcsicmp(os_buf, L"Other") == 0;
         if (!manual_os && !json_get_string(json, L"adminUser", user_buf, ARRAYSIZE(user_buf))) {
-            const wchar_t *error = !json_has_key(json, L"adminUser")
+            error = !json_has_key(json, L"adminUser")
                 ? L"Username is required."
                 : user_buf[0]
                     ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
                         ? L"Username cannot exceed 32 characters (Linux limit)."
                         : L"Username cannot exceed 20 characters.")
                     : L"adminUser must be a valid JSON string without NUL characters.";
-            ui_show_alert(error);
-            return;
-        }
-        if (!manual_os && !json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
-            const wchar_t *error = !json_has_key(json, L"adminPass")
+        } else if (!manual_os && !json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
+            error = !json_has_key(json, L"adminPass")
                 ? L"Password is required."
                 : pass_buf[0]
                     ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
                         ? L"Password is too long (max 255 bytes)."
                         : L"Password is too long (max 127 characters for Windows).")
                     : L"adminPass must be a valid JSON string without NUL characters.";
+        } else if (!json_get_string(json, L"gpuId", gpu_id, ARRAYSIZE(gpu_id)) &&
+                   json_has_key(json, L"gpuId")) {
+            error = L"GPU selection is invalid or too long.";
+        } else if (!json_get_string(json, L"diskDirectory", disk_buf, MAX_PATH + 1) &&
+                   json_has_key(json, L"diskDirectory")) {
+            error = L"Disk folder is invalid or too long.";
+        }
+        if (error) {
             SecureZeroMemory(pass_buf, sizeof(pass_buf));
-            ui_show_alert(error);
+            post_create_result(FALSE, error);
             return;
         }
         json_get_string(json, L"netAdapter", adapter_buf, 256);
-        if (!json_get_string(json, L"gpuId", gpu_id, ARRAYSIZE(gpu_id)) &&
-            json_has_key(json, L"gpuId")) {
-            SecureZeroMemory(pass_buf, sizeof(pass_buf));
-            ui_show_alert(L"GPU selection is invalid or too long.");
-            return;
-        }
-        if (!json_get_string(json, L"diskDirectory", disk_buf, MAX_PATH + 1) &&
-            json_has_key(json, L"diskDirectory")) {
-            ui_show_alert(L"Disk folder is invalid or too long.");
-            return;
-        }
         json_get_bool(json, L"isTemplate", &is_tpl);
 
         ZeroMemory(&cfg, sizeof(cfg));
@@ -1598,15 +2794,36 @@ static void handle_webview2_message(const wchar_t *json)
         json_get_bool(json, L"sshEnabled", &cfg.ssh_enabled);
         json_get_bool(json, L"sshDeployKey", &cfg.ssh_deploy_key);
 
-        {
-            const wchar_t *error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);
-            if (error) {
-                SecureZeroMemory(pass_buf, sizeof(pass_buf));
-                ui_show_alert(error);
-                return;
-            }
+        error = asb_validate_gpu_selection(cfg.gpu_mode, cfg.gpu_id);
+        if (error) {
+            SecureZeroMemory(pass_buf, sizeof(pass_buf));
+            post_create_result(FALSE, error);
+            return;
         }
-        asb_vm_create(&cfg);
+        g_last_error_line[0] = 0;
+        alert_capture_begin(captured, ARRAYSIZE(captured));
+        hr = asb_vm_create(&cfg);
+        alert_capture_end();
+        SecureZeroMemory(pass_buf, sizeof(pass_buf));
+        if (FAILED(hr)) {
+            wchar_t reason[700], message[1400];
+            if (!captured[0]) {
+                recent_error_reason(reason, ARRAYSIZE(reason));
+                if (!reason[0]) {
+                    wchar_t why[300];
+                    describe_hresult(hr, why, ARRAYSIZE(why));
+                    _snwprintf_s(reason, ARRAYSIZE(reason), _TRUNCATE, L" Reason: %s", why);
+                }
+                _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE,
+                             L"The VM could not be created.%s Details are in Activity.", reason);
+            }
+            post_create_result(FALSE, captured[0] ? captured : message);
+            send_vm_list();
+            return;
+        }
+        post_create_result(TRUE, NULL);
+        /* Created, but something went wrong afterwards (for example it could not start). */
+        if (captured[0]) ui_alert(L"error", NULL, captured);
         if (manual_os) {
             int k;
             for (k = 0; k < asb_vm_count(); k++) {
@@ -1614,44 +2831,61 @@ static void handle_webview2_message(const wchar_t *json)
                 if (cv && _wcsicmp(cv->name, name_buf) == 0) { open_console_when_running(cv->unique_id); break; }
             }
         }
-        SecureZeroMemory(pass_buf, sizeof(pass_buf));
         send_vm_list();
     } else if (wcscmp(action, L"startVm") == 0) {
+        int idx, si = -1, bi = -1;
+        wchar_t bname[128] = {0};
         if (!g_prereq_ok) {
             webview2_post(g_prereq_reboot_pending
                 ? L"{\"type\":\"prereqReboot\"}"
                 : L"{\"type\":\"prereqRequired\"}");
             return;
         }
-        int idx, si = -1, bi = -1;
-        wchar_t bname[128] = {0};
+        if (g_exit_waiting) {
+            ui_notice(L"info", L"App Sandbox is shutting its VMs down to exit. Cancel that first to start a VM.");
+            return;
+        }
         if (json_vm_index(json, &idx)) {
+            VmInstance *sv = asb_vm_instance(asb_vm_get(idx));
+            wchar_t captured[1024];
+            HRESULT hr;
             json_get_int(json, L"snapIndex", &si);
             json_get_int(json, L"branchIndex", &bi);
             json_get_string(json, L"branchName", bname, 128);
-            asb_vm_start(asb_vm_get(idx), si, bi, bname);
-            {
-                VmInstance *sv = asb_vm_instance(asb_vm_get(idx));
+            if (sv) vm_note_clear(sv->unique_id);
+            alert_capture_begin(captured, ARRAYSIZE(captured));
+            hr = asb_vm_start(asb_vm_get(idx), si, bi, bname);
+            alert_capture_end();
+            if (FAILED(hr)) {
+                wchar_t reason[300], text[1400];
+                if (!captured[0]) describe_hresult(hr, reason, ARRAYSIZE(reason));
+                _snwprintf_s(text, ARRAYSIZE(text), _TRUNCATE, L"Could not start: %s%s",
+                             captured[0] ? captured : reason,
+                             captured[0] ? L"" : L" Details are in Activity.");
+                if (sv) vm_note_set(sv->unique_id, text);
+            } else {
+                if (captured[0]) ui_alert(L"error", NULL, captured);
                 if (sv && _wcsicmp(sv->os_type, L"Other") == 0)
                     open_console_when_running(sv->unique_id);   /* no display driver to auto-open */
             }
             send_vm_list();
         }
     } else if (wcscmp(action, L"shutdownVm") == 0) {
+        /* The VM's windows close once the guest has accepted the request. */
         int idx;
-        if (json_vm_index(json, &idx)) {
-            safe_destroy_rdp(idx);
-            safe_destroy_idd(idx);
-            asb_vm_shutdown(asb_vm_get(idx));
-            send_vm_list();
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            vm_note_clear(v->unique_id);
+            start_vm_op(BG_SHUTDOWN, v->unique_id);
         }
     } else if (wcscmp(action, L"stopVm") == 0) {
         int idx;
-        if (json_vm_index(json, &idx)) {
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
             safe_destroy_rdp(idx);
             safe_destroy_idd(idx);
-            asb_vm_stop(asb_vm_get(idx));
-            send_vm_list();
+            vm_note_clear(v->unique_id);
+            start_vm_op(BG_STOP, v->unique_id);
         }
     } else if (wcscmp(action, L"connectIddVm") == 0) {
         int idx; if (json_vm_index(json, &idx)) do_connect_vm(idx);
@@ -1701,23 +2935,14 @@ static void handle_webview2_message(const wchar_t *json)
             }
         }
     } else if (wcscmp(action, L"deleteVm") == 0) {
+        /* Runs on the worker thread; a running VM is turned off first. */
         int idx;
-        if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
-            HRESULT hr;
-            AsbVm vm = asb_vm_get(idx);
-            VmInstance *instance = asb_vm_instance(vm);
-            ui_log(L"Deleting VM \"%s\"...", asb_vm_name(vm));
-            if (instance) ui_display_close(instance->unique_id);
-            hr = asb_vm_delete(vm);
-            if (FAILED(hr)) {
-                ui_log(L"VM deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
-                ui_show_alert(L"VM deletion failed. Check that its disk storage is available and writable.");
-                send_vm_list();
-                return;
-            }
-            reconcile_displays();
-            send_vm_list();
-            ui_log(L"VM deleted.");
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            ui_log(L"Deleting VM \"%s\"...", v->name);
+            vm_note_clear(v->unique_id);
+            ui_display_close(v->unique_id);
+            start_vm_op(BG_DELETE, v->unique_id);
         }
     } else if (wcscmp(action, L"deleteTemplate") == 0) {
         wchar_t tpl_name[256] = { 0 };
@@ -1725,7 +2950,7 @@ static void handle_webview2_message(const wchar_t *json)
         if (tpl_name[0] != L'\0') {
             HRESULT hr = asb_template_delete(tpl_name);
             if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {
-                ui_show_alert(L"This template is still required by an existing VM or an active disk copy.");
+                ui_alert(L"info", L"Template in use", L"This template is still required by an existing VM or an active disk copy.");
             } else if (FAILED(hr)) {
                 ui_log(L"Template deletion failed (0x%08X). Check that its disk storage is available and writable.", hr);
                 ui_show_alert(L"Template deletion failed. Check that its disk storage is available and writable.");
@@ -1740,7 +2965,7 @@ static void handle_webview2_message(const wchar_t *json)
             json_get_string(json, L"value", value, 256)) {
             AsbVm vm = asb_vm_get(idx);
             if (asb_vm_is_running(vm) || asb_vm_is_building(vm)) {
-                ui_show_alert(L"VM settings can only be changed when the VM is stopped and its disk build has finished.");
+                ui_alert(L"info", L"Shut the VM down first", L"VM settings can only be changed when the VM is stopped and its disk build has finished.");
             } else {
                 HRESULT hr = E_INVALIDARG;
                 const wchar_t *error = NULL;
@@ -1787,7 +3012,7 @@ static void handle_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"ejectIso") == 0) {
         int idx;
         if (json_vm_index(json, &idx) && asb_vm_eject_iso(asb_vm_get(idx)) == E_ACCESSDENIED)
-            ui_show_alert(L"Shut the VM down first; the installer ISO is removed for the next start.");
+            ui_alert(L"info", L"Shut the VM down first", L"Shut the VM down first; the installer ISO is removed for the next start.");
         send_vm_list();
     } else if (wcscmp(action, L"getVmIcon") == 0) {
         int idx;
@@ -1815,8 +3040,8 @@ static void handle_webview2_message(const wchar_t *json)
                 ofn.nMaxFile = MAX_PATH;
                 ofn.lpstrTitle = L"Choose an icon for this VM";
                 ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-                if (GetOpenFileNameW(&ofn) && !vm_icon_set(v, file, err, ARRAYSIZE(err)))
-                    ui_show_alert(err);
+                if (open_file_dialog(&ofn) && !vm_icon_set(v, file, err, ARRAYSIZE(err)))
+                    ui_alert(L"error", L"Icon not changed", err);
             }
             vm_icon_post(v);
             {
@@ -1843,10 +3068,10 @@ static void handle_webview2_message(const wchar_t *json)
                     ? L"\"%s\" is now in the Start menu (App Sandbox folder). You can pin it to Start or the taskbar from there."
                     : L"A shortcut to \"%s\" is on your desktop. Opening it starts the VM and shows its window.",
                     v->name);
-                ui_show_alert(msg);
+                ui_notice(L"info", msg);
             } else {
                 swprintf_s(msg, ARRAYSIZE(msg), L"The shortcut could not be created (0x%08X).", (unsigned)hr);
-                ui_show_alert(msg);
+                ui_alert(L"error", L"Shortcut not created", msg);
             }
         }
     } else if (wcscmp(action, L"setVideoCodec") == 0 || wcscmp(action, L"setVideoBitrate") == 0) {
@@ -1909,9 +3134,9 @@ static void handle_webview2_message(const wchar_t *json)
         if (json_vm_index(json, &idx) && idx >= 0 && idx < asb_vm_count()) {
             HRESULT hr = asb_vm_update_guest_tools(asb_vm_get(idx));
             if (hr == E_ACCESSDENIED)
-                ui_show_alert(L"Stop the VM (Shut down) before updating its guest components.");
+                ui_alert(L"info", L"Shut the VM down first", L"Stop the VM (Shut down) before updating its guest components.");
             else if (FAILED(hr))
-                ui_show_alert(L"Guest components can only be updated for Windows VMs.");
+                ui_alert(L"info", L"Not available", L"Guest components can only be updated for Windows VMs.");
         }
         send_vm_list();
     } else if (wcscmp(action, L"exportVm") == 0) {
@@ -1945,7 +3170,9 @@ static void handle_webview2_message(const wchar_t *json)
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-        if (GetOpenFileNameW(&ofn))
+        if (g_exit_waiting)
+            ui_notice(L"info", L"App Sandbox is shutting its VMs down to exit. Cancel that first.");
+        else if (open_file_dialog(&ofn))
             asb_vm_import(file);
         send_vm_list();
     } else if (wcscmp(action, L"setAutoUpdateGuestTools") == 0) {
@@ -2006,7 +3233,7 @@ static void handle_webview2_message(const wchar_t *json)
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
         ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-        if (GetOpenFileNameW(&ofn)) {
+        if (open_file_dialog(&ofn)) {
             wchar_t json_buf[2048];
             JsonBuilder jb;
             asb_set_last_iso_path(file);
@@ -2022,20 +3249,20 @@ static void handle_webview2_message(const wchar_t *json)
         wchar_t sname[128] = {0};
         if (json_vm_index(json, &vi)) {
             json_get_string(json, L"name", sname, 128);
-            asb_snap_take(asb_vm_get(vi), sname);
+            notify_snapshot_failure(L"The snapshot could not be taken", asb_snap_take(asb_vm_get(vi), sname));
             send_vm_list();
         }
     } else if (wcscmp(action, L"snapDelete") == 0) {
         int vi, si;
         if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si)) {
-            asb_snap_delete(asb_vm_get(vi), si);
+            notify_snapshot_failure(L"The snapshot could not be deleted", asb_snap_delete(asb_vm_get(vi), si));
             send_vm_list();
         }
     } else if (wcscmp(action, L"snapDeleteBranch") == 0) {
         int vi, si, bi;
         if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si) &&
             json_get_int(json, L"branchIndex", &bi)) {
-            asb_snap_delete_branch(asb_vm_get(vi), si, bi);
+            notify_snapshot_failure(L"The branch could not be deleted", asb_snap_delete_branch(asb_vm_get(vi), si, bi));
             send_vm_list();
         }
     } else if (wcscmp(action, L"snapRename") == 0) {
@@ -2044,7 +3271,7 @@ static void handle_webview2_message(const wchar_t *json)
         if (json_vm_index(json, &vi) && json_get_int(json, L"snapIndex", &si) &&
             json_get_string(json, L"name", new_name, 128)) {
             json_get_int(json, L"branchIndex", &bi);
-            asb_snap_rename(asb_vm_get(vi), si, bi, new_name);
+            notify_snapshot_failure(L"The name could not be changed", asb_snap_rename(asb_vm_get(vi), si, bi, new_name));
             send_vm_list();
         }
     } else if (wcscmp(action, L"enableFeature") == 0) {
@@ -2055,27 +3282,132 @@ static void handle_webview2_message(const wchar_t *json)
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
     } else if (wcscmp(action, L"setMinSize") == 0) {
+        /* {width, height} in CSS pixels; scaled with the window's DPI. */
         int cw = 0, ch = 0;
         json_get_int(json, L"width", &cw);
         json_get_int(json, L"height", &ch);
-        if (cw > 0 && ch > 0) {
-            RECT rc = { 0, 0, cw, ch };
+        if (cw > 0 && ch > 0 && cw < 10000 && ch < 10000) {
             RECT wr;
-            AdjustWindowRectEx(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0);
-            g_min_width = rc.right - rc.left;
-            g_min_height = rc.bottom - rc.top;
-            GetWindowRect(g_hwnd_main, &wr);
-            {
+            SIZE min;
+            g_min_css_width = cw;
+            g_min_css_height = ch;
+            min = min_window_size(g_hwnd_main);
+            if (!g_borderless_fullscreen && GetWindowRect(g_hwnd_main, &wr)) {
                 int cur_w = wr.right - wr.left;
                 int cur_h = wr.bottom - wr.top;
-                if (cur_w < g_min_width || cur_h < g_min_height) {
+                if (cur_w < min.cx || cur_h < min.cy) {
                     SetWindowPos(g_hwnd_main, NULL, 0, 0,
-                        cur_w < g_min_width ? g_min_width : cur_w,
-                        cur_h < g_min_height ? g_min_height : cur_h,
+                        cur_w < min.cx ? min.cx : cur_w,
+                        cur_h < min.cy ? min.cy : cur_h,
                         SWP_NOMOVE | SWP_NOZORDER);
                 }
             }
         }
+    } else if (wcscmp(action, L"openFolder") == 0) {
+        /* {which: "vms" | "data" | "log" | "app"}: folders App Sandbox owns. */
+        wchar_t which[16] = L"", path[MAX_PATH], message[MAX_PATH + 160];
+        BOOL ok = FALSE;
+        json_get_string(json, L"which", which, ARRAYSIZE(which));
+        if (wcscmp(which, L"vms") == 0) {
+            asb_default_disk_directory(path, MAX_PATH);
+            ok = explorer_open_folder(path);
+        } else if (wcscmp(which, L"data") == 0) {
+            asb_program_data_dir(path, MAX_PATH);
+            ok = explorer_open_folder(path);
+        } else if (wcscmp(which, L"log") == 0) {
+            log_file_path(path, MAX_PATH);
+            ok = path_is_file(path) && explorer_select(path);
+            if (!ok) {
+                wchar_t *slash = wcsrchr(path, L'\\');
+                if (slash) *slash = 0;
+                ok = explorer_open_folder(path);
+            }
+        } else if (wcscmp(which, L"app") == 0) {
+            if (asb_running_packaged()) {
+                ui_notice(L"info", L"App Sandbox was installed from the Microsoft Store; Windows keeps its program folder private.");
+                return;
+            }
+            if (GetModuleFileNameW(NULL, path, MAX_PATH)) ok = explorer_select(path);
+            else path[0] = 0;
+        } else {
+            return;
+        }
+        if (!ok) {
+            _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE, L"This folder could not be opened: %s", path);
+            ui_notice(L"error", message);
+        }
+    } else if (wcscmp(action, L"openVmFolder") == 0 || wcscmp(action, L"copyVmPath") == 0) {
+        /* The VM's folder from vms.cfg: shown in Explorer (its disk selected)
+           or copied to the clipboard. */
+        int idx;
+        VmInstance *v;
+        wchar_t folder[MAX_PATH], message[MAX_PATH + 200];
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            if (!vm_root_folder(v, folder, MAX_PATH)) {
+                ui_notice(L"error", L"This VM has no disk folder yet.");
+            } else if (wcscmp(action, L"copyVmPath") == 0) {
+                BOOL copied = clipboard_set_text(folder);
+                if (copied)
+                    _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE, L"Copied: %s", folder);
+                else
+                    wcscpy_s(message, ARRAYSIZE(message), L"The path could not be copied to the clipboard.");
+                ui_notice(copied ? L"info" : L"error", message);
+            } else {
+                wchar_t disk_dir[MAX_PATH], *slash;
+                BOOL ok;
+                wcscpy_s(disk_dir, MAX_PATH, v->vhdx_path);
+                slash = wcsrchr(disk_dir, L'\\');
+                if (slash) *slash = 0;
+                ok = (_wcsicmp(disk_dir, folder) == 0 && path_is_file(v->vhdx_path))
+                    ? explorer_select(v->vhdx_path) : explorer_open_folder(folder);
+                if (!ok) {
+                    _snwprintf_s(message, ARRAYSIZE(message), _TRUNCATE,
+                                 L"The folder of \"%s\" was not found: %s", v->name, folder);
+                    ui_notice(L"error", message);
+                }
+            }
+        }
+    } else if (wcscmp(action, L"copyDiagnostics") == 0) {
+        size_t cap = 32768;
+        wchar_t *text = (wchar_t *)malloc(cap * sizeof(wchar_t));
+        if (text) {
+            build_diagnostics(text, cap);
+            if (clipboard_set_text(text))
+                ui_notice(L"info", L"Diagnostic info copied. Paste it into your bug report; it has no passwords or account names.");
+            else
+                ui_notice(L"error", L"The diagnostic info could not be copied to the clipboard.");
+            free(text);
+        }
+    } else if (wcscmp(action, L"openLink") == 0) {
+        /* {which}: one of the fixed project links (see open_project_link). */
+        wchar_t which[16] = L"";
+        if (json_get_string(json, L"which", which, ARRAYSIZE(which)))
+            open_project_link(which);
+    } else if (wcscmp(action, L"showDocument") == 0) {
+        /* {which: "notices" | "license"}: the copy beside AppSandbox.exe, or
+           the one on the project page when the package has none. */
+        wchar_t which[16] = L"";
+        BOOL notices;
+        wchar_t *text;
+        json_get_string(json, L"which", which, ARRAYSIZE(which));
+        notices = wcscmp(which, L"notices") == 0;
+        if (!notices && wcscmp(which, L"license") != 0) return;
+        text = read_text_beside_exe(notices ? L"THIRD-PARTY-NOTICES.md" : L"LICENSE");
+        if (text) {
+            post_text_message(L"document", which, notices ? L"Third-party notices" : L"License", text);
+            free(text);
+        } else {
+            open_project_link(which);
+        }
+    } else if (wcscmp(action, L"dismissVmError") == 0) {
+        int idx;
+        VmInstance *v;
+        if (json_vm_index(json, &idx) && (v = asb_vm_instance(asb_vm_get(idx))) != NULL) {
+            vm_note_clear(v->unique_id);
+            send_vm_list();
+        }
+    } else if (wcscmp(action, L"cancelExit") == 0) {
+        if (g_hwnd_main) exit_cancel(g_hwnd_main);
     }
 }
 
@@ -2110,9 +3442,21 @@ static void ui_core_event(const CoreVmEvent *event, void *context)
 
 static void on_webview2_message(const wchar_t *json)
 {
-    if (g_command_depth || asb_api_busy()) {
-        ui_show_alert(L"Another VM operation is in progress. Please try again when it finishes.");
-        return;
+    wchar_t action[64] = { 0 };
+    json_get_string(json, L"action", action, ARRAYSIZE(action));
+    if (!action_is_passive(action)) {
+        if (g_command_depth || asb_api_busy()) {
+            reply_rejected(action, L"Another VM operation is in progress. Try again when it finishes.");
+            return;
+        }
+        if (g_core_starting) {
+            reply_rejected(action, L"App Sandbox is still starting. Try again in a moment.");
+            return;
+        }
+        if (g_bg_op) {
+            reply_rejected(action, L"App Sandbox is finishing a VM operation (shut down, force stop or delete). Try again in a moment.");
+            return;
+        }
     }
     ++g_command_depth;
     reconcile_displays();
@@ -2150,14 +3494,35 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     if (!RegisterClassExW(&wc))
         return NULL;
 
+    /* Be told early when Windows signs out or restarts, so running VMs can
+       be shut down before the process (and with it every VM) ends. */
+    SetProcessShutdownParameters(0x3FF, 0);
+
     hwnd = CreateWindowExW(
         0, UI_MAIN_WINDOW_CLASS, L"App Sandbox",
         WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, 1575, 900,
+        CW_USEDEFAULT, CW_USEDEFAULT, UI_DEFAULT_WIDTH, UI_DEFAULT_HEIGHT,
         NULL, NULL, hInstance, NULL);
 
     if (!hwnd)
         return NULL;
+
+    /* The default size is in 100%-scaling pixels: scale it to the monitor's
+       DPI, keep it inside the work area and center it there. */
+    {
+        MONITORINFO mi;
+        UINT dpi = GetDpiForWindow(hwnd);
+        mi.cbSize = sizeof(mi);
+        if (!dpi) dpi = 96;
+        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
+            int work_w = mi.rcWork.right - mi.rcWork.left, work_h = mi.rcWork.bottom - mi.rcWork.top;
+            int w = MulDiv(UI_DEFAULT_WIDTH, (int)dpi, 96), h = MulDiv(UI_DEFAULT_HEIGHT, (int)dpi, 96);
+            if (w > work_w * 9 / 10) w = work_w * 9 / 10;
+            if (h > work_h * 9 / 10) h = work_h * 9 / 10;
+            SetWindowPos(hwnd, NULL, mi.rcWork.left + (work_w - w) / 2, mi.rcWork.top + (work_h - h) / 2,
+                         w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
 
     DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
 
@@ -2207,6 +3572,10 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_TIMER:
         if (wp == IDT_LAUNCH_VM) { launch_vm_tick(hwnd); return 0; }
+        if (wp == IDT_EXIT_WAIT) {
+            if (!g_command_depth) exit_tick(hwnd);   /* not inside one of its own dialogs */
+            return 0;
+        }
         if (wp == IDT_OPEN_CONSOLE) {
             VmInstance *v = asb_find_vm_by_id(g_console_vm_id);
             int idx = v ? asb_vm_index((AsbVm)v) : -1;
@@ -2259,16 +3628,54 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_GETMINMAXINFO:
     {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        if (g_min_width > 0)  mmi->ptMinTrackSize.x = g_min_width;
-        if (g_min_height > 0) mmi->ptMinTrackSize.y = g_min_height;
+        SIZE min = min_window_size(hwnd);
+        if (min.cx > 0) mmi->ptMinTrackSize.x = min.cx;
+        if (min.cy > 0) mmi->ptMinTrackSize.y = min.cy;
         return 0;
     }
 
+    case WM_DPICHANGED:
+        /* Moved to a monitor with another scale: take the size Windows suggests. */
+        if (!g_borderless_fullscreen) {
+            const RECT *suggested = (const RECT *)lp;
+            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
+                         suggested->right - suggested->left, suggested->bottom - suggested->top,
+                         SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        return 0;
+
     case WM_ASB_API_REQUEST:
+        /* A VM operation runs on the worker thread: the request waits for it. */
+        if (g_bg_op && !g_destroying && g_deferred_api_count < (int)ARRAYSIZE(g_deferred_api)) {
+            g_deferred_api[g_deferred_api_count++] = lp;
+            return 0;
+        }
         return asb_api_dispatch((void *)lp);
 
     case WM_ASB_API_SHUTDOWN:
         DestroyWindow(hwnd);
+        return 0;
+
+    case WM_QUERYENDSESSION:
+    {
+        /* Signing out, restarting, or the package is being updated. Ending
+           the process turns every VM off, so hold Windows back with a reason
+           while the VMs shut down, and exit when they have stopped. Windows
+           shows the reason and the user can still continue at once. */
+        int running = 0, busy = 0;
+        if (!g_prereq_ok || (lp & ENDSESSION_CRITICAL)) return TRUE;
+        count_vm_activity(&running, &busy);
+        if (!running) return TRUE;
+        if (!g_exit_block_reason)
+            g_exit_block_reason = ShutdownBlockReasonCreate(hwnd, L"Shutting down virtual machines so their work is saved");
+        exit_begin(hwnd, TRUE);
+        return FALSE;
+    }
+
+    case WM_ENDSESSION:
+        /* wp FALSE: the sign-out or restart was cancelled; App Sandbox stays.
+           wp TRUE: the session ends now with whatever still runs. */
+        if (!wp && g_exit_for_session) exit_cancel(hwnd);
         return 0;
 
     case WM_CORE_CHANGED:
@@ -2441,21 +3848,30 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         g_prereq_ok = TRUE;
         if (!asb_api_start(g_hInstance, g_hwnd_main))
-            ui_show_alert(L"The local API could not start. See headless.log for details.");
+            ui_alert(L"warning", L"Local API not available", L"The local API could not start. See headless.log for details.");
         send_full_state();
         webview2_post(L"{\"type\":\"coreReady\"}");
         return 0;
 
     case WM_SHOW_ALERT:
     {
-        wchar_t *msg_text = (wchar_t *)lp;
-        if (msg_text) { ui_show_alert(msg_text); free(msg_text); }
+        PendingAlert *pa = (PendingAlert *)lp;
+        if (pa) {
+            ui_alert(pa->kind, pa->title[0] ? pa->title : NULL, pa->message);
+            free(pa);
+        }
         return 0;
     }
 
+    case WM_BG_OP_DONE:
+        if (lp) bg_op_finish((BgOp *)lp);
+        return 0;
+
     case WM_TRAYICON:
         if (g_command_depth || asb_api_busy()) return 0;
-        if (lp == WM_LBUTTONDBLCLK) {
+        if (lp == WM_LBUTTONDBLCLK || ((lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) && g_bg_op)) {
+            /* While a VM operation finishes the menu's actions would wait;
+               show the window instead. */
             ShowWindow(hwnd, SW_RESTORE);
             SetForegroundWindow(hwnd);
         } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
@@ -2467,57 +3883,36 @@ static LRESULT CALLBACK main_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_CLOSE:
-    {
         if (g_command_depth || asb_api_busy()) return 0;
-        int i, count = asb_vm_count();
-        BOOL has_running = FALSE;
-        for (i = 0; i < count; i++) {
-            if (asb_vm_is_running(asb_vm_get(i))) { has_running = TRUE; break; }
-        }
-        if (has_running) {
-            if (!asb_get_suppress_tray_warn()) {
-                int btn = 0;
-                BOOL checked = FALSE;
-                TASKDIALOGCONFIG tdc;
-                TASKDIALOG_BUTTON buttons[2];
-
-                buttons[0].nButtonID = IDOK;
-                buttons[0].pszButtonText = L"Minimize to Tray";
-                buttons[1].nButtonID = IDCANCEL;
-                buttons[1].pszButtonText = L"Cancel";
-
-                ZeroMemory(&tdc, sizeof(tdc));
-                tdc.cbSize = sizeof(tdc);
-                tdc.hwndParent = hwnd;
-                tdc.pszWindowTitle = L"App Sandbox";
-                tdc.pszMainIcon = TD_INFORMATION_ICON;
-                tdc.pszMainInstruction = L"VMs are still running";
-                tdc.pszContent = L"App Sandbox will minimize to the system tray.\n"
-                                 L"Your VMs will continue running in the background.\n\n"
-                                 L"Click the tray icon to manage VMs or exit.";
-                tdc.pszVerificationText = L"Don't show this again";
-                tdc.cButtons = 2;
-                tdc.pButtons = buttons;
-                tdc.nDefaultButton = IDOK;
-
-                if (FAILED(TaskDialogIndirect(&tdc, &btn, NULL, &checked)) || btn != IDOK)
-                    return 0;
-
-                if (checked) {
-                    asb_set_suppress_tray_warn(TRUE);
-                    asb_save();
-                }
-            }
-            ShowWindow(hwnd, SW_HIDE);
+        if (g_bg_op) {
+            ui_notice(L"info", L"App Sandbox is finishing a VM operation. Close the window again in a moment.");
             return 0;
         }
-        DestroyWindow(hwnd);
+        confirm_exit(hwnd, TRUE);
         return 0;
-    }
 
     case WM_DESTROY:
     {
         int i;
+        g_destroying = TRUE;
+        KillTimer(hwnd, IDT_EXIT_WAIT);
+        if (g_exit_block_reason) {
+            ShutdownBlockReasonDestroy(hwnd);
+            g_exit_block_reason = FALSE;
+        }
+        /* Let a stop or delete in progress finish before the core shuts down. */
+        if (g_bg_thread) {
+            if (WaitForSingleObject(g_bg_thread, 60000) == WAIT_OBJECT_0) {
+                free(g_bg_op);         /* its WM_BG_OP_DONE is never handled now */
+                g_bg_op = NULL;
+            }
+            CloseHandle(g_bg_thread);
+            g_bg_thread = NULL;
+        }
+        /* Waiting API requests are answered while the API stops. */
+        for (i = 0; i < g_deferred_api_count; i++)
+            PostMessageW(hwnd, WM_ASB_API_REQUEST, 0, g_deferred_api[i]);
+        g_deferred_api_count = 0;
         asb_api_stop();
         asb_events_unsubscribe(g_core_subscription);
         g_core_subscription = 0;

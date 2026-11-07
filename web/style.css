@@ -2,7 +2,11 @@
  *
  * Colors are tokens on :root. Dark is the default; light applies with
  * data-theme="light", and "System" (no data-theme) follows the OS through
- * prefers-color-scheme. --accent can be overridden from Settings. */
+ * prefers-color-scheme. --accent can be overridden from Settings.
+ *
+ * Contrast: text on --accent uses --on-accent (dark in both themes: at least
+ * 6:1 on every accent choice); accent-colored text on light backgrounds uses
+ * --accent-text, a darker mix of the accent. */
 :root {
     --bg: #0F1115;
     --sidebar: #13161C;
@@ -17,6 +21,8 @@
     --accent: #4EA6F5;
     --on-accent: #0B0D11;
     --accent-soft: rgba(78, 166, 245, 0.16);
+    --accent-text: var(--accent);
+    --on-danger: #0B0D11;
     --danger: #F0605D;
     --danger-text: #F38B88;
     --danger-soft: rgba(240, 96, 93, 0.14);
@@ -46,11 +52,13 @@
     --text: #171A21;
     --text-dim: #4F5867;
     --text-faint: #5F6877;
-    --on-accent: #FFFFFF;
+    --on-accent: #0B0D11;
+    --accent-text: #1F5E96;
+    --on-danger: #FFFFFF;
     --danger: #C9302C;
     --danger-text: #B42B27;
-    --success: #1E8A4C;
-    --warning: #9A6A00;
+    --success: #17703D;
+    --warning: #855A00;
     --overlay: rgba(15, 17, 21, 0.45);
     --shadow: 0 16px 40px rgba(15, 17, 21, 0.18);
     color-scheme: light;
@@ -67,14 +75,30 @@
         --text: #171A21;
         --text-dim: #4F5867;
         --text-faint: #5F6877;
-        --on-accent: #FFFFFF;
+        --on-accent: #0B0D11;
+        --accent-text: #1F5E96;
+        --on-danger: #FFFFFF;
         --danger: #C9302C;
         --danger-text: #B42B27;
-        --success: #1E8A4C;
-        --warning: #9A6A00;
+        --success: #17703D;
+        --warning: #855A00;
         --overlay: rgba(15, 17, 21, 0.45);
         --shadow: 0 16px 40px rgba(15, 17, 21, 0.18);
         color-scheme: light;
+    }
+}
+
+/* Tints that follow the chosen accent color (fixed blue values above where
+   color-mix is not available). */
+@supports (color: color-mix(in srgb, red 50%, blue)) {
+    :root { --accent-soft: color-mix(in srgb, var(--accent) 16%, transparent); }
+    :root[data-theme="light"] { --accent-text: color-mix(in srgb, var(--accent) 55%, #000000); }
+}
+@media (prefers-color-scheme: light) {
+    @supports (color: color-mix(in srgb, red 50%, blue)) {
+        :root:not([data-theme="dark"]):not([data-theme="light"]) {
+            --accent-text: color-mix(in srgb, var(--accent) 55%, #000000);
+        }
     }
 }
 
@@ -224,7 +248,7 @@ body {
     background: var(--surface-2); color: var(--text-dim);
     display: flex; align-items: center; justify-content: center;
 }
-.vm-card.running .os-tile { background: var(--accent-soft); color: var(--accent); }
+.vm-card.running .os-tile { background: var(--accent-soft); color: var(--accent-text); }
 .vm-card-names { display: flex; flex-direction: column; gap: 3px; min-width: 0; margin-right: auto; }
 .vm-card-names h2 { font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .vm-card-names span { color: var(--text-dim); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -237,7 +261,7 @@ body {
 }
 .badge::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
 .badge.running { background: var(--success-soft); color: var(--success); }
-.badge.busy { background: var(--accent-soft); color: var(--accent); }
+.badge.busy { background: var(--accent-soft); color: var(--accent-text); }
 .badge.busy::before { display: none; }
 .badge.stopping { background: rgba(242, 184, 75, 0.14); color: var(--warning); }
 
@@ -432,6 +456,10 @@ body {
     cursor: text;
 }
 #log-panel .log-line { white-space: pre-wrap; word-break: break-all; }
+#log-panel .log-line.log-error { color: var(--danger-text); }
+.activity-tools { display: flex; gap: 6px; }
+.activity.collapsed .activity-tools { display: none; }
+.small-btn { height: 28px; padding: 0 10px; font-size: 12px; }
 
 /* ================================================================== */
 /* Controls                                                           */
@@ -498,7 +526,11 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
     gap: 8px 12px;
     align-items: center;
 }
-.form-grid label { font-size: 13px; color: var(--text-dim); text-align: right; }
+.form-grid label, .form-grid .form-label { font-size: 13px; color: var(--text-dim); text-align: right; }
+.form-grid .form-help { margin: -4px 0 0; }
+.modal .form-hint { font-size: 12px; color: var(--text-dim); margin: 0 0 12px; overflow-wrap: anywhere; }
+.modal .form-hint:empty { display: none; }
+.modal .form-hint.error { color: var(--danger-text); }
 .form-row { display: flex; align-items: center; gap: 8px; min-height: 34px; }
 .form-row .host-info { font-size: 12px; color: var(--text-faint); margin-left: 6px; }
 
@@ -509,6 +541,7 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 
 .template-dropdown { position: relative; min-width: 190px; }
 .template-dropdown-selected {
+    display: block; width: 100%; text-align: left; font-weight: 400;
     background: var(--field); color: var(--text);
     border: 1px solid var(--border-strong); border-radius: 8px;
     padding: 0 10px; font-size: 13px; height: 34px; line-height: 32px;
@@ -522,22 +555,34 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 }
 .template-dropdown.open .template-dropdown-list { display: block; }
 .template-dropdown-item {
-    display: flex; align-items: center; padding: 8px 10px;
-    font-size: 13px; cursor: pointer; color: var(--text);
+    display: flex; align-items: center; gap: 4px; padding: 2px 4px;
+    font-size: 13px; color: var(--text);
 }
-.template-dropdown-item:hover { background: var(--surface-2); }
-.template-dropdown-item .tpl-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.template-dropdown-item .tpl-delete { flex-shrink: 0; margin-left: 6px; cursor: pointer; opacity: 0.6; font-size: 14px; }
-.template-dropdown-item .tpl-delete:hover { opacity: 1; }
+.template-dropdown-item:hover, .template-dropdown-item:focus-within { background: var(--surface-2); }
+.template-dropdown-item[aria-selected="true"] .tpl-name { font-weight: 600; }
+.template-dropdown-item .tpl-name {
+    flex: 1; min-width: 0; display: block; text-align: left; height: 32px;
+    background: transparent; border: none; font-weight: 400; color: var(--text);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.template-dropdown-item .tpl-delete {
+    flex: none; width: 30px; height: 30px; padding: 0;
+    background: transparent; border-color: transparent; color: var(--text-dim);
+}
+.template-dropdown-item .tpl-delete:hover { color: var(--danger-text); border-color: var(--danger-soft); }
 
 .field-warn {
     font-size: 12px; color: var(--danger-text);
     white-space: normal; overflow-wrap: anywhere; flex: 1 1 0; min-width: 0;
 }
-.pass-mismatch:focus { border-color: var(--danger) !important; }
+.pass-mismatch { border-color: var(--danger) !important; }
 .pass-match:focus { border-color: var(--success) !important; }
-.toggle-pass { cursor: pointer; font-size: 14px; opacity: 0.6; user-select: none; }
-.toggle-pass:hover { opacity: 1; }
+.toggle-pass {
+    flex: none; width: 34px; height: 34px; padding: 0;
+    background: transparent; border-color: transparent; color: var(--text-dim);
+}
+.toggle-pass:hover { color: var(--text); border-color: var(--border-strong); }
+.toggle-pass[aria-pressed="true"] { color: var(--accent-text); background: var(--accent-soft); }
 .cred-row { display: flex; align-items: center; gap: 8px; }
 .cred-row label { font-size: 13px; color: var(--text-dim); white-space: nowrap; }
 .action-buttons { display: flex; gap: 8px; }
@@ -584,7 +629,7 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 .modal h3 { font-size: 17px; font-weight: 700; margin-bottom: 14px; overflow-wrap: anywhere; }
 .modal p { font-size: 13px; color: var(--text-dim); margin-bottom: 16px; line-height: 1.55; }
 .modal-buttons { display: flex; justify-content: flex-end; gap: 8px; }
-.modal-buttons .danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.modal-buttons .danger { background: var(--danger); border-color: var(--danger); color: var(--on-danger); }
 .modal-buttons .danger:hover:not(:disabled) { filter: brightness(1.08); background: var(--danger); }
 
 #edit-vm-warn, #snapshot-warn { display: block; margin-top: 12px; }
@@ -667,3 +712,57 @@ label:has(input[type="checkbox"]:disabled) { opacity: 0.5; cursor: default; }
 /* Start-up loading state in the VM list */
 .loading-state { align-items: center; text-align: center; }
 .loading-state .spinner { width: 28px; height: 28px; margin-bottom: 4px; }
+
+/* VM card: a problem with the last action (start, shut down, delete) */
+.vm-card-error, .notice.error {
+    display: flex; align-items: flex-start; gap: 8px;
+    font-size: 13px; line-height: 1.45; color: var(--text);
+    background: var(--danger-soft); border: 1px solid var(--danger);
+}
+.vm-card-error { margin: 0 16px 12px; padding: 8px 10px; border-radius: var(--radius); }
+.vm-card-error > span, .notice.error > span { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.notice-dismiss {
+    flex: none; width: 26px; height: 26px; padding: 0; font-size: 16px; line-height: 1;
+    background: transparent; border-color: transparent; color: var(--text-dim);
+}
+.notice-dismiss:hover { color: var(--text); border-color: var(--border-strong); }
+
+/* Paths in Settings and the VM's Files card */
+.path-value {
+    font-family: var(--mono); font-size: 12px; color: var(--text-dim);
+    overflow-wrap: anywhere; user-select: text;
+}
+.path-value:empty { display: none; }
+
+/* Notices that do not interrupt */
+.toasts {
+    position: fixed; right: 20px; bottom: 64px; z-index: 1100;
+    display: flex; flex-direction: column; align-items: flex-end; gap: 8px;
+    max-width: min(440px, calc(100vw - 40px)); pointer-events: none;
+}
+.toast {
+    pointer-events: auto;
+    display: flex; align-items: center; gap: 10px;
+    background: var(--surface); color: var(--text);
+    border: 1px solid var(--border-strong); border-left: 4px solid var(--accent);
+    border-radius: var(--radius); box-shadow: var(--shadow);
+    padding: 10px 10px 10px 14px; font-size: 13px; line-height: 1.45;
+}
+.toast.error { border-left-color: var(--danger); }
+.toast.warning { border-left-color: var(--warning); }
+.toast-text { flex: 1; min-width: 0; overflow-wrap: anywhere; user-select: text; }
+
+/* Confirm dialog parts */
+.modal-check { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--text-dim); cursor: pointer; margin-bottom: 10px; }
+.modal-input-row { margin-bottom: 12px; }
+.modal-input-row label { display: block; font-size: 12px; color: var(--text-dim); margin-bottom: 4px; }
+.modal-input-row input { width: 100%; }
+.prereq-message p { margin-bottom: 10px; }
+
+/* License and third-party notices */
+.document-text {
+    font-family: var(--mono); font-size: 12px; line-height: 1.5; color: var(--text);
+    white-space: pre-wrap; overflow-wrap: anywhere; user-select: text;
+    background: var(--field); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; max-height: calc(100vh - 220px); overflow-y: auto;
+}
