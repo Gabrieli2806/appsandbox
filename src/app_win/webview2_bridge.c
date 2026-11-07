@@ -18,6 +18,7 @@
 #include "ui.h"
 #include <commctrl.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -112,16 +113,18 @@ static ICoreWebView2Environment *g_env;
 #define RESTART_RETRY_MS 2000
 static int g_restart_retries;
 
-/* HRESULT_FROM_WIN32(ERROR_BUSY): the user data folder still belongs to a
-   WebView2 browser process that has not finished (an App Sandbox window
-   that was just closed, or one left behind by a process that was ended).
-   Starting is retried every BUSY_RETRY_MS for BUSY_RETRIES tries, then the
-   window uses a second user data folder so it still opens. */
+/* HRESULT_FROM_WIN32(ERROR_BUSY): WebView2 considers the user data folder
+   in use. That happens while the browser process of a window that was just
+   closed is still exiting, and also when the browser cannot take the
+   folder's lock file at all (for example an access list it cannot work
+   with). Starting is retried every BUSY_RETRY_MS, BUSY_RETRIES times per
+   folder, then the next user data folder in g_udf_kinds is tried. */
 #define WV2_E_BUSY       ((HRESULT)0x800700AAL)
 #define BUSY_RETRY_MS    1000
-#define BUSY_RETRIES     15
-static int  g_busy_retries;
-static BOOL g_alt_user_data;
+#define BUSY_RETRIES     3
+enum { UDF_LOCAL_APPDATA, UDF_PROGRAMDATA, UDF_PROGRAMDATA_2, UDF_COUNT };
+static int g_busy_retries;
+static int g_udf_kind;          /* index into the folders above */
 static UINT_PTR g_restart_timer;
 
 /* Subclass of the parent window: see parent_subclass_proc. */
@@ -1054,14 +1057,31 @@ static HRESULT start_environment(void)
     DWORD n;
     HRESULT hr;
 
-    /* User data folder */
-    n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
-    if (n == 0 || n >= MAX_PATH)
-        wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
-    if (wcslen(base) + 32 >= MAX_PATH)
-        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
-    swprintf_s(udf, MAX_PATH, g_alt_user_data ? L"%s\\AppSandbox\\WebView2Data.2"
-                                              : L"%s\\AppSandbox\\WebView2Data", base);
+    /* User data folder. The user's own local app data comes first: it has
+       the profile's normal access list, which WebView2 expects, and only
+       this user can change it. (Packaged installs get the package's
+       private copy of it.) The folders older versions used under
+       %ProgramData%\AppSandbox remain as fallbacks. */
+    udf[0] = 0;
+    if (g_udf_kind == UDF_LOCAL_APPDATA) {
+        PWSTR local = NULL;
+        if (SUCCEEDED(SHGetKnownFolderPath(&FOLDERID_LocalAppData, KF_FLAG_CREATE, NULL, &local)) &&
+            local && wcslen(local) + 32 < MAX_PATH)
+            swprintf_s(udf, MAX_PATH, L"%s\\AppSandbox\\WebView2", local);
+        if (local) CoTaskMemFree(local);
+        if (!udf[0]) g_udf_kind = UDF_PROGRAMDATA;
+    }
+    if (g_udf_kind != UDF_LOCAL_APPDATA) {
+        n = GetEnvironmentVariableW(L"ProgramData", base, MAX_PATH);
+        if (n == 0 || n >= MAX_PATH)
+            wcscpy_s(base, MAX_PATH, L"C:\\ProgramData");
+        if (wcslen(base) + 32 >= MAX_PATH)
+            return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+        swprintf_s(udf, MAX_PATH, g_udf_kind == UDF_PROGRAMDATA_2
+                                  ? L"%s\\AppSandbox\\WebView2Data.2"
+                                  : L"%s\\AppSandbox\\WebView2Data", base);
+    }
+    ui_log(L"WebView2: user data folder %s", udf);
 
     eh = (EnvHandler *)calloc(1, sizeof(EnvHandler));
     if (!eh) return E_OUTOFMEMORY;
@@ -1114,17 +1134,17 @@ static void CALLBACK retry_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
 static void start_failed(HRESULT hr)
 {
     if (g_shutting_down) return;
-    if (hr == WV2_E_BUSY && (g_busy_retries < BUSY_RETRIES || !g_alt_user_data)) {
+    if (hr == WV2_E_BUSY && (g_busy_retries < BUSY_RETRIES || g_udf_kind + 1 < UDF_COUNT)) {
         UINT delay = BUSY_RETRY_MS;
         if (g_busy_retries < BUSY_RETRIES) {
             if (g_busy_retries == 0)
-                ui_log(L"WebView2: its data folder is still in use by another WebView2 process; "
-                       L"waiting for it to close");
+                ui_log(L"WebView2: its data folder is in use (0x800700AA); trying again");
             g_busy_retries++;
         } else {
-            g_alt_user_data = TRUE;
+            g_udf_kind++;
+            g_busy_retries = 0;
             delay = 10;
-            ui_log(L"WebView2: the data folder stayed in use; using WebView2Data.2 instead");
+            ui_log(L"WebView2: the data folder stayed in use; trying another one");
         }
         kill_restart_timer();
         g_restart_timer = SetTimer(NULL, 0, delay, retry_timer_proc);
