@@ -97,15 +97,26 @@ items need a change in the repository.
   Insider VM (`fe3_templates.h`), and copies its DLLs into guests. It is not
   a documented redistribution channel; Microsoft can change it at any time,
   and a Store reviewer may ask about it.
-- The DLLs are now accepted only with a valid Microsoft Authenticode
-  signature (on download and on every use of the cache). **Before release,
-  confirm on a real host** that a GPU VM logs `d3dlayers: using cached
-  layers` / `staged 6 mapping-layer files` and no "no valid signature" line
-  (or, on an existing install, run `Get-AuthenticodeSignature` on
-  `d3dlayers\*.dll` beside `AppSandbox.exe` (zip) or in
-  `%ProgramData%\AppSandbox` (MSIX): every DLL must be Valid, signer
-  Microsoft). If they are not signed, switch the check to comparing the
-  `.appx` with the SHA-1 `Digest` that FE3 returns over HTTPS.
+- A download is accepted when the `.appx` matches the digest FE3 returns
+  over HTTPS (SHA-256 `AdditionalDigest`, else the SHA-1 `Digest`) **or**
+  every DLL has a valid Microsoft Authenticode signature. `dzn_icd.json` is
+  always written from a fixed template (only `api_version` is copied). The
+  SHA-256 of each accepted file goes to `d3dlayers.verified` beside the
+  `d3dlayers` folder; later VM starts compare against it and need no network.
+  A set that fails both checks is discarded and `d3dlayers.retry` blocks new
+  downloads for 24 hours. Neither check has been confirmed against a real
+  download yet. **Before release, on a real host:**
+  - Delete `d3dlayers`, `d3dlayers.verified` and `d3dlayers.retry` beside
+    `AppSandbox.exe` (zip) or in `%ProgramData%\AppSandbox` (MSIX), start a
+    GPU VM and check the log: `package matches the SHA-256 digest` (or
+    `SHA-1`) and `staged 6 mapping-layer files`. If it says the package does
+    not match or has no digest, the FE3 parsing in `parse_leaf` needs a look.
+  - Run `Get-AuthenticodeSignature` on `d3dlayers\*.dll`. If any DLL is not
+    Valid with a Microsoft signer, the digest is the only check that works:
+    note it here.
+  - In the guest, `C:\Windows\AppSandbox\d3dlayers\dzn_icd.json` has
+    `library_path` `C:\\Windows\\AppSandbox\\d3dlayers\\vulkan_dzn.dll` and
+    `vulkaninfo --summary` lists the Dozen device.
 - Longer term, prefer redistributable sources: Mesa d3d12/dzn (already built
   in `tools/win-mesa-gl`), microsoft/OpenCLOn12 (MIT) and `dxil.dll` from
   DirectXShaderCompiler releases; or let the guest install the Compatibility
@@ -135,6 +146,8 @@ items need a change in the repository.
 
 1. Build Release x64 with `AsbSourceRepo`/`AsbSourceRef` set (2.3).
 2. Sign binaries, attest drivers, stage without `*.cer` (2.1, 2.2).
+   Until `make-release.ps1` copies them (2.6), copy `LICENSE` and
+   `THIRD-PARTY-NOTICES.md` to the root of the stage by hand.
 3. Zip; publish as a GitHub release (not pre-release) with SHA-256 of the zip
    in the notes.
 4. Remove the "test signing" and "SmartScreen" text from the release notes.

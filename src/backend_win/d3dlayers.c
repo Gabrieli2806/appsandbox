@@ -11,12 +11,32 @@
  *      response, so version changes / extra updates do not break resolution.
  *   3. Download the .appx (a zip) from the Microsoft CDN.
  *   4. Extract with the in-box tar.exe (libarchive handles zip natively).
- *   5. Copy the mapping-layer files into <exe_dir>\d3dlayers\ (cached).
- *   6. Check that every DLL carries a valid Authenticode signature from
- *      Microsoft. The CDN url is often plain HTTP and the DLLs end up in the
- *      guest's System32, so nothing is used without that check. The cache
- *      is checked the same way each time it is used; a cache that fails is
- *      deleted and downloaded again.
+ *   5. Verify, then copy the mapping-layer files into <exe_dir>\d3dlayers\.
+ *
+ * Verification. The CDN url is often plain HTTP and the DLLs end up in the
+ * guest's System32, so a download is accepted only when either
+ *   - the .appx matches the digest that FE3 returned over HTTPS for that file
+ *     (SHA-256 from <AdditionalDigest> when present, else the SHA-1 Digest),
+ *   - or every DLL carries a valid Authenticode signature from Microsoft.
+ * Either proves the files come from Microsoft; two independent checks keep
+ * the feature working if one of them stops applying (FE3 changes its reply,
+ * or a package version ships DLLs without their own signature).
+ * dzn_icd.json is not taken from the package: it is written from a fixed
+ * template (only api_version is copied, digits and dots only), so the Vulkan
+ * ICD path the guest registers can never point anywhere else.
+ *
+ * After a set is accepted, the SHA-256 of each cached file is written to
+ * <exe_dir>\d3dlayers.verified (before the files are copied). A cache whose
+ * files match that list is used without any further check or network access.
+ * A cache that does not match is downloaded again; the old files stay until a
+ * new set has been verified, so a failed or offline download loses nothing.
+ * A cache without the list (made by an older version) is accepted once if
+ * every DLL is signed by Microsoft, and the list is then written.
+ *
+ * When a downloaded set fails verification, <exe_dir>\d3dlayers.retry is
+ * written and no new download is attempted for DL_RETRY_HOURS (deleting the
+ * file allows an earlier retry), so a package that cannot be verified does
+ * not cost a full download on every VM start.
  *
  * Defensive throughout: any failure returns FALSE and VM creation continues
  * without GL/CL/Vulkan acceleration.
@@ -30,6 +50,7 @@
 #include <winhttp.h>
 #include <rpc.h>
 #include <wincrypt.h>
+#include <bcrypt.h>
 #include <wintrust.h>
 #include <softpub.h>
 #include <stdio.h>
@@ -40,6 +61,7 @@
 #pragma comment(lib, "rpcrt4.lib")
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 #define DL_PRODUCT_ID       L"9NQPSL29BFFF"
 #define DL_FE3_HOST         L"fe3.delivery.mp.microsoft.com"
@@ -59,6 +81,14 @@
 #define DL_APPX_NAME    L"D3DMappingLayers_" DL_ARCH L".appx"
 #define DL_ISI_ARCH      "_" DL_ARCH_A "_"
 #define DL_MAX_ROUNDS       5   /* FE3 faults intermittently; retry the chain */
+#define DL_VERIFIED_FILE    L"d3dlayers.verified"   /* beside the cache dir */
+#define DL_RETRY_FILE       L"d3dlayers.retry"      /* beside the cache dir */
+#define DL_RETRY_HOURS      24
+#define DL_JSON_NAME        L"dzn_icd.json"
+/* Guest location of vulkan_dzn.dll, JSON-escaped. Must match the GL-layers
+   share guest_path in gpu_enum.c (gpu_append_gl_layers_share). */
+#define DL_DZN_GUEST_PATH   "C:\\\\Windows\\\\AppSandbox\\\\d3dlayers\\\\vulkan_dzn.dll"
+#define DL_DZN_API_DEFAULT  "1.2.0"
 
 /* Files to extract: dest leaf name <- source path inside the .appx. */
 static const wchar_t *const DL_DST[] = {
@@ -341,9 +371,13 @@ done:
 
 /* Find the D3DMappingLayers .appx matching the build architecture in a
  * (decoded) SyncUpdates response and resolve its UpdateIdentity by joining the
- * file's enclosing <Update> <ID> to the matching NewUpdates <UpdateIdentity>. */
+ * file's enclosing <Update> <ID> to the matching NewUpdates <UpdateIdentity>.
+ * digest receives the file's Digest attribute (base64 SHA-1) and sha256 the
+ * base64 SHA-256 from its <AdditionalDigest Algorithm="SHA256"> child; either
+ * is left empty when the reply does not carry it. */
 static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
-                           char *rev, size_t rev_cch, char *digest, size_t dig_cch)
+                           char *rev, size_t rev_cch, char *digest, size_t dig_cch,
+                           char *sha256, size_t sha_cch)
 {
     const char *p = buf;
     while ((p = strstr(p, "<File ")) != NULL) {
@@ -366,7 +400,17 @@ static BOOL parse_leaf(const char *buf, char *uid, size_t uid_cch,
             p = gt + 1; continue;
         }
         /* matched the package file for this architecture */
-        attr_in(tag, "Digest", digest, dig_cch);
+        digest[0] = 0;
+        sha256[0] = 0;
+        attr_in(tag, " Digest", digest, dig_cch);   /* not DigestAlgorithm */
+        if (taglen == 0 || tag[taglen - 1] != '/') {
+            static const char ad_tag[] = "<AdditionalDigest Algorithm=\"SHA256\">";
+            const char *end = strstr(gt, "</File>");
+            const char *ad = strstr(gt, ad_tag);
+            if (end && ad && ad < end &&
+                !between(ad, ad_tag, "<", sha256, sha_cch))
+                sha256[0] = 0;
+        }
 
         /* nearest <ID>N</ID> before this <File> = the ExtendedUpdateInfo id */
         idp = rfind(buf, p, "<ID>");
@@ -425,8 +469,12 @@ static BOOL parse_file_url(const char *buf, const char *digest,
     return FALSE;
 }
 
-/* Resolve the (build-architecture) package CDN url from Microsoft. Returns 0 on success. */
-static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
+/* Resolve the (build-architecture) package CDN url from Microsoft, with the
+ * package's base64 SHA-1 and SHA-256 digests (either may come back empty).
+ * Returns 0 on success. */
+static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch,
+                       char *sha1_out, size_t sha1_cch,
+                       char *sha256_out, size_t sha256_cch)
 {
     int round, rc = -1;
     for (round = 0; round < DL_MAX_ROUNDS && rc != 0; round++) {
@@ -434,7 +482,7 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         char *t1, *cookie_req = NULL, *cookie_resp = NULL;
         char cookie[8192];
         char *sync_req = NULL, *sync_resp = NULL;
-        char uid[128] = {0}, rev[32] = {0}, digest[256] = {0};
+        char uid[128] = {0}, rev[32] = {0}, digest[256] = {0}, sha256[256] = {0};
         char *ext_req = NULL, *ext_resp = NULL;
 
         new_guid(msgid, sizeof(msgid));
@@ -460,7 +508,7 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         if (sync_req) { sync_resp = fe3_post(DL_FE3_PATH, sync_req); free(sync_req); }
         if (sync_resp) html_unescape(sync_resp);
         if (!sync_resp || !parse_leaf(sync_resp, uid, sizeof(uid), rev, sizeof(rev),
-                                      digest, sizeof(digest))) {
+                                      digest, sizeof(digest), sha256, sizeof(sha256))) {
             free(sync_resp); Sleep(1500); continue;
         }
         free(sync_resp);
@@ -474,54 +522,159 @@ static int resolve_url(const char *wucatid, wchar_t *url_out, size_t url_cch)
         if (t1) { ext_req = str_replace_all(t1, "%REVISION%", rev); free(t1); }
         if (ext_req) { ext_resp = fe3_post(DL_FE3_PATH_SECURED, ext_req); free(ext_req); }
         if (ext_resp) html_unescape(ext_resp);
-        if (ext_resp && parse_file_url(ext_resp, digest, url_out, url_cch))
+        if (ext_resp && parse_file_url(ext_resp, digest, url_out, url_cch)) {
+            strncpy_s(sha1_out, sha1_cch, digest, _TRUNCATE);
+            strncpy_s(sha256_out, sha256_cch, sha256, _TRUNCATE);
             rc = 0;
-        else
+        } else
             Sleep(1500);
         free(ext_resp);
     }
     return rc;
 }
 
-/* The shipped dzn_icd.<arch>.json gives library_path as "<arch>\vulkan_dzn.dll",
- * relative to the manifest. The layers are staged into one flat directory, so
- * point library_path at the DLL's fully-qualified location in the guest.
- *
- * The path must be absolute: the Vulkan loader resolves an ICD via
- * LoadLibraryW(), falling back to LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_*),
- * and LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires a fully-qualified path. The
- * path must match the GL-layers share guest_path in gpu_enum.c
- * (gpu_append_gl_layers_share). */
-static void rewrite_dzn_json(const wchar_t *dir)
-{
-    wchar_t path[MAX_PATH];
-    FILE *f = NULL;
-    long sz;
-    char *buf, *fixed;
-    size_t rd;
+/* ---- Vulkan ICD manifest ---- */
 
-    swprintf_s(path, MAX_PATH, L"%s\\dzn_icd.json", dir);
+static const char *skip_ws(const char *p)
+{
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+    return p;
+}
+
+/* Read api_version from a dzn_icd JSON file into out. Only a value made of
+ * digits and dots (starting with a digit) is taken; anything else, or a
+ * missing file, gives DL_DZN_API_DEFAULT. */
+static void read_dzn_api_version(const wchar_t *path, char *out, size_t cch)
+{
+    FILE *f = NULL;
+    char buf[4096];
+    size_t rd, n;
+    const char *p;
+
+    strcpy_s(out, cch, DL_DZN_API_DEFAULT);
     if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
-    fseek(f, 0, SEEK_END); sz = ftell(f); fseek(f, 0, SEEK_SET);
-    if (sz <= 0 || sz > 65536) { fclose(f); return; }
-    buf = (char *)malloc((size_t)sz + 1);
-    if (!buf) { fclose(f); return; }
-    rd = fread(buf, 1, (size_t)sz, f);
+    rd = fread(buf, 1, sizeof(buf) - 1, f);
     fclose(f);
     buf[rd] = 0;
 
-    /* On disk the JSON value is  <arch>\\vulkan_dzn.dll  (two backslash
-     * characters, JSON-escaped). Match that exactly and replace it with the
-     * absolute guest path (each backslash JSON-escaped). */
-    fixed = str_replace_all(buf, DL_ARCH_A "\\\\vulkan_dzn.dll",
-                            "C:\\\\Windows\\\\AppSandbox\\\\d3dlayers\\\\vulkan_dzn.dll");
-    free(buf);
-    if (!fixed) return;
-    if (_wfopen_s(&f, path, L"wb") == 0 && f) {
-        fwrite(fixed, 1, strlen(fixed), f);
-        fclose(f);
+    p = strstr(buf, "\"api_version\"");
+    if (!p) return;
+    p = skip_ws(p + 13);
+    if (*p != ':') return;
+    p = skip_ws(p + 1);
+    if (*p != '"') return;
+    p++;
+    if (*p < '0' || *p > '9') return;
+    for (n = 0; (p[n] >= '0' && p[n] <= '9') || p[n] == '.'; n++)
+        ;
+    if (p[n] != '"' || n >= cch) return;
+    memcpy(out, p, n);
+    out[n] = 0;
+}
+
+/* Write the Vulkan ICD manifest to dst_path from a fixed template. Nothing in
+ * it comes from the download except api_version (read from src_path, which
+ * may be the same file), so library_path is always the expected DLL.
+ *
+ * library_path is the DLL's fully-qualified location in the guest: the layers
+ * are staged into one flat directory, and the Vulkan loader resolves an ICD
+ * via LoadLibraryW(), falling back to LoadLibraryExW(..., LOAD_LIBRARY_SEARCH_*),
+ * where LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR requires a fully-qualified path. */
+static BOOL write_dzn_json(const wchar_t *src_path, const wchar_t *dst_path)
+{
+    char api[32], json[512];
+    FILE *f = NULL;
+    int len;
+    BOOL ok;
+
+    read_dzn_api_version(src_path, api, sizeof(api));
+    len = _snprintf_s(json, sizeof(json), _TRUNCATE,
+        "{\n"
+        "    \"file_format_version\": \"1.0.0\",\n"
+        "    \"ICD\": {\n"
+        "        \"library_path\": \"" DL_DZN_GUEST_PATH "\",\n"
+        "        \"api_version\": \"%s\"\n"
+        "    }\n"
+        "}\n", api);
+    if (len <= 0) return FALSE;
+    if (_wfopen_s(&f, dst_path, L"wb") != 0 || !f) {
+        ui_log(L"d3dlayers: cannot write %s", dst_path);
+        return FALSE;
     }
-    free(fixed);
+    ok = fwrite(json, 1, (size_t)len, f) == (size_t)len;
+    if (fclose(f) != 0) ok = FALSE;
+    return ok;
+}
+
+/* ---- hashes ---- */
+
+/* Hash a file with a BCrypt algorithm (BCRYPT_SHA1_ALGORITHM or
+ * BCRYPT_SHA256_ALGORITHM). Returns the digest length, 0 on failure. */
+static ULONG file_hash(const wchar_t *path, LPCWSTR alg_name, BYTE *out, ULONG out_cb)
+{
+    BCRYPT_ALG_HANDLE alg = NULL;
+    BCRYPT_HASH_HANDLE hash = NULL;
+    HANDLE h;
+    BYTE buf[65536];
+    DWORD got;
+    ULONG len = 0, cb = 0, result = 0;
+
+    h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+                    FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (h == INVALID_HANDLE_VALUE) return 0;
+    if (BCryptOpenAlgorithmProvider(&alg, alg_name, NULL, 0) != 0) goto done;
+    if (BCryptGetProperty(alg, BCRYPT_HASH_LENGTH, (PUCHAR)&len, sizeof(len), &cb, 0) != 0 ||
+        len == 0 || len > out_cb) goto done;
+    if (BCryptCreateHash(alg, &hash, NULL, 0, NULL, 0, 0) != 0) goto done;
+    for (;;) {
+        if (!ReadFile(h, buf, sizeof(buf), &got, NULL)) goto done;
+        if (got == 0) break;
+        if (BCryptHashData(hash, buf, got, 0) != 0) goto done;
+    }
+    if (BCryptFinishHash(hash, out, len, 0) != 0) goto done;
+    result = len;
+
+done:
+    if (hash) BCryptDestroyHash(hash);
+    if (alg) BCryptCloseAlgorithmProvider(alg, 0);
+    CloseHandle(h);
+    return result;
+}
+
+/* TRUE when the file's hash (alg_name) equals the base64 digest b64. */
+static BOOL file_matches_b64(const wchar_t *path, LPCWSTR alg_name, const char *b64)
+{
+    BYTE want[64], have[64];
+    DWORD want_len = sizeof(want);
+    ULONG have_len;
+
+    if (!b64 || !b64[0]) return FALSE;
+    if (!CryptStringToBinaryA(b64, 0, CRYPT_STRING_BASE64, want, &want_len, NULL, NULL))
+        return FALSE;
+    have_len = file_hash(path, alg_name, have, sizeof(have));
+    return have_len != 0 && have_len == want_len && memcmp(want, have, have_len) == 0;
+}
+
+/* TRUE when the downloaded package matches a digest FE3 returned for it over
+ * HTTPS (SHA-256 or SHA-1, base64; an empty one is skipped). */
+static BOOL package_matches_digest(const wchar_t *appx, const char *sha1_b64,
+                                   const char *sha256_b64)
+{
+    if (file_matches_b64(appx, BCRYPT_SHA256_ALGORITHM, sha256_b64)) {
+        ui_log(L"d3dlayers: package matches the SHA-256 digest from Windows Update");
+        return TRUE;
+    }
+    if (file_matches_b64(appx, BCRYPT_SHA1_ALGORITHM, sha1_b64)) {
+        ui_log(L"d3dlayers: package matches the SHA-1 digest from Windows Update");
+        return TRUE;
+    }
+    if (sha256_b64[0] || sha1_b64[0])
+        ui_log(L"d3dlayers: package does not match the digest from Windows Update; "
+               L"checking the DLL signatures instead");
+    else
+        ui_log(L"d3dlayers: Windows Update gave no digest for the package; "
+               L"checking the DLL signatures instead");
+    return FALSE;
 }
 
 /* ---- signature check ---- */
@@ -578,59 +731,180 @@ static BOOL is_dll(const wchar_t *name)
 }
 
 /* TRUE when every DLL of the set in dir is signed by Microsoft. */
-static BOOL layers_trusted(const wchar_t *dir)
+static BOOL layers_signed(const wchar_t *dir)
 {
     int i;
     for (i = 0; i < DL_NFILES; i++) {
         wchar_t f[MAX_PATH];
-        if (!is_dll(DL_DST[i])) continue;      /* dzn_icd.json: rewritten by us */
+        if (!is_dll(DL_DST[i])) continue;      /* dzn_icd.json: written by us */
         swprintf_s(f, MAX_PATH, L"%s\\%s", dir, DL_DST[i]);
         if (!signed_by_microsoft(f)) return FALSE;
     }
     return TRUE;
 }
 
-/* Remove the mapping-layer files from the cache (other files stay). */
-static void layers_delete(const wchar_t *dir)
+/* ---- cache bookkeeping ---- */
+
+/* TRUE when every file of the set exists in dir. */
+static BOOL layers_present(const wchar_t *dir)
 {
     int i;
     for (i = 0; i < DL_NFILES; i++) {
         wchar_t f[MAX_PATH];
         swprintf_s(f, MAX_PATH, L"%s\\%s", dir, DL_DST[i]);
-        SetFileAttributesW(f, FILE_ATTRIBUTE_NORMAL);
-        if (!DeleteFileW(f) && GetLastError() != ERROR_FILE_NOT_FOUND)
-            ui_log(L"d3dlayers: could not delete %s: %lu", f, GetLastError());
+        if (!file_exists(f)) return FALSE;
     }
+    return TRUE;
+}
+
+/* The verified list for the set in dir: one line "<sha256 hex> <name>" per
+ * file. FALSE when a file cannot be read. */
+static BOOL build_verified_list(const wchar_t *dir, char *out, size_t cch)
+{
+    static const char hexdig[] = "0123456789abcdef";
+    size_t used = 0;
+    int i;
+
+    out[0] = 0;
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t f[MAX_PATH];
+        BYTE h[32];
+        char hex[65];
+        ULONG j;
+        int n;
+        swprintf_s(f, MAX_PATH, L"%s\\%s", dir, DL_DST[i]);
+        if (file_hash(f, BCRYPT_SHA256_ALGORITHM, h, sizeof(h)) != sizeof(h)) return FALSE;
+        for (j = 0; j < sizeof(h); j++) {
+            hex[j * 2]     = hexdig[h[j] >> 4];
+            hex[j * 2 + 1] = hexdig[h[j] & 15];
+        }
+        hex[64] = 0;
+        n = _snprintf_s(out + used, cch - used, _TRUNCATE, "%s %ls\r\n", hex, DL_DST[i]);
+        if (n < 0) return FALSE;
+        used += (size_t)n;
+    }
+    return TRUE;
+}
+
+static BOOL write_text(const wchar_t *path, const char *text)
+{
+    FILE *f = NULL;
+    size_t len = strlen(text);
+    BOOL ok;
+    if (_wfopen_s(&f, path, L"wb") != 0 || !f) {
+        ui_log(L"d3dlayers: cannot write %s", path);
+        return FALSE;
+    }
+    ok = fwrite(text, 1, len, f) == len;
+    if (fclose(f) != 0) ok = FALSE;
+    return ok;
+}
+
+/* 1 when the files in dir match the verified list at list_path, 0 when they
+ * do not (or cannot be read), -1 when there is no list. */
+static int cache_matches_list(const wchar_t *dir, const wchar_t *list_path)
+{
+    char want[1024], have[1024];
+    FILE *f = NULL;
+    size_t rd;
+
+    if (!file_exists(list_path)) return -1;
+    if (_wfopen_s(&f, list_path, L"rb") != 0 || !f) return 0;
+    rd = fread(want, 1, sizeof(want) - 1, f);
+    fclose(f);
+    want[rd] = 0;
+    if (!build_verified_list(dir, have, sizeof(have))) return 0;
+    return strcmp(want, have) == 0 ? 1 : 0;
+}
+
+/* TRUE while the retry marker is younger than DL_RETRY_HOURS. A marker dated
+ * in the future (clock moved back) does not block. */
+static BOOL retry_blocked(const wchar_t *marker)
+{
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    FILETIME now_ft;
+    ULARGE_INTEGER t, now;
+
+    if (!GetFileAttributesExW(marker, GetFileExInfoStandard, &fad)) return FALSE;
+    GetSystemTimeAsFileTime(&now_ft);
+    t.LowPart = fad.ftLastWriteTime.dwLowDateTime;
+    t.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+    now.LowPart = now_ft.dwLowDateTime;
+    now.HighPart = now_ft.dwHighDateTime;
+    if (t.QuadPart > now.QuadPart) return FALSE;
+    return now.QuadPart - t.QuadPart < (ULONGLONG)DL_RETRY_HOURS * 3600ULL * 10000000ULL;
+}
+
+static void retry_mark(const wchar_t *marker)
+{
+    SYSTEMTIME st;
+    char text[256];
+    GetSystemTime(&st);
+    _snprintf_s(text, sizeof(text), _TRUNCATE,
+                "The D3D mapping layers downloaded at %04u-%02u-%02u %02u:%02u UTC failed "
+                "verification. App Sandbox downloads them again %d hours after that; "
+                "delete this file to retry sooner.\r\n",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, DL_RETRY_HOURS);
+    write_text(marker, text);
+}
+
+static void remove_tree(const wchar_t *dir)
+{
+    wchar_t cmd[2048];
+    swprintf_s(cmd, ARRAYSIZE(cmd), L"cmd.exe /c rd /s /q \"%s\" 2>nul", dir);
+    run_hidden(cmd);
 }
 
 /* ---- public API ---- */
 
 BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
 {
-    wchar_t exe_dir[MAX_PATH], cache[MAX_PATH], tmp[MAX_PATH], appx[MAX_PATH];
+    wchar_t base[MAX_PATH], cache[MAX_PATH], tmp[MAX_PATH], stage[MAX_PATH];
+    wchar_t appx[MAX_PATH], list_path[MAX_PATH], retry_path[MAX_PATH];
     wchar_t sysdir[MAX_PATH], cmd[2048];
-    char *catalog = NULL, wucatid_a[64] = {0};
-    char wucatid[64] = {0};
+    char *catalog = NULL, wucatid[64] = {0};
+    char sha1[256] = {0}, sha256[256] = {0};
+    char list[1024];
     wchar_t url[6144];
-    int i, present = 0;
+    int i, state;
+    BOOL verified;
 
-    asb_writable_dir(exe_dir, MAX_PATH);   /* beside the exe, or ProgramData for MSIX */
-    swprintf_s(cache, MAX_PATH, L"%s\\%s", exe_dir, DL_CACHE_SUBDIR);
+    asb_writable_dir(base, MAX_PATH);   /* beside the exe, or ProgramData for MSIX */
+    swprintf_s(cache, MAX_PATH, L"%s\\%s", base, DL_CACHE_SUBDIR);
+    swprintf_s(list_path, MAX_PATH, L"%s\\%s", base, DL_VERIFIED_FILE);
+    swprintf_s(retry_path, MAX_PATH, L"%s\\%s", base, DL_RETRY_FILE);
 
     /* Already cached? */
-    for (i = 0; i < DL_NFILES; i++) {
-        wchar_t f[MAX_PATH];
-        swprintf_s(f, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
-        if (file_exists(f)) present++;
-    }
-    if (present == DL_NFILES) {
-        if (layers_trusted(cache)) {
+    if (layers_present(cache)) {
+        state = cache_matches_list(cache, list_path);
+        if (state == 1) {
             wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
             ui_log(L"d3dlayers: using cached layers at %s", cache);
             return TRUE;
         }
-        ui_log(L"d3dlayers: cached layers failed the signature check; downloading them again");
-        layers_delete(cache);
+        if (state < 0) {
+            /* A cache made before the verified list existed: accept it if
+               every DLL is signed by Microsoft, with a fixed ICD manifest. */
+            wchar_t json[MAX_PATH];
+            swprintf_s(json, MAX_PATH, L"%s\\%s", cache, DL_JSON_NAME);
+            if (layers_signed(cache) && write_dzn_json(json, json) &&
+                build_verified_list(cache, list, sizeof(list)) &&
+                write_text(list_path, list)) {
+                wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
+                ui_log(L"d3dlayers: verified the cached layers at %s", cache);
+                return TRUE;
+            }
+            ui_log(L"d3dlayers: the cached layers could not be verified; downloading them again");
+        } else {
+            ui_log(L"d3dlayers: the cached layers differ from the verified copy; downloading them again");
+        }
+    }
+
+    if (retry_blocked(retry_path)) {
+        ui_log(L"d3dlayers: the last download failed verification, so the layers are downloaded "
+               L"again only %d hours after it (delete %s to retry now); "
+               L"GL/CL/Vulkan acceleration is off for this VM", DL_RETRY_HOURS, retry_path);
+        return FALSE;
     }
     mkdir_p(cache);
 
@@ -641,21 +915,21 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
                         L"?languages=en-us&market=US&fieldsTemplate=Details",
                         NULL, NULL, 0);
     if (!catalog || !between(catalog, "\"WuCategoryId\":\"", "\"",
-                             wucatid_a, sizeof(wucatid_a))) {
+                             wucatid, sizeof(wucatid))) {
         ui_log(L"d3dlayers: could not resolve WuCategoryId from displaycatalog");
         free(catalog);
         return FALSE;
     }
     free(catalog);
-    strcpy_s(wucatid, sizeof(wucatid), wucatid_a);
     {
         wchar_t w[64];
         MultiByteToWideChar(CP_UTF8, 0, wucatid, -1, w, 64);
         ui_log(L"d3dlayers: WuCategoryId=%s", w);
     }
 
-    /* 2. FE3 chain -> CDN url. */
-    if (resolve_url(wucatid, url, ARRAYSIZE(url)) != 0) {
+    /* 2. FE3 chain -> CDN url and the package digests. */
+    if (resolve_url(wucatid, url, ARRAYSIZE(url), sha1, sizeof(sha1),
+                    sha256, sizeof(sha256)) != 0) {
         ui_log(L"d3dlayers: FE3 did not return a download url (after %d rounds)", DL_MAX_ROUNDS);
         return FALSE;
     }
@@ -665,55 +939,81 @@ BOOL d3dlayers_ensure_cached(wchar_t *out_dir, int out_max)
     ui_log(L"d3dlayers: downloading D3DMappingLayers package...");
     if (http_download(url, appx) != 0) {
         ui_log(L"d3dlayers: package download failed");
+        DeleteFileW(appx);
         return FALSE;
     }
 
     /* 4. Extract with in-box tar.exe (libarchive reads zip/.appx). */
     swprintf_s(tmp, MAX_PATH, L"%s\\_extract", cache);
-    swprintf_s(cmd, ARRAYSIZE(cmd), L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
-    run_hidden(cmd);
+    swprintf_s(stage, MAX_PATH, L"%s\\_stage", cache);
+    remove_tree(tmp);
+    remove_tree(stage);
     mkdir_p(tmp);
+    mkdir_p(stage);
     GetSystemDirectoryW(sysdir, MAX_PATH);
     swprintf_s(cmd, ARRAYSIZE(cmd), L"\"%s\\tar.exe\" -xf \"%s\" -C \"%s\"", sysdir, appx, tmp);
     if (run_hidden(cmd) != 0) {
         ui_log(L"d3dlayers: tar extraction failed");
+        remove_tree(tmp);
+        remove_tree(stage);
+        DeleteFileW(appx);
         return FALSE;
     }
 
-    /* 5. Copy the mapping-layer files into the cache root. */
+    /* 5. Collect the set flat in the staging folder; the ICD manifest is
+       written from the template, not copied. */
     for (i = 0; i < DL_NFILES; i++) {
         wchar_t src[MAX_PATH], dst[MAX_PATH];
         swprintf_s(src, MAX_PATH, L"%s\\%s", tmp, DL_SRC[i]);
+        swprintf_s(dst, MAX_PATH, L"%s\\%s", stage, DL_DST[i]);
+        if (!is_dll(DL_DST[i])) {
+            if (!file_exists(src))
+                ui_log(L"d3dlayers: the package has no %s", DL_SRC[i]);
+            else
+                write_dzn_json(src, dst);
+        } else if (!CopyFileW(src, dst, FALSE)) {
+            ui_log(L"d3dlayers: copy %s failed: %lu", DL_DST[i], GetLastError());
+        }
+    }
+
+    verified = layers_present(stage) &&
+               (package_matches_digest(appx, sha1, sha256) || layers_signed(stage));
+    remove_tree(tmp);
+    DeleteFileW(appx);
+
+    if (!layers_present(stage)) {
+        ui_log(L"d3dlayers: the package does not contain every layer file");
+        remove_tree(stage);
+        return FALSE;
+    }
+    if (!verified) {
+        retry_mark(retry_path);
+        remove_tree(stage);
+        ui_log(L"d3dlayers: the downloaded layers failed verification and were discarded; "
+               L"GL/CL/Vulkan acceleration is off for this VM");
+        return FALSE;
+    }
+
+    /* The list goes first: if the copy below stops part-way, the cache no
+       longer matches it and is downloaded again instead of being used. */
+    if (!build_verified_list(stage, list, sizeof(list)) || !write_text(list_path, list)) {
+        remove_tree(stage);
+        return FALSE;
+    }
+    for (i = 0; i < DL_NFILES; i++) {
+        wchar_t src[MAX_PATH], dst[MAX_PATH];
+        swprintf_s(src, MAX_PATH, L"%s\\%s", stage, DL_DST[i]);
         swprintf_s(dst, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
+        SetFileAttributesW(dst, FILE_ATTRIBUTE_NORMAL);
         if (!CopyFileW(src, dst, FALSE))
             ui_log(L"d3dlayers: copy %s failed: %lu", DL_DST[i], GetLastError());
     }
-
-    /* Make the Vulkan ICD manifest point at the DLL beside it (flat layout). */
-    rewrite_dzn_json(cache);
-
-    /* Clean up the extracted tree and the .appx (keep only the DLLs). */
-    swprintf_s(cmd, ARRAYSIZE(cmd), L"cmd.exe /c rd /s /q \"%s\" 2>nul", tmp);
-    run_hidden(cmd);
-    DeleteFileW(appx);
-
-    /* Verify the files we actually need are present. */
-    present = 0;
-    for (i = 0; i < DL_NFILES; i++) {
-        wchar_t f[MAX_PATH];
-        swprintf_s(f, MAX_PATH, L"%s\\%s", cache, DL_DST[i]);
-        if (file_exists(f)) present++;
-    }
-    if (present != DL_NFILES) {
-        ui_log(L"d3dlayers: only %d/%d layer files present after extract", present, DL_NFILES);
+    remove_tree(stage);
+    if (cache_matches_list(cache, list_path) != 1) {
+        ui_log(L"d3dlayers: could not replace the cached layers in %s", cache);
         return FALSE;
     }
-    if (!layers_trusted(cache)) {
-        ui_log(L"d3dlayers: the downloaded layers failed the signature check and were deleted; "
-               L"GL/CL/Vulkan acceleration is off for this VM");
-        layers_delete(cache);
-        return FALSE;
-    }
+    DeleteFileW(retry_path);
 
     wcsncpy_s(out_dir, out_max, cache, _TRUNCATE);
     ui_log(L"d3dlayers: staged %d mapping-layer files to %s", DL_NFILES, cache);

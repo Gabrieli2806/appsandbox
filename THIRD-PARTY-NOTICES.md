@@ -7,8 +7,9 @@ MIT License and remain under their own licenses and copyrights. Each vendored
 source file additionally carries its own `SPDX-License-Identifier` header, which
 governs that file.
 
-This file and [LICENSE](LICENSE) ship at the root of the Windows release zip
-and of the MSIX package. Paths below are repository paths; where a component
+This file and [LICENSE](LICENSE) ship at the root of the MSIX package and of
+the CI test-build zip. For a release zip made with `tools/sign/make-release.ps1`
+they must be added to the stage (see `docs/RELEASE_CHECKLIST.md`, 2.6). Paths below are repository paths; where a component
 ships in the Windows release, its location there is given too.
 
 ---
@@ -243,7 +244,7 @@ project and stay under their own terms.
 | Component | Downloaded from | License | Used for |
 |---|---|---|---|
 | Win32-OpenSSH 10.0.0.0p2 (`OpenSSH-Win64/ARM64-v10.0.0.0.msi`, Microsoft-signed; SHA-256 pinned in `disk_util.c`) | `github.com/PowerShell/Win32-OpenSSH` releases | OpenSSH license (BSD-style) and those of its bundled components; see the project's `LICENSE` | Installed in Windows guests when SSH is enabled |
-| Microsoft OpenCL, OpenGL and Vulkan Compatibility Pack (`Microsoft.D3DMappingLayers`, Store ID 9NQPSL29BFFF): `OpenGLOn12.dll`, `OpenCLOn12.dll`, `clon12compiler.dll`, `dxil.dll`, `vulkan_dzn.dll` | Microsoft Store delivery service (`displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`, Microsoft CDN) | Microsoft software license terms of the Store package | Copied into Windows guests with GPU (the DLLs must carry Microsoft's Authenticode signature) |
+| Microsoft OpenCL, OpenGL and Vulkan Compatibility Pack (`Microsoft.D3DMappingLayers`, Store ID 9NQPSL29BFFF): `OpenGLOn12.dll`, `OpenCLOn12.dll`, `clon12compiler.dll`, `dxil.dll`, `vulkan_dzn.dll` | Microsoft Store delivery service (`displaycatalog.mp.microsoft.com`, `fe3.delivery.mp.microsoft.com`, Microsoft CDN) | Microsoft software license terms of the Store package | Copied into Windows guests with GPU (accepted only when the package matches the digest Windows Update gives over HTTPS or every DLL carries Microsoft's Authenticode signature) |
 | `Microsoft.Direct3D.Linux` and DXCore NuGet packages (`libd3d12`, `libdxcore`) | `pkgs.dev.azure.com/shine-oss` (the public feed the WSL build uses) | Microsoft license terms included in the packages | Copied into Ubuntu guests (GPU acceleration) |
 | Ubuntu packages (build dependencies of the guest components) | `archive.ubuntu.com` | Each package's own license (`/usr/share/doc/<package>/copyright` in the guest) | Installed in Ubuntu guests |
 | This project's Linux guest sources (incl. `tools/linux/dxgkrnl`, GPL-2.0) | `codeload.github.com` (the repository and commit set at build time) | As listed in this file | Compiled inside Ubuntu guests |
