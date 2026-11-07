@@ -3,15 +3,22 @@
 
 #include <windows.h>
 
-/* Initialize WebView2 in the given parent window.
-   Returns TRUE if initialization started (async completion). */
+/* Initialize WebView2 in the given parent window and load web\index.html.
+   Returns FALSE when WebView2 cannot be used at all (WebView2Loader.dll or
+   the WebView2 Runtime is missing); the caller tells the user. Otherwise
+   returns TRUE and completes asynchronously: if the WebView later fails to
+   start, or one of its processes ends or hangs, the bridge itself asks the
+   user whether to reload the window. The WebView only shows the app's own
+   page and only accepts messages from it. */
 BOOL webview2_init(HWND parent, HINSTANCE hInstance);
 
 /* Post a JSON message to the WebView2 frontend.
-   Safe to call before WebView2 is ready (messages are queued). */
+   Safe to call at any time: until the page has sent {"action":"uiReady"}
+   (also after a reload), messages are queued (up to 64). */
 void webview2_post(const wchar_t *json);
 
-/* Flush queued messages. Call when JS signals it is ready. */
+/* Flush queued messages. The bridge already does this when the page sends
+   "uiReady", before the message callback sees that message. */
 void webview2_flush_queue(void);
 
 /* Resize the WebView2 to fill the parent's client area. */
@@ -20,10 +27,11 @@ void webview2_resize(HWND parent);
 /* Clean up WebView2 resources. */
 void webview2_cleanup(void);
 
-/* Check if WebView2 is ready to receive messages. */
+/* Check if the page is ready to receive messages (it has sent "uiReady"). */
 BOOL webview2_is_ready(void);
 
-/* Set callback for incoming messages from the JS frontend. */
+/* Set callback for incoming messages from the JS frontend (the app page
+   only; messages from any other document are dropped). */
 typedef void (*WebView2MessageCallback)(const wchar_t *json);
 void webview2_set_message_callback(WebView2MessageCallback cb);
 
