@@ -94,8 +94,33 @@ static UINT_PTR g_failure_timer;
 static BOOL g_failure_prompt_open;
 static ULONGLONG g_unresponsive_quiet_until;
 
+/* The worst failure the user chose not to reload ("Not now"), other than a
+   hung page. The window is unusable until it is reloaded, so the bridge
+   asks again when the window is shown or restored, and F5 or Ctrl+R reload
+   it. Cleared by every restart. */
+static int g_declined_failure;
+static HRESULT g_declined_hr;
+
+/* The environment of the current WebView. A restart after a hung page
+   makes a new controller in it, in the running browser process, instead
+   of starting a new environment while that process shuts down. */
+static ICoreWebView2Environment *g_env;
+
+/* A restart the user asked for gets one automatic retry with a new
+   environment, after RESTART_RETRY_MS: starting can fail while the
+   previous browser process is still shutting down. */
+#define RESTART_RETRY_MS 2000
+static int g_restart_retries;
+static UINT_PTR g_restart_timer;
+
+/* Subclass of the parent window: see parent_subclass_proc. */
+#define PARENT_SUBCLASS_ID 1
+static BOOL g_parent_subclassed;
+
 static void report_failure(int kind, HRESULT hr);
 static HRESULT start_environment(void);
+static void start_failed(HRESULT hr);
+static void schedule_key_reload(void);
 static BOOL is_app_page_uri(const wchar_t *uri);
 
 /* ---- Forward declarations ---- */
@@ -300,6 +325,13 @@ static HRESULT STDMETHODCALLTYPE AcceleratorH_Invoke(
             args->lpVtbl->put_Handled(args, TRUE);
             if (!(lparam & (1 << 30)) && g_accelerator_callback)
                 g_accelerator_callback(key);
+        } else if (g_declined_failure != FAIL_NONE &&
+                   (key == VK_F5 || (key == 'R' && GetKeyState(VK_CONTROL) < 0))) {
+            /* The user declined to reload after a failure: F5 and Ctrl+R
+               (otherwise off with the browser keys) reload the window. */
+            args->lpVtbl->put_Handled(args, TRUE);
+            if (!(lparam & (1 << 30)))
+                schedule_key_reload();
         } else if (handle_zoom_key(sender, key)) {
             args->lpVtbl->put_Handled(args, TRUE);
         }
@@ -705,28 +737,15 @@ static BOOL is_app_page_uri(const wchar_t *uri)
 
 /* ---- Callback implementations ---- */
 
-static HRESULT STDMETHODCALLTYPE EnvH_Invoke(
-    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This,
-    HRESULT errorCode, ICoreWebView2Environment *env)
+/* Start creating a controller in env for the current generation; the page
+   follows in CtrlH_Invoke. Returns the synchronous result. */
+static HRESULT start_controller(ICoreWebView2Environment *env)
 {
     CtrlHandler *ch;
     HRESULT hr;
 
-    /* A newer start, or shutdown, replaced this one. */
-    if (((EnvHandler *)This)->generation != g_generation)
-        return S_OK;
-
-    if (FAILED(errorCode) || !env) {
-        ui_log(L"WebView2: Environment creation failed (0x%08X)", (unsigned)errorCode);
-        report_failure(FAIL_START, FAILED(errorCode) ? errorCode : E_FAIL);
-        return S_OK;
-    }
-
     ch = (CtrlHandler *)calloc(1, sizeof(CtrlHandler));
-    if (!ch) {
-        report_failure(FAIL_START, E_OUTOFMEMORY);
-        return S_OK;
-    }
+    if (!ch) return E_OUTOFMEMORY;
     ch->lpVtbl = &g_ctrlVtbl;
     ch->ref = 1;
     ch->generation = g_generation;
@@ -736,8 +755,42 @@ static HRESULT STDMETHODCALLTYPE EnvH_Invoke(
     if (FAILED(hr)) {
         ui_log(L"WebView2: Controller creation failed (0x%08X)", (unsigned)hr);
         ch->lpVtbl->Release((ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *)ch);
-        report_failure(FAIL_START, hr);
     }
+    return hr;
+}
+
+/* Release the kept environment, if any. */
+static void release_env(void)
+{
+    if (g_env) {
+        g_env->lpVtbl->Release(g_env);
+        g_env = NULL;
+    }
+}
+
+static HRESULT STDMETHODCALLTYPE EnvH_Invoke(
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler *This,
+    HRESULT errorCode, ICoreWebView2Environment *env)
+{
+    HRESULT hr;
+
+    /* A newer start, or shutdown, replaced this one. */
+    if (((EnvHandler *)This)->generation != g_generation)
+        return S_OK;
+
+    if (FAILED(errorCode) || !env) {
+        ui_log(L"WebView2: Environment creation failed (0x%08X)", (unsigned)errorCode);
+        start_failed(FAILED(errorCode) ? errorCode : E_FAIL);
+        return S_OK;
+    }
+
+    release_env();
+    g_env = env;
+    env->lpVtbl->AddRef(env);
+
+    hr = start_controller(env);
+    if (FAILED(hr))
+        start_failed(hr);
     return S_OK;
 }
 
@@ -884,12 +937,39 @@ static BOOL register_handlers(ICoreWebView2 *webview, ICoreWebView2Controller *c
     return menu_filtered;
 }
 
+/* Navigate webview to the app page (a new WebView, or one whose page
+   process ended). */
+static HRESULT navigate_to_page(ICoreWebView2 *webview)
+{
+    wchar_t url[MAX_PATH * 9 + 16];     /* up to 3 escapes per path character */
+    HRESULT hr;
+
+    if (!g_page_path[0] && !find_page_path(g_page_path, MAX_PATH)) {
+        ui_log(L"WebView2: cannot locate web\\index.html");
+        return HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE);
+    }
+    if (GetFileAttributesW(g_page_path) == INVALID_FILE_ATTRIBUTES)
+        ui_log(L"WebView2: %s is missing", g_page_path);
+    if (!path_to_file_url(g_page_path, url, sizeof(url) / sizeof(url[0]))) {
+        ui_log(L"WebView2: cannot build a URL for %s", g_page_path);
+        return E_INVALIDARG;
+    }
+
+    g_expect_own_navigation = TRUE;
+    hr = webview->lpVtbl->Navigate(webview, url);
+    if (FAILED(hr)) {
+        ui_log(L"WebView2: Navigate failed (0x%08X)", (unsigned)hr);
+        g_expect_own_navigation = FALSE;
+    }
+    return hr;
+}
+
 static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
     ICoreWebView2CreateCoreWebView2ControllerCompletedHandler *This,
     HRESULT errorCode, ICoreWebView2Controller *controller)
 {
     ICoreWebView2 *webview = NULL;
-    wchar_t url[MAX_PATH * 9 + 16];     /* up to 3 escapes per path character */
+    HRESULT hr;
 
     if (((CtrlHandler *)This)->generation != g_generation) {
         /* A newer start, or shutdown, replaced this one. */
@@ -900,7 +980,7 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
 
     if (FAILED(errorCode) || !controller) {
         ui_log(L"WebView2: Controller creation failed (0x%08X)", (unsigned)errorCode);
-        report_failure(FAIL_START, FAILED(errorCode) ? errorCode : E_FAIL);
+        start_failed(FAILED(errorCode) ? errorCode : E_FAIL);
         return S_OK;
     }
 
@@ -908,10 +988,12 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
     if (!webview) {
         ui_log(L"WebView2: Failed to get CoreWebView2");
         controller->lpVtbl->Close(controller);
-        report_failure(FAIL_START, E_NOINTERFACE);
+        start_failed(E_NOINTERFACE);
         return S_OK;
     }
 
+    /* The WebView started: a later failure is a new one. */
+    g_restart_retries = 0;
     g_controller = controller;
     controller->lpVtbl->AddRef(controller);
     g_webview = webview;
@@ -922,21 +1004,11 @@ static HRESULT STDMETHODCALLTYPE CtrlH_Invoke(
     /* Resize to fill parent */
     webview2_resize(g_parent_hwnd);
 
-    if (!g_page_path[0] && !find_page_path(g_page_path, MAX_PATH)) {
-        ui_log(L"WebView2: cannot locate web\\index.html");
-        report_failure(FAIL_START, HRESULT_FROM_WIN32(ERROR_FILENAME_EXCED_RANGE));
+    hr = navigate_to_page(webview);
+    if (FAILED(hr)) {
+        report_failure(FAIL_START, hr);
         return S_OK;
     }
-    if (GetFileAttributesW(g_page_path) == INVALID_FILE_ATTRIBUTES)
-        ui_log(L"WebView2: %s is missing", g_page_path);
-    if (!path_to_file_url(g_page_path, url, sizeof(url) / sizeof(url[0]))) {
-        ui_log(L"WebView2: cannot build a URL for %s", g_page_path);
-        report_failure(FAIL_START, E_INVALIDARG);
-        return S_OK;
-    }
-
-    g_expect_own_navigation = TRUE;
-    webview->lpVtbl->Navigate(webview, url);
 
     ui_log(L"WebView2: Ready");
     return S_OK;
@@ -991,19 +1063,158 @@ static HRESULT start_environment(void)
     return hr;
 }
 
-/* Replace the WebView with a new environment, controller and page. The
-   page asks the host for its state again with "uiReady". */
-static void restart_webview(void)
+static void kill_restart_timer(void)
+{
+    if (g_restart_timer) {
+        KillTimer(NULL, g_restart_timer);
+        g_restart_timer = 0;
+    }
+}
+
+/* Replace the WebView with a new environment, controller and page. */
+static void start_fresh(void)
 {
     HRESULT hr;
 
-    ui_log(L"WebView2: reloading the window");
     release_webview();
+    release_env();
     hr = start_environment();
     if (FAILED(hr)) {
         ui_log(L"WebView2: CreateEnvironment failed (0x%08X)", (unsigned)hr);
-        report_failure(FAIL_START, hr);
+        start_failed(hr);
     }
+}
+
+static void CALLBACK retry_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    (void)hwnd; (void)msg; (void)time;
+    KillTimer(NULL, id);
+    if (id == g_restart_timer) g_restart_timer = 0;
+    if (g_shutting_down || !IsWindow(g_parent_hwnd))
+        return;
+    ui_log(L"WebView2: starting again");
+    start_fresh();
+}
+
+/* The environment or controller did not start. The restart the user asked
+   for is retried once with a new environment; otherwise ask the user. */
+static void start_failed(HRESULT hr)
+{
+    if (g_shutting_down) return;
+    if (g_restart_retries > 0) {
+        g_restart_retries--;
+        kill_restart_timer();
+        g_restart_timer = SetTimer(NULL, 0, RESTART_RETRY_MS, retry_timer_proc);
+        if (g_restart_timer) {
+            ui_log(L"WebView2: start failed (0x%08X), trying again", (unsigned)hr);
+            return;
+        }
+    }
+    g_restart_retries = 0;
+    report_failure(FAIL_START, hr);
+}
+
+/* Reload the window after a failure of the given kind. The page asks the
+   host for its state again with "uiReady". */
+static void restart_webview(int kind)
+{
+    HRESULT hr;
+
+    g_declined_failure = FAIL_NONE;
+    g_restart_retries = 0;
+    kill_restart_timer();
+
+    /* The page process ended but the browser process runs: load the page
+       again in the same WebView, which starts a new page process. */
+    if (kind == FAIL_RENDERER_EXITED && g_webview && g_controller) {
+        ui_log(L"WebView2: reloading the page");
+        g_ready = FALSE;
+        if (SUCCEEDED(navigate_to_page(g_webview)))
+            return;
+    }
+
+    ui_log(L"WebView2: reloading the window");
+    release_webview();      /* also ends a hung page process */
+    g_restart_retries = 1;
+
+    /* The page hangs but the browser process runs: make the new WebView in
+       the same environment. If that fails, start_failed retries with a new
+       environment. */
+    if (kind == FAIL_UNRESPONSIVE && g_env) {
+        ++g_generation;     /* ignore any start still in flight */
+        hr = start_controller(g_env);
+        if (FAILED(hr))
+            start_failed(hr);
+        return;
+    }
+
+    /* The browser process ended, or the WebView never started. */
+    start_fresh();
+}
+
+/* F5 or Ctrl+R after a declined failure. Runs from the message loop, not
+   from inside the WebView2 key event, since the restart closes the
+   controller that raised it. */
+static void CALLBACK key_reload_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD time)
+{
+    (void)hwnd; (void)msg; (void)time;
+    KillTimer(NULL, id);
+    if (id == g_restart_timer) g_restart_timer = 0;
+    if (g_shutting_down || !IsWindow(g_parent_hwnd) || g_failure_prompt_open ||
+        g_declined_failure == FAIL_NONE)
+        return;
+    restart_webview(g_declined_failure);
+}
+
+static void schedule_key_reload(void)
+{
+    if (g_restart_timer) return;    /* a restart or retry is already pending */
+    g_restart_timer = SetTimer(NULL, 0, 0, key_reload_timer_proc);
+}
+
+/* Ask again about a declined failure (the window was shown or restored). */
+static void ask_again_if_declined(void)
+{
+    if (g_declined_failure != FAIL_NONE && !g_failure_prompt_open && !g_restart_timer)
+        report_failure(g_declined_failure, g_declined_hr);
+}
+
+/* Subclass of the parent window. While a failure is declined the window
+   shows no working page: ask again when it comes back from the tray or
+   from minimized, and let F5 and Ctrl+R reload it when the parent has the
+   keyboard focus (there is no WebView, or it does not take keys). */
+static LRESULT CALLBACK parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
+                                             UINT_PTR id, DWORD_PTR data)
+{
+    static BOOL minimized;
+    (void)data;
+
+    switch (msg) {
+    case WM_SHOWWINDOW:
+        if (wp && lp == 0)
+            ask_again_if_declined();
+        break;
+    case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) {
+            minimized = TRUE;
+        } else if (minimized && (wp == SIZE_RESTORED || wp == SIZE_MAXIMIZED)) {
+            minimized = FALSE;
+            ask_again_if_declined();
+        }
+        break;
+    case WM_KEYDOWN:
+        if (g_declined_failure != FAIL_NONE && !(lp & (1 << 30)) &&
+            (wp == VK_F5 || (wp == 'R' && GetKeyState(VK_CONTROL) < 0))) {
+            schedule_key_reload();
+            return 0;
+        }
+        break;
+    case WM_NCDESTROY:
+        RemoveWindowSubclass(hwnd, parent_subclass_proc, id);
+        g_parent_subclassed = FALSE;
+        break;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
 }
 
 /* Ask whether to reload the window. Returns TRUE for Reload. */
@@ -1100,11 +1311,26 @@ static void CALLBACK failure_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD 
 
     if (reload) {
         g_pending_failure = FAIL_NONE;      /* the restart covers it */
-        restart_webview();
+        restart_webview(kind);
         return;
     }
-    if (kind == FAIL_UNRESPONSIVE)
+    if (kind == FAIL_UNRESPONSIVE) {
         g_unresponsive_quiet_until = GetTickCount64() + UNRESPONSIVE_QUIET_MS;
+    } else {
+        /* Remembered so the user can still reload: see g_declined_failure. */
+        if (kind >= g_declined_failure) {
+            g_declined_failure = kind;
+            g_declined_hr = hr;
+        }
+        if (kind == FAIL_BROWSER_EXITED) {
+            /* The WebView and its environment are dead: release them, so
+               the parent window gets the keyboard focus for F5 and Ctrl+R. */
+            release_webview();
+            release_env();
+            if (GetForegroundWindow() == g_parent_hwnd)
+                SetFocus(g_parent_hwnd);
+        }
+    }
     ui_log(L"WebView2: reload declined");
     /* Something worse happened while the dialog was open: ask about it. */
     if (g_pending_failure > kind)
@@ -1203,6 +1429,9 @@ BOOL webview2_init(HWND parent, HINSTANCE hInstance)
         }
     }
 
+    g_parent_subclassed = SetWindowSubclass(parent, parent_subclass_proc,
+                                            PARENT_SUBCLASS_ID, 0);
+
     hr = start_environment();
     if (FAILED(hr)) {
         /* The runtime is there, so offer to try again rather than leave the
@@ -1263,9 +1492,19 @@ void webview2_cleanup(void)
         KillTimer(NULL, g_failure_timer);
         g_failure_timer = 0;
     }
+    kill_restart_timer();
     g_pending_failure = FAIL_NONE;
+    g_declined_failure = FAIL_NONE;
+    g_restart_retries = 0;
+
+    if (g_parent_subclassed) {
+        if (IsWindow(g_parent_hwnd))
+            RemoveWindowSubclass(g_parent_hwnd, parent_subclass_proc, PARENT_SUBCLASS_ID);
+        g_parent_subclassed = FALSE;
+    }
 
     release_webview();
+    release_env();
     for (i = 0; i < g_queue_count; i++)
         free(g_queue[i]);
     g_queue_count = 0;

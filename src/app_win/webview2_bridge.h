@@ -8,8 +8,10 @@
    the WebView2 Runtime is missing); the caller tells the user. Otherwise
    returns TRUE and completes asynchronously: if the WebView later fails to
    start, or one of its processes ends or hangs, the bridge itself asks the
-   user whether to reload the window. The WebView only shows the app's own
-   page and only accepts messages from it. */
+   user whether to reload the window. After "Not now" it asks again when the
+   window is shown or restored, and F5 or Ctrl+R reload it (the bridge
+   subclasses the parent window for this). The WebView only shows the app's
+   own page and only accepts messages from it. */
 BOOL webview2_init(HWND parent, HINSTANCE hInstance);
 
 /* Post a JSON message to the WebView2 frontend.
