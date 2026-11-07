@@ -21,6 +21,13 @@
 #pragma comment(lib, "crypt32.lib")
 #pragma comment(lib, "version.lib")
 
+static GlVkLogFn g_provision_log_fn = NULL;
+
+void gl_vk_set_log(GlVkLogFn fn)
+{
+    g_provision_log_fn = fn;
+}
+
 BOOL gpu_prefers_system_opengl(void)
 {
 #if defined(_M_X64)
@@ -298,29 +305,21 @@ static BOOL grant_system_file_control(const wchar_t *path)
 }
 
 #if defined(_M_X64)
-/* Appends one line to the agent log in the same format as agent.c's agent_log,
-   so NVIDIA provisioning can say which step failed and why. The caller's last
-   error is preserved. */
+/* Writes one line to the agent log through the logger set with
+   gl_vk_set_log, so NVIDIA provisioning can say which step failed and why.
+   The caller's last error is preserved. */
 static void provision_log(const char *fmt, ...)
 {
-    FILE *f;
+    char line[1024];
     va_list ap;
-    SYSTEMTIME st;
     DWORD error = GetLastError();
 
-    if (fopen_s(&f, "C:\\Windows\\AppSandbox\\agent.log", "a") != 0 || !f) {
-        SetLastError(error);
-        return;
+    if (g_provision_log_fn) {
+        va_start(ap, fmt);
+        _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+        va_end(ap);
+        g_provision_log_fn("%s", line);
     }
-    GetLocalTime(&st);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] ",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fprintf(f, "\n");
-    fclose(f);
     SetLastError(error);
 }
 

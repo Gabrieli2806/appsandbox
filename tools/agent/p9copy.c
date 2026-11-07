@@ -95,6 +95,7 @@ typedef struct {
     UINT32   next_fid;
     UINT32   msize;
     int      files_copied;
+    int      files_pending;    /* new copies waiting for the next restart */
     P9CopyOptions options;
 } P9Session;
 
@@ -574,29 +575,20 @@ static BOOL temporary_path(const wchar_t *path, wchar_t temporary[MAX_PATH])
     return TRUE;
 }
 
-/* TRUE when MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) has queued a rename of
-   path for the next restart (Session Manager's PendingFileRenameOperations). */
-static BOOL rename_pending_at_restart(const wchar_t *path)
+/* TRUE when the REG_MULTI_SZ rename list 'value' under key renames nt_path
+   (as source) to a non-empty destination. */
+static BOOL rename_listed(HKEY key, const wchar_t *value, const wchar_t *nt_path)
 {
-    wchar_t full[MAX_PATH], nt_path[MAX_PATH + 4], *list = NULL;
-    DWORD type, size = 0, length;
+    wchar_t *list = NULL;
+    DWORD type, size = 0;
     size_t count, at = 0;
-    HKEY key;
     BOOL pending = FALSE;
 
-    length = GetFullPathNameW(path, MAX_PATH, full, NULL);
-    if (!length || length >= MAX_PATH) return FALSE;
-    wcscpy_s(nt_path, MAX_PATH + 4, L"\\??\\");
-    wcscat_s(nt_path, MAX_PATH + 4, full);
-    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
-                      0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
-        return FALSE;
-    if (RegQueryValueExW(key, L"PendingFileRenameOperations", NULL, &type, NULL,
-                         &size) == ERROR_SUCCESS && type == REG_MULTI_SZ && size)
+    if (RegQueryValueExW(key, value, NULL, &type, NULL, &size) == ERROR_SUCCESS &&
+        type == REG_MULTI_SZ && size)
         list = (wchar_t *)calloc(size / sizeof(wchar_t) + 2, sizeof(wchar_t));
-    if (list && RegQueryValueExW(key, L"PendingFileRenameOperations", NULL, &type,
-                                 (BYTE *)list, &size) == ERROR_SUCCESS) {
+    if (list && RegQueryValueExW(key, value, NULL, &type, (BYTE *)list, &size) == ERROR_SUCCESS &&
+        type == REG_MULTI_SZ) {
         /* Entries are pairs: source, then destination (empty for a delete).
            The extra zeroed characters terminate every string. */
         count = size / sizeof(wchar_t);
@@ -610,6 +602,30 @@ static BOOL rename_pending_at_restart(const wchar_t *path)
         }
     }
     free(list);
+    return pending;
+}
+
+/* TRUE when MoveFileEx(MOVEFILE_DELAY_UNTIL_REBOOT) has queued a rename of
+   path for the next restart. Session Manager processes both
+   PendingFileRenameOperations and PendingFileRenameOperations2, so both are
+   searched. */
+static BOOL rename_pending_at_restart(const wchar_t *path)
+{
+    wchar_t full[MAX_PATH], nt_path[MAX_PATH + 4];
+    DWORD length;
+    HKEY key;
+    BOOL pending;
+
+    length = GetFullPathNameW(path, MAX_PATH, full, NULL);
+    if (!length || length >= MAX_PATH) return FALSE;
+    wcscpy_s(nt_path, MAX_PATH + 4, L"\\??\\");
+    wcscat_s(nt_path, MAX_PATH + 4, full);
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager",
+                      0, KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        return FALSE;
+    pending = rename_listed(key, L"PendingFileRenameOperations", nt_path) ||
+              rename_listed(key, L"PendingFileRenameOperations2", nt_path);
     RegCloseKey(key);
     return pending;
 }
@@ -662,8 +678,59 @@ static BOOL destination_in_use(DWORD error)
            error == ERROR_LOCK_VIOLATION || error == ERROR_USER_MAPPED_FILE;
 }
 
+/* TRUE when an existing executable image (.dll, .exe, .sys) does not start
+   with "MZ". Copies cut short by a crash with older agents left such files
+   at their full size but filled with zeros, which a size check alone never
+   repairs. Only the first two bytes are read, and only image files are
+   checked, because no valid one starts any other way. */
+static BOOL damaged_image(const char *name, const wchar_t *path)
+{
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    const char *ext = strrchr(name, '.');
+    BYTE head[2];
+    DWORD got = 0;
+    HANDLE f;
+    BOOL damaged = FALSE;
+
+    if (!ext || (_stricmp(ext, ".dll") && _stricmp(ext, ".exe") && _stricmp(ext, ".sys")))
+        return FALSE;
+    f = CreateFileW(path, GENERIC_READ, share, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (f == INVALID_HANDLE_VALUE) return FALSE;
+    if (ReadFile(f, head, sizeof(head), &got, NULL) && got == sizeof(head))
+        damaged = head[0] != 'M' || head[1] != 'Z';
+    CloseHandle(f);
+    return damaged;
+}
+
+/* TRUE when both files can be read and hold the same bytes. */
+#define P9_COMPARE_CHUNK 65536
+static BOOL same_contents(const wchar_t *a, const wchar_t *b)
+{
+    const DWORD share = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
+    HANDLE fa = CreateFileW(a, GENERIC_READ, share, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    HANDLE fb = CreateFileW(b, GENERIC_READ, share, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    BYTE *buf = (BYTE *)malloc(2 * P9_COMPARE_CHUNK);
+    BOOL equal = FALSE;
+
+    if (fa != INVALID_HANDLE_VALUE && fb != INVALID_HANDLE_VALUE && buf) {
+        for (;;) {
+            DWORD na = 0, nb = 0;
+            if (!ReadFile(fa, buf, P9_COMPARE_CHUNK, &na, NULL) ||
+                !ReadFile(fb, buf + P9_COMPARE_CHUNK, P9_COMPARE_CHUNK, &nb, NULL) ||
+                na != nb || memcmp(buf, buf + P9_COMPARE_CHUNK, na) != 0)
+                break;
+            if (na == 0) { equal = TRUE; break; }
+        }
+    }
+    free(buf);
+    if (fa != INVALID_HANDLE_VALUE) CloseHandle(fa);
+    if (fb != INVALID_HANDLE_VALUE) CloseHandle(fb);
+    return equal;
+}
+
 /* Copy a single file from the 9P share to local disk, through a temporary
-   copy beside the destination. */
+   copy beside the destination. A destination in use is replaced at the next
+   restart and counted in files_pending instead of files_copied. */
 static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
                       const wchar_t *local_path, UINT64 file_size)
 {
@@ -673,6 +740,9 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     HANDLE hfile;
     BOOL ok = TRUE;
     BOOL remove_temporary = TRUE;
+    BOOL compare_first = FALSE;   /* same size, fetched anyway: replace only if the bytes differ */
+    BOOL unchanged = FALSE;           /* the new copy equals the destination */
+    BOOL pending = FALSE;             /* replaced at the next restart */
     const char *names[1];
     wchar_t target[MAX_PATH] = { 0 }, temporary[MAX_PATH];
 
@@ -684,14 +754,24 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     }
     if (skip_preserved_file(s, name, local_path)) return TRUE;
 
-    /* Check if file exists and same size — skip if so */
+    /* Check if file exists and same size — skip if so. Files in the refresh
+       filter, and damaged images, are fetched anyway and compared by content
+       below. */
     {
         WIN32_FILE_ATTRIBUTE_DATA attr;
         if (GetFileAttributesExW(local_path, GetFileExInfoStandard, &attr)) {
             UINT64 local_size = ((UINT64)attr.nFileSizeHigh << 32) | attr.nFileSizeLow;
-            if (local_size == file_size && !should_refresh_file(s, name)) {
-                P9LOG("9P skip (exists, same size): %s", name);
-                return TRUE;
+            if (local_size == file_size) {
+                if (should_refresh_file(s, name)) {
+                    compare_first = TRUE;
+                } else if (damaged_image(name, local_path)) {
+                    P9LOG("9P %ls is not a valid image (an interrupted copy); fetching it again.",
+                          local_path);
+                    compare_first = TRUE;
+                } else {
+                    P9LOG("9P skip (exists, same size): %s", name);
+                    return TRUE;
+                }
             }
         }
     }
@@ -702,6 +782,7 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
     }
     if (replacement_pending(temporary, file_size)) {
         P9LOG("9P skip (replacement pending restart): %s", name);
+        s->files_pending++;
         return TRUE;
     }
 
@@ -762,41 +843,60 @@ static BOOL copy_file(P9Session *s, UINT32 parent_fid, const char *name,
 
     if (ok && target[0]) {
         ok = s->options.commit_file(temporary, local_path);
+    } else if (ok && compare_first && same_contents(temporary, local_path)) {
+        /* Nothing to replace: leaves a loaded file alone instead of queuing
+           a rename for the next restart on every connection. */
+        unchanged = TRUE;
     } else if (ok) {
-        if (MoveFileExW(temporary, local_path,
-                        s->options.keep_existing ? 0 : MOVEFILE_REPLACE_EXISTING)) {
+        const DWORD flags = s->options.keep_existing ? 0 : MOVEFILE_REPLACE_EXISTING;
+        BOOL moved = MoveFileExW(temporary, local_path, flags);
+        DWORD err = moved ? ERROR_SUCCESS : GetLastError();
+        int attempt;
+
+        /* A handle held open for a moment (a virus scan, a process reading
+           the file) goes away quickly: try again before the destination is
+           treated as in use until the next restart. */
+        for (attempt = 0; !moved && attempt < 3 &&
+             (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION); attempt++) {
+            Sleep(250);
+            moved = MoveFileExW(temporary, local_path, flags);
+            err = moved ? ERROR_SUCCESS : GetLastError();
+        }
+
+        if (moved) {
             remove_temporary = FALSE;
-        } else {
-            DWORD err = GetLastError();
-            if (s->options.keep_existing &&
-                (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
-                P9LOG("9P skip (destination created during copy): %s", name);
-                DeleteFileW(temporary);
-                return TRUE;
-            }
-            if (!s->options.keep_existing && destination_in_use(err)) {
-                /* A loaded DLL cannot be replaced: Windows renames the
-                   temporary copy over it during the next restart. */
-                if (MoveFileExW(temporary, local_path,
-                                MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
-                    P9LOG("9P %ls is in use (error %lu); it will be replaced at the next restart.",
-                          local_path, err);
-                    remove_temporary = FALSE;
-                } else {
-                    P9LOG("9P cannot replace %ls (in use, error %lu) or queue it for the next "
-                          "restart (error %lu)", local_path, err, GetLastError());
-                    ok = FALSE;
-                }
+        } else if (s->options.keep_existing &&
+                   (err == ERROR_FILE_EXISTS || err == ERROR_ALREADY_EXISTS)) {
+            P9LOG("9P skip (destination created during copy): %s", name);
+            DeleteFileW(temporary);
+            return TRUE;
+        } else if (!s->options.keep_existing && destination_in_use(err)) {
+            /* A loaded DLL cannot be replaced: Windows renames the
+               temporary copy over it during the next restart. */
+            if (MoveFileExW(temporary, local_path,
+                            MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
+                P9LOG("9P %ls is in use (error %lu); it will be replaced at the next restart.",
+                      local_path, err);
+                remove_temporary = FALSE;
+                pending = TRUE;
             } else {
-                P9LOG("9P cannot replace %ls (error %lu)", local_path, err);
+                P9LOG("9P cannot replace %ls (in use, error %lu) or queue it for the next "
+                      "restart (error %lu)", local_path, err, GetLastError());
                 ok = FALSE;
             }
+        } else {
+            P9LOG("9P cannot replace %ls (error %lu)", local_path, err);
+            ok = FALSE;
         }
     }
     if (remove_temporary && !DeleteFileW(temporary))
         P9LOG("9P cannot remove temporary file: %ls (error %lu)", temporary, GetLastError());
 
-    if (ok) {
+    if (ok && pending) {
+        s->files_pending++;
+    } else if (ok && unchanged) {
+        P9LOG("9P skip (unchanged): %s", name);
+    } else if (ok) {
         s->files_copied++;
         P9LOG("9P copied: %s (%llu bytes)", name, (unsigned long long)file_size);
     }
@@ -1023,8 +1123,11 @@ int p9_copy_share_ex(UINT32 port, const char *share_name,
     s.next_fid = 10;
     s.msize = P9_MSIZE;
     s.files_copied = 0;
+    s.files_pending = 0;
     if (options)
         s.options = *options;
+    if (s.options.files_pending)
+        *s.options.files_pending = 0;
 
     P9LOG("9P connecting to share '%s' on port %u...", share_name, port);
 
@@ -1071,7 +1174,8 @@ int p9_copy_share_ex(UINT32 port, const char *share_name,
     p9_clunk(&s, root_fid);
 
     if (result == P9_OK)
-        P9LOG("9P share '%s' copy complete (%d files).", share_name, s.files_copied);
+        P9LOG("9P share '%s' copy complete (%d files, %d waiting for a restart).",
+              share_name, s.files_copied, s.files_pending);
 
 done:
     if (s.is_ivshmem) {
@@ -1081,5 +1185,7 @@ done:
     }
     if (files_copied)
         *files_copied = s.files_copied;
+    if (s.options.files_pending)
+        *s.options.files_pending = s.files_pending;
     return result;
 }

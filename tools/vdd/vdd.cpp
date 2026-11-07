@@ -1179,9 +1179,19 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                     } else if (VddEnsureStaging(proc, sdesc.Width, sdesc.Height)) {
                         proc->pDeviceContext->CopyResource(proc->pStagingTex, pTexture);
 
+                        /* Without a viewer the copy stays on the GPU: the
+                           blocking read-back (Map) of every frame is skipped,
+                           and the idle resend above maps the newest copy for
+                           a viewer that connects. */
                         D3D11_MAPPED_SUBRESOURCE mapped = {};
-                        hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
-                        if (SUCCEEDED(hr))
+                        BOOL mappedOk = FALSE;
+                        if (proc->hClientConn == NULL) {
+                            bHasFrame = TRUE;
+                        } else {
+                            hr = proc->pDeviceContext->Map(proc->pStagingTex, 0, D3D11_MAP_READ, 0, &mapped);
+                            mappedOk = SUCCEEDED(hr);
+                        }
+                        if (mappedOk)
                         {
                             bHasFrame = TRUE;
 
@@ -2296,6 +2306,26 @@ NTSTATUS VddAdapterInitFinished(
 /*  WDF: D0 Entry (device power-up)                                          */
 /* ========================================================================= */
 
+/* GPU scheduling class for the whole WUDFHost process: HIGH unless
+   HKLM\SOFTWARE\AppSandbox\VDD RealtimeGpuPriority (DWORD) is 1. A REALTIME
+   process together with NVENC is a known trigger of NVIDIA driver freezes
+   and crashes (Sunshine uses HIGH for the same reason), and in a GPU-PV guest
+   such a crash resets the GPU of the whole VM. The swap chain's own device
+   still gets IddCx's realtime GPU priority (IddCxSetRealtimeGPUPriority). */
+static BOOL VddWantsRealtimeProcessGpuPriority(void)
+{
+    HKEY k;
+    DWORD value = 0, size = sizeof(value), type = 0;
+
+    if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, "SOFTWARE\\AppSandbox\\VDD", 0, KEY_READ, &k) != ERROR_SUCCESS)
+        return FALSE;
+    if (RegQueryValueExA(k, "RealtimeGpuPriority", NULL, &type, (BYTE*)&value, &size) != ERROR_SUCCESS ||
+        type != REG_DWORD || size != sizeof(value))
+        value = 0;
+    RegCloseKey(k);
+    return value == 1;
+}
+
 _Use_decl_annotations_
 NTSTATUS VddDeviceD0Entry(
     WDFDEVICE Device,
@@ -2303,11 +2333,15 @@ NTSTATUS VddDeviceD0Entry(
 {
     VddLog("D0Entry: entered (Device=%p, PreviousState=%d)", (void*)Device, (int)PreviousState);
 
-    /* Set GPU scheduling priority to realtime for this process (WUDFHost.exe) */
+    /* GPU scheduling priority class for this process (WUDFHost.exe) */
     {
+        BOOL realtime = VddWantsRealtimeProcessGpuPriority();
         NTSTATUS st = D3DKMTSetProcessSchedulingPriorityClass(
-            GetCurrentProcess(), D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME);
-        VddLog("D0Entry: D3DKMTSetProcessSchedulingPriorityClass(REALTIME) = 0x%08X", st);
+            GetCurrentProcess(),
+            realtime ? D3DKMT_SCHEDULINGPRIORITYCLASS_REALTIME : D3DKMT_SCHEDULINGPRIORITYCLASS_HIGH);
+        VddLog("D0Entry: D3DKMTSetProcessSchedulingPriorityClass(%s) = 0x%08X%s",
+               realtime ? "REALTIME" : "HIGH", st,
+               realtime ? " (RealtimeGpuPriority=1)" : "");
     }
 
     IndirectDeviceContextWrapper* pWrapper =

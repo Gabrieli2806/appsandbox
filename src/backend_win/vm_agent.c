@@ -49,12 +49,24 @@ void vm_agent_set_hwnd(HWND hwnd)
    every line it sends fits; longer lines are discarded (see recv_line). */
 #define AGENT_LINE_MAX 2048
 
+/* An over-long line is read and dropped up to its newline (see recv_line);
+   past this many bytes without one the connection is dropped instead, so a
+   guest that never sends a newline cannot hold the connection thread. */
+#define AGENT_DISCARD_MAX (64 * 1024)
+
 /* How long a tagged command waits for its reply before the connection is
    treated as dead and re-established. The agent handles commands one at a
-   time and can be busy for a while (devcon runs, netsh calls, restarting its
-   helpers on idd_connect); other lines (heartbeat, log:, gpu_copy_*, ...) are
-   still read and handled while waiting. */
-#define AGENT_REPLY_TIMEOUT_MS 30000
+   time and can be busy for a while: set_ip runs up to three netsh processes
+   with a 10 s limit each, ssh_enable can wait for the SCM to start sshd
+   (about 30 s), idd_connect restarts its helpers. Other lines (heartbeat,
+   log:, gpu_copy_*, ...) are still read and handled while waiting, and a
+   closed or failed connection is noticed at once. */
+#define AGENT_REPLY_TIMEOUT_MS 60000
+
+/* A fire-and-forget command (shutdown, restart) that could not be sent yet
+   stays queued across a reconnect, but is dropped once it is this old: by
+   then the shutdown watchdog has asked the user to force stop. */
+#define AGENT_QUEUED_CMD_MAX_AGE_MS 120000
 
 typedef struct AgentConn {
     /* Stable VM identifier; survives g_vms[] compaction. The actual
@@ -63,23 +75,60 @@ typedef struct AgentConn {
     HANDLE         thread;
     SOCKET         sock;
     volatile BOOL  stop;
-    /* Command synchronization */
-    volatile BOOL  cmd_pending;
-    volatile LONG  cmd_gen;      /* Bumped by vm_agent_send for every queued command */
-    HANDLE         cmd_done;     /* Event: signaled when response is ready */
+    /* Command slot. One command at a time; a newer one replaces a queued one
+       that has not been sent yet. Callers (vm_agent_send: idd_connect from
+       the viewer's receive thread, shutdown/restart from the UI or headless
+       API) and the connection thread use these fields only under the slot's
+       lock (conn_lock), and waiters sleep on conn_cv. */
+    BOOL           cmd_pending;  /* cmd is queued and not taken by the connection thread yet */
+    LONG           cmd_gen;      /* generation of the newest queued command */
+    BOOL           cmd_no_waiter;    /* queued fire-and-forget: kept across a reconnect */
+    ULONGLONG      cmd_queued_at;    /* GetTickCount64() when it was queued */
     char           cmd[64];
+    LONG           taken_gen;    /* newest generation the connection thread has taken */
+    LONG           rsp_gen;      /* generation whose reply is in rsp (empty: failed) */
+    LONG           done_gen;     /* newest generation that was answered, failed or dropped */
     char           rsp[AGENT_LINE_MAX];
     unsigned int   cmd_seq;      /* Monotonic sequence ID for tagged commands */
     /* Why the current connection dropped, for the host log. Not logged when
        it ended normally (os_shutdown, service_stopping, vm_agent_stop). */
     wchar_t        drop_reason[160];
     BOOL           drop_expected;    /* agent announced os_shutdown / service_stopping */
+    BOOL           guest_shutting_down;  /* agent announced os_shutdown */
     BOOL           overlong_logged;  /* an over-long line was reported on this connection */
 } AgentConn;
 
 #define MAX_AGENTS 16
 static AgentConn g_conns[MAX_AGENTS];
 static BOOL      g_wsa_init = FALSE;
+
+/* Per-slot command lock and wake-up, outside AgentConn so free_conn's reset
+   never touches a lock or condition another thread may still be using.
+   Initialised once and never deleted. */
+static CRITICAL_SECTION   g_conn_cs[MAX_AGENTS];
+static CONDITION_VARIABLE g_conn_cv[MAX_AGENTS];
+static INIT_ONCE          g_conn_sync_once = INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK init_conn_sync(PINIT_ONCE once, PVOID param, PVOID *context)
+{
+    int i;
+    (void)once; (void)param; (void)context;
+    for (i = 0; i < MAX_AGENTS; i++) {
+        InitializeCriticalSection(&g_conn_cs[i]);
+        InitializeConditionVariable(&g_conn_cv[i]);
+    }
+    return TRUE;
+}
+
+static CRITICAL_SECTION *conn_lock(AgentConn *conn)
+{
+    return &g_conn_cs[conn - g_conns];
+}
+
+static CONDITION_VARIABLE *conn_cv(AgentConn *conn)
+{
+    return &g_conn_cv[conn - g_conns];
+}
 
 static AgentConn *find_conn(VmInstance *vm)
 {
@@ -95,12 +144,14 @@ static AgentConn *alloc_conn(VmInstance *vm)
 {
     int i;
     if (!vm || vm->unique_id == 0) return NULL;
+    InitOnceExecuteOnce(&g_conn_sync_once, init_conn_sync, NULL, NULL);
     for (i = 0; i < MAX_AGENTS; i++) {
         if (g_conns[i].vm_id == 0) {
+            EnterCriticalSection(&g_conn_cs[i]);
             memset(&g_conns[i], 0, sizeof(AgentConn));
             g_conns[i].vm_id = vm->unique_id;
             g_conns[i].sock = INVALID_SOCKET;
-            g_conns[i].cmd_done = CreateEventW(NULL, FALSE, FALSE, NULL);
+            LeaveCriticalSection(&g_conn_cs[i]);
             return &g_conns[i];
         }
     }
@@ -109,10 +160,13 @@ static AgentConn *alloc_conn(VmInstance *vm)
 
 static void free_conn(AgentConn *conn)
 {
-    if (conn->cmd_done) CloseHandle(conn->cmd_done);
     if (conn->thread) CloseHandle(conn->thread);
+    EnterCriticalSection(conn_lock(conn));
     memset(conn, 0, sizeof(AgentConn));
     conn->sock = INVALID_SOCKET;
+    /* A caller still waiting in vm_agent_send sees no reply and returns. */
+    WakeAllConditionVariable(conn_cv(conn));
+    LeaveCriticalSection(conn_lock(conn));
 }
 
 /* ---- Line I/O ---- */
@@ -122,10 +176,11 @@ static void free_conn(AgentConn *conn)
    the peer closed the socket, -1 on a socket error (WSAGetLastError() has
    the code). A line that does not fit in buf is read up to its \n and
    discarded: buf comes back empty and *discarded is set, so no part of it is
-   handled as a line of its own. */
+   handled as a line of its own. When AGENT_DISCARD_MAX bytes pass without a
+   newline, -1 is returned with WSAEMSGSIZE. */
 static int recv_line(SOCKET s, char *buf, int buf_size, BOOL *discarded)
 {
-    int pos = 0;
+    int pos = 0, dropped = 0;
     BOOL overflow = FALSE;
 
     if (discarded) *discarded = FALSE;
@@ -138,10 +193,16 @@ static int recv_line(SOCKET s, char *buf, int buf_size, BOOL *discarded)
         }
         if (c == '\n') break;
         if (c == '\r') continue;
-        if (pos < buf_size - 1)
+        if (pos < buf_size - 1) {
             buf[pos++] = c;
-        else
+        } else {
             overflow = TRUE;
+            if (++dropped > AGENT_DISCARD_MAX) {
+                buf[0] = '\0';
+                WSASetLastError(WSAEMSGSIZE);
+                return -1;
+            }
+        }
     }
     if (overflow) {
         pos = 0;
@@ -182,6 +243,9 @@ static int read_agent_line(AgentConn *conn, VmInstance *vm, SOCKET s,
 
     if (n == 0) {
         set_drop_reason(conn, L"the agent closed the connection");
+    } else if (n < 0 && WSAGetLastError() == WSAEMSGSIZE) {
+        set_drop_reason(conn, L"the agent sent more than %d bytes without a line end",
+                        AGENT_DISCARD_MAX);
     } else if (n < 0) {
         set_drop_reason(conn, L"receive error %d", WSAGetLastError());
     } else if (discarded && !conn->overlong_logged) {
@@ -480,7 +544,22 @@ static int send_tagged_cmd(AgentConn *conn, SOCKET s, VmInstance *vm,
         rc = process_async_message(vm, s, rsp);
         if (rc == 1 || rc == 2)
             conn->drop_expected = TRUE;
+        if (rc == 1)
+            conn->guest_shutting_down = TRUE;
     }
+}
+
+/* Record the outcome of the command of generation gen (reply text, or an
+   empty reply when it failed) and wake the callers waiting for it. */
+static void complete_cmd(AgentConn *conn, LONG gen, const char *reply)
+{
+    EnterCriticalSection(conn_lock(conn));
+    strncpy_s(conn->rsp, sizeof(conn->rsp), reply, _TRUNCATE);
+    conn->rsp_gen = gen;
+    if (gen > conn->done_gen)
+        conn->done_gen = gen;
+    WakeAllConditionVariable(conn_cv(conn));
+    LeaveCriticalSection(conn_lock(conn));
 }
 
 /* ---- Persistent connection thread ---- */
@@ -512,6 +591,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         conn->sock = s;
         conn->drop_reason[0] = L'\0';
         conn->drop_expected = FALSE;
+        conn->guest_shutting_down = FALSE;
         conn->overlong_logged = FALSE;
 
         /* Wait for hello from agent */
@@ -604,30 +684,39 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Connected - read loop */
         while (!conn->stop) {
             int ret;
+            BOOL have_cmd = FALSE, expired = FALSE;
+            char cmd[sizeof(conn->cmd)];
+            LONG gen = 0;
 
-            /* Check for pending command first */
+            /* Take the queued command, if any. A command queued while this
+               one is in flight stays pending and is sent on a later pass. */
+            EnterCriticalSection(conn_lock(conn));
             if (conn->cmd_pending) {
-                /* Work on a copy: a caller that gave up waiting may queue a
-                   newer command into conn->cmd while this one is in flight. */
-                char cmd[sizeof(conn->cmd)];
-                LONG gen = conn->cmd_gen;
+                conn->cmd_pending = FALSE;
+                gen = conn->cmd_gen;
+                conn->taken_gen = gen;
                 memcpy(cmd, conn->cmd, sizeof(cmd));
                 cmd[sizeof(cmd) - 1] = '\0';
+                expired = conn->cmd_no_waiter &&
+                          GetTickCount64() - conn->cmd_queued_at > AGENT_QUEUED_CMD_MAX_AGE_MS;
+                have_cmd = TRUE;
+            }
+            LeaveCriticalSection(conn_lock(conn));
+
+            if (have_cmd && expired) {
+                ui_log(L"Agent for \"%s\": \"%S\" was queued too long ago and is not sent.",
+                       vm->name, cmd);
+                complete_cmd(conn, gen, "");
+                continue;
+            }
+            if (have_cmd) {
+                char reply[AGENT_LINE_MAX];
 
                 /* Send it and read lines until we get our tagged response */
-                n = send_tagged_cmd(conn, s, vm, cmd, conn->rsp, sizeof(conn->rsp));
-                if (n <= 0) {
-                    conn->rsp[0] = '\0';
-                    conn->cmd_pending = FALSE;
-                    SetEvent(conn->cmd_done);
+                n = send_tagged_cmd(conn, s, vm, cmd, reply, sizeof(reply));
+                complete_cmd(conn, gen, n > 0 ? reply : "");
+                if (n <= 0)
                     goto disconnected;
-                }
-                /* A newer command queued meanwhile stays pending and is sent
-                   on the next pass; only this command's request completes. */
-                if (conn->cmd_gen == gen) {
-                    conn->cmd_pending = FALSE;
-                    SetEvent(conn->cmd_done);
-                }
                 continue;
             }
 
@@ -642,6 +731,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             { int rc = process_async_message(vm, s, buf);
               if (rc == 1 || rc == 2) {   /* os_shutdown or service_stopping - reconnect loop will retry */
                   conn->drop_expected = TRUE;
+                  conn->guest_shutting_down = rc == 1;
                   break;
               }
             }
@@ -667,11 +757,38 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             ui_log(L"Agent connection for \"%s\" dropped: %s.", vm->name, conn->drop_reason);
         notify_agent_status(vm);
 
-        /* Wake up any blocked command sender */
-        if (conn->cmd_pending) {
-            conn->rsp[0] = '\0';
-            conn->cmd_pending = FALSE;
-            SetEvent(conn->cmd_done);
+        /* A queued command that was not sent yet: fail it when a caller
+           waits for its reply. A fire-and-forget one (shutdown, restart)
+           stays queued for the next connection, unless Windows in the VM is
+           already shutting down. */
+        {
+            BOOL failed = FALSE, kept = FALSE;
+            char queued[sizeof(conn->cmd)];
+            LONG queued_gen = 0;
+
+            EnterCriticalSection(conn_lock(conn));
+            if (conn->cmd_pending) {
+                memcpy(queued, conn->cmd, sizeof(queued));
+                queued[sizeof(queued) - 1] = '\0';
+                queued_gen = conn->cmd_gen;
+                if (conn->cmd_no_waiter && !conn->guest_shutting_down && !conn->stop &&
+                    vm->running) {
+                    kept = TRUE;
+                } else {
+                    conn->cmd_pending = FALSE;
+                    failed = TRUE;
+                }
+            }
+            LeaveCriticalSection(conn_lock(conn));
+
+            if (failed) {
+                complete_cmd(conn, queued_gen, "");
+                ui_log(L"Agent for \"%s\": \"%S\" was not sent (connection dropped).",
+                       vm->name, queued);
+            } else if (kept) {
+                ui_log(L"Agent for \"%s\": \"%S\" is sent when the agent reconnects.",
+                       vm->name, queued);
+            }
         }
 
         /* Don't reconnect if the VM is no longer running */
@@ -742,23 +859,35 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
                    char *response, int response_max, DWORD timeout_ms)
 {
     AgentConn *conn = find_conn(instance);
-    BOOL ok;
+    CRITICAL_SECTION *lock;
+    char reply[AGENT_LINE_MAX];
+    ULONGLONG deadline;
+    LONG my_gen;
+    BOOL answered = FALSE, superseded = FALSE, ok;
 
     if (!conn || !instance->agent_online) {
         ui_log(L"Agent: not connected to \"%s\"", instance->name);
         return FALSE;
     }
+    if (strlen(command) >= sizeof(conn->cmd)) {
+        ui_log(L"Agent: command \"%S\" is too long", command);
+        return FALSE;
+    }
+    lock = conn_lock(conn);
 
     /* Hand the command to the connection thread (it owns the socket and is the
-       sole sender). NOTE: this is a single slot per VM (conn->cmd), not a queue,
-       so concurrent callers for the SAME VM would clobber -- safe here because
-       per VM only one caller exists (shutdown). A caller that gives up waiting
-       does not stop the connection thread waiting for that reply (up to
-       AGENT_REPLY_TIMEOUT_MS); a command queued meanwhile bumps cmd_gen, stays
+       sole sender). The slot holds one command: a newer one replaces a queued
+       one that was not sent yet (its caller then gets FALSE). A caller that
+       gives up waiting does not stop the connection thread waiting for that
+       reply (up to AGENT_REPLY_TIMEOUT_MS); a command queued meanwhile stays
        pending and is sent once that reply is in. */
-    InterlockedIncrement(&conn->cmd_gen);
-    ResetEvent(conn->cmd_done);
+    EnterCriticalSection(lock);
+    if (conn->cmd_pending)   /* replaced: its caller, if waiting, gives up */
+        WakeAllConditionVariable(conn_cv(conn));
+    my_gen = ++conn->cmd_gen;
     strcpy_s(conn->cmd, sizeof(conn->cmd), command);
+    conn->cmd_no_waiter = timeout_ms == 0;
+    conn->cmd_queued_at = GetTickCount64();
     conn->cmd_pending = TRUE;
 
     /* timeout_ms == 0  =>  FIRE-AND-FORGET. Used for shutdown/restart, which ride
@@ -767,26 +896,60 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
        the queued command and consumes the (ignored) reply on its OWN read loop;
        we return immediately, so we never block the single-threaded HTTP request
        loop / the GUI thread. Delivery is confirmed by the HCS SystemExited
-       monitor, not by this reply. */
-    if (timeout_ms == 0)
+       monitor, not by this reply. If the connection drops before it is sent,
+       it is sent on the next connection (see agent_thread_proc). */
+    if (timeout_ms == 0) {
+        LeaveCriticalSection(lock);
         return TRUE;
+    }
 
     /* Otherwise wait up to timeout_ms for the agent's tagged reply (idd_connect
        expects a prompt "ok"). A real disconnect unblocks us: agent_thread_proc
-       SetEvent()s cmd_done with an empty rsp when the connection drops (closed,
-       socket error, or no reply within AGENT_REPLY_TIMEOUT_MS), so we return
-       FALSE. */
-    if (WaitForSingleObject(conn->cmd_done, timeout_ms) != WAIT_OBJECT_0) {
-        ui_log(L"Agent: command \"%S\" timed out", command);
+       completes the command with an empty reply when the connection drops
+       (closed, socket error, or no reply within AGENT_REPLY_TIMEOUT_MS), so we
+       return FALSE. */
+    deadline = GetTickCount64() + timeout_ms;
+    for (;;) {
+        ULONGLONG now;
+        if (conn->rsp_gen == my_gen) {
+            strncpy_s(reply, sizeof(reply), conn->rsp, _TRUNCATE);
+            answered = TRUE;
+            break;
+        }
+        if (conn->done_gen >= my_gen || conn->vm_id == 0 ||
+            (conn->cmd_gen != my_gen && conn->taken_gen < my_gen)) {
+            superseded = TRUE;   /* replaced before it was sent, or the connection was freed */
+            break;
+        }
+        now = GetTickCount64();
+        if (now >= deadline)
+            break;
+        SleepConditionVariableCS(conn_cv(conn), lock, (DWORD)(deadline - now));
+    }
+    /* Timed out: withdraw the command if it is still queued and still ours. */
+    if (!answered && !superseded && conn->cmd_pending && conn->cmd_gen == my_gen)
         conn->cmd_pending = FALSE;
+    LeaveCriticalSection(lock);
+
+    if (superseded) {
+        ui_log(L"Agent: command \"%S\" was not answered (replaced by a newer command "
+               L"or the connection closed)", command);
+        return FALSE;
+    }
+    if (!answered) {
+        ui_log(L"Agent: command \"%S\" timed out", command);
         return FALSE;
     }
 
     if (response && response_max > 0)
-        strncpy_s(response, response_max, conn->rsp, _TRUNCATE);
+        strncpy_s(response, response_max, reply, _TRUNCATE);
 
-    ok = (strcmp(conn->rsp, "ok") == 0);
-    ui_log(L"Agent: %S -> %S", command, conn->rsp);
+    if (!reply[0]) {
+        ui_log(L"Agent: command \"%S\" failed (connection dropped)", command);
+        return FALSE;
+    }
+    ok = (strcmp(reply, "ok") == 0);
+    ui_log(L"Agent: %S -> %S", command, reply);
     return ok;
 }
 

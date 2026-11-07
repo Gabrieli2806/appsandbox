@@ -22,6 +22,12 @@ typedef struct {
     const char *refresh_filter;
     BOOL (*resolve_target)(const wchar_t *path, wchar_t target[MAX_PATH]);
     BOOL (*commit_file)(const wchar_t *source, const wchar_t *target);
+    /* Optional. Receives the number of files whose new copy waits for the
+       next restart of Windows (the destination was in use), including ones
+       queued by an earlier copy in this boot. Such files are not counted in
+       files_copied. Keep this the last member: callers initialise the
+       structure positionally. */
+    int *files_pending;
 } P9CopyOptions;
 
 /* Copy a single Plan9 share to a local directory via HvSocket.
@@ -29,7 +35,9 @@ typedef struct {
    and recursively copies all files to local_dir.
    If filter is non-NULL/non-empty, only copies the named files (semicolon-separated)
    from the share root.
-   Skips files that already exist with matching size.
+   Skips files that already exist with matching size; files named in
+   refresh_filter, and .dll/.exe/.sys files that do not start with "MZ", are
+   fetched and compared by content instead.
    Returns P9_OK on success, or a P9_ERR_* code.
    files_copied receives the count of files actually written (may be NULL). */
 int p9_copy_share(UINT32 port, const char *share_name,

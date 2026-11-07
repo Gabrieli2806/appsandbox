@@ -24,8 +24,11 @@
 #include <cfgmgr32.h>
 #include <wtsapi32.h>
 #include <userenv.h>
+#include <winevt.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <wchar.h>
 #include "p9copy.h"
 #include "gl_vk_provision.h"
 #include "../transport/asb_transport.h"
@@ -37,6 +40,7 @@
 #pragma comment(lib, "cfgmgr32.lib")
 #pragma comment(lib, "wtsapi32.lib")
 #pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "wevtapi.lib")
 
 /* GUID_DEVCLASS_DISPLAY = {4D36E968-E325-11CE-BFC1-08002BE10318} */
 static const GUID GUID_DISPLAY_CLASS =
@@ -78,7 +82,11 @@ static HANDLE                g_stop_event;
    threads reach it only through send_to_host(). */
 static AsbConn *             g_client_sock = NULL;
 static volatile BOOL         g_os_shutting_down = FALSE;
-static CRITICAL_SECTION      g_send_cs;     /* Serializes send_line and guards g_client_sock */
+/* Serializes send_line and guards g_client_sock. Like the other locks and
+   events below, it lives until the process exits: threads that are still
+   finishing (GPU copy, device checks, ViGEm setup) may use it after the
+   service reports itself stopped. */
+static CRITICAL_SECTION      g_send_cs;
 
 /* ---- Logging ---- */
 
@@ -108,23 +116,63 @@ static BOOL host_connected(void)
     return connected;
 }
 
+#define AGENT_LOG_PATH     "C:\\Windows\\AppSandbox\\agent.log"
+#define AGENT_LOG_OLD_PATH "C:\\Windows\\AppSandbox\\agent.old.log"
+/* Past this size agent.log becomes agent.old.log (replacing the previous
+   one) and a new agent.log is started. */
+#define AGENT_LOG_MAX_BYTES (8LL * 1024 * 1024)
+
+/* Every thread writes agent.log through agent_log, and so do p9copy and
+   gl_vk_provision (p9_set_log, gl_vk_set_log): one whole line per append,
+   under this lock. The file is opened with full sharing, so a reader that
+   has it open does not make a line disappear. */
+static SRWLOCK g_log_lock = SRWLOCK_INIT;
+
+static HANDLE open_agent_log(void)
+{
+    return CreateFileA(AGENT_LOG_PATH, FILE_APPEND_DATA,
+                       FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                       NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+}
+
+/* Appends one time-stamped line to agent.log. The caller's last error is
+   preserved, so a failing call can be logged before its error is read. */
 static void agent_log(const char *fmt, ...)
 {
-    FILE *f;
+    char line[2048];
+    int len, n;
     va_list ap;
     SYSTEMTIME st;
+    HANDLE f;
+    LARGE_INTEGER size;
+    DWORD written, error = GetLastError();
 
-    if (fopen_s(&f, "C:\\Windows\\AppSandbox\\agent.log", "a") != 0 || !f)
-        return;
     GetLocalTime(&st);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] ",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
+    len = _snprintf_s(line, sizeof(line), _TRUNCATE, "[%04d-%02d-%02d %02d:%02d:%02d] ",
+                      st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+    if (len < 0) len = 0;
     va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
+    /* Two bytes stay free for the line end. */
+    n = _vsnprintf_s(line + len, sizeof(line) - len - 2, _TRUNCATE, fmt, ap);
     va_end(ap);
-    fprintf(f, "\n");
-    fclose(f);
+    len = n < 0 ? (int)strlen(line) : len + n;
+    line[len++] = '\r';
+    line[len++] = '\n';
+
+    AcquireSRWLockExclusive(&g_log_lock);
+    f = open_agent_log();
+    if (f != INVALID_HANDLE_VALUE && GetFileSizeEx(f, &size) &&
+        size.QuadPart > AGENT_LOG_MAX_BYTES) {
+        CloseHandle(f);
+        MoveFileExA(AGENT_LOG_PATH, AGENT_LOG_OLD_PATH, MOVEFILE_REPLACE_EXISTING);
+        f = open_agent_log();
+    }
+    if (f != INVALID_HANDLE_VALUE) {
+        WriteFile(f, line, (DWORD)len, &written, NULL);
+        CloseHandle(f);
+    }
+    ReleaseSRWLockExclusive(&g_log_lock);
+    SetLastError(error);
 }
 
 /* Send a log message to the host via the command channel (non-recursive, won't call agent_log).
@@ -146,28 +194,6 @@ static int agent_log_to_host(const char *fmt, ...)
     snprintf(line, sizeof(line), "log:%s", msg);
     line[sizeof(line) - 1] = '\0';
     return send_to_host(line);
-}
-
-/* ---- p9copy log adapter ---- */
-
-/* Wraps agent_log for p9copy's P9LogFn signature (identical, but explicit). */
-static void p9copy_log(const char *fmt, ...)
-{
-    FILE *f;
-    va_list ap;
-    SYSTEMTIME st;
-
-    if (fopen_s(&f, "C:\\Windows\\AppSandbox\\agent.log", "a") != 0 || !f)
-        return;
-    GetLocalTime(&st);
-    fprintf(f, "[%04d-%02d-%02d %02d:%02d:%02d] ",
-        st.wYear, st.wMonth, st.wDay,
-        st.wHour, st.wMinute, st.wSecond);
-    va_start(ap, fmt);
-    vfprintf(f, fmt, ap);
-    va_end(ap);
-    fprintf(f, "\n");
-    fclose(f);
 }
 
 /* ---- GPU copy state ---- */
@@ -193,6 +219,7 @@ static GpuCopyState g_gpu_copy = {0};
 /* Forward declarations — defined later but needed by GPU copy */
 static int recv_line(AsbConn *s, char *buf, int buf_size);
 static BOOL enable_privilege(LPCWSTR priv_name);
+static void gpu_shares_received(void);
 
 /* ---- GPU copy background thread ---- */
 
@@ -632,6 +659,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
     int i;
     int total_files = 0;
     int driver_files = 0;   /* files copied outside the always-refreshed shim share */
+    int pending_files = 0;  /* new copies that wait for the next restart (destination in use) */
     int failed_shares = 0;
     char msg[256];
     wchar_t gl_dir[MAX_PATH], native_dir[MAX_PATH];
@@ -644,6 +672,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         GpuShareInfo *si = &state->shares[i];
         wchar_t dest_wide[MAX_PATH];
         int files = 0;
+        int pending = 0;
         int rc;
 
         dest_wide[0] = 0;
@@ -667,7 +696,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             /* This list is also sent after reconnects. Seed missing files;
                existing profiles belong to the guest. The host's runtime
                lock file is recreated locally by NVIDIA when needed. */
-            const P9CopyOptions options = { TRUE, "nvdrswr.lk", NULL };
+            const P9CopyOptions options = { TRUE, "nvdrswr.lk", NULL, NULL, NULL, &pending };
             if (nvidia_drs_prepare(dest_wide))
                 rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
                                      si->filter[0] ? si->filter : NULL,
@@ -678,21 +707,24 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
             const P9CopyOptions options = {
                 FALSE, NULL, "appsandbox-nvidia-vk-gl-shim.dll;appsandbox-nvidia-vk-gl-shim32.dll;"
                              "appsandbox-nvidia-dlss-shim.dll;appsandbox-nvidia-cuda-shim.dll;"
-                             "appsandbox-nvidia-opencl-shim.dll"
+                             "appsandbox-nvidia-opencl-shim.dll",
+                NULL, NULL, &pending
             };
             rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
                                  si->filter[0] ? si->filter : NULL,
                                  &options, &files);
         } else if (strncmp(si->share_name, "AppSandbox.Drv.", 15) == 0) {
             const P9CopyOptions options = {
-                FALSE, NULL, NULL, nvidia_opencl_copy_target, nvidia_opencl_commit_copy
+                FALSE, NULL, NULL, nvidia_opencl_copy_target, nvidia_opencl_commit_copy, &pending
             };
             rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
                                  si->filter[0] ? si->filter : NULL,
                                  &options, &files);
         } else {
-            rc = p9_copy_share(50001, si->share_name, dest_wide,
-                               si->filter[0] ? si->filter : NULL, &files);
+            const P9CopyOptions options = { FALSE, NULL, NULL, NULL, NULL, &pending };
+            rc = p9_copy_share_ex(50001, si->share_name, dest_wide,
+                                 si->filter[0] ? si->filter : NULL,
+                                 &options, &files);
         }
 
         if (rc != P9_OK) {
@@ -708,6 +740,7 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
                 wcscpy_s(native_dir, MAX_PATH, dest_wide);
         }
         total_files += files;
+        pending_files += pending;
         if (strcmp(si->share_name, GPU_SHIM_SHARE) != 0)
             driver_files += files;
 
@@ -716,10 +749,23 @@ static DWORD WINAPI gpu_copy_thread(LPVOID param)
         send_to_host(msg);
     }
 
-    /* If driver files were copied and vrd.inf has error 43, restart the GPU
-       device, at most once per boot: the device restart itself can disturb
-       the display, and a second one in the same boot does not help. */
-    if (driver_files > 0 && check_gpu_error43()) {
+    /* Files whose destination was in use are only replaced when Windows
+       restarts, so until then the guest runs a mix of old and new driver
+       files. Restarting the GPU device cannot change that (and disturbs the
+       display): say that a restart is needed instead.
+       Otherwise, if driver files were copied and vrd.inf has error 43,
+       restart the GPU device, at most once per boot: the device restart
+       itself can disturb the display, and a second one in the same boot
+       does not help. */
+    if (pending_files > 0) {
+        char line[256];
+        agent_log("GPU driver sync: %d file(s) in use will be replaced at the next restart; "
+                  "not restarting the GPU device.", pending_files);
+        sprintf_s(line, sizeof(line),
+                  "log:GPU driver sync: %d driver file(s) are in use; restart the VM to finish the update",
+                  pending_files);
+        send_to_host(line);
+    } else if (driver_files > 0 && check_gpu_error43()) {
         if (first_time_this_boot(L"GpuCycledThisBoot", &gpu_cycled_flag)) {
             agent_log("GPU drivers copied and error 43 detected - attempting device restart.");
             cycle_gpu_devices(TRUE, TRUE);
@@ -851,6 +897,7 @@ static void handle_gpu_query_response(AsbConn *client, int share_count)
         send_line(client, "gpu_copy_done:0");
         return;
     }
+    gpu_shares_received();
 
     /* Start background copy */
     g_gpu_copy.copying = TRUE;
@@ -1027,17 +1074,21 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
         DWORD cur_session = WTSGetActiveConsoleSessionId();
 
         if (cur_session != 0xFFFFFFFF) {
-            HANDLE proc_snap;
+            HANDLE dead = NULL;
             DWORD  sess_snap;
             BOOL helper_alive;
 
-            /* Check liveness under the lock so the handle cannot be closed
-               by idd_connect while it is being waited on. */
+            /* Check liveness and take a dead helper's handle in the same
+               locked step: idd_connect may kill and respawn the helper at
+               any time, and a new process handle can reuse the old value. */
             EnterCriticalSection(&g_input_proc_cs);
-            proc_snap = g_input_process;
             sess_snap = g_input_session;
-            helper_alive = proc_snap &&
-                WaitForSingleObject(proc_snap, 0) != WAIT_OBJECT_0;
+            helper_alive = g_input_process &&
+                WaitForSingleObject(g_input_process, 0) != WAIT_OBJECT_0;
+            if (g_input_process && !helper_alive && cur_session == sess_snap) {
+                dead = g_input_process;
+                g_input_process = NULL;
+            }
             LeaveCriticalSection(&g_input_proc_cs);
 
             if (cur_session != sess_snap) {
@@ -1049,22 +1100,13 @@ static DWORD WINAPI input_monitor_thread(LPVOID param)
                 }
                 spawn_input_in_session(cur_session);
             } else if (!helper_alive) {
-                /* Same session but helper died — respawn.  If idd_connect
-                   replaced the helper meanwhile, there is nothing to do. */
-                HANDLE dead = NULL;
-                BOOL replaced;
-                EnterCriticalSection(&g_input_proc_cs);
-                replaced = g_input_process != proc_snap;
-                if (!replaced) {
-                    dead = g_input_process;
-                    g_input_process = NULL;
-                }
-                LeaveCriticalSection(&g_input_proc_cs);
-                if (dead) CloseHandle(dead);
-                if (!replaced) {
+                /* Same session but no live helper (it died, or none was
+                   started) — respawn. */
+                if (dead) {
+                    CloseHandle(dead);
                     agent_log("Input monitor: helper died, respawning in session %lu.", cur_session);
-                    spawn_input_in_session(cur_session);
                 }
+                spawn_input_in_session(cur_session);
             }
         }
 
@@ -1555,8 +1597,10 @@ static void stop_audio_monitor(void)
 /* Start cmd with stdout/stderr on 'out' (an inheritable pipe end).
    PROC_THREAD_ATTRIBUTE_HANDLE_LIST limits inheritance to that pipe, so the
    child does not get copies of the agent's sockets, pipes and process
-   handles. Falls back to plain inheritance if the attribute list cannot be
-   built. */
+   handles. Plain inheritance is used only when the attribute list cannot be
+   built or CreateProcess rejects it (ERROR_INVALID_PARAMETER); any other
+   failure (devcon missing, access denied) is returned as is, with
+   GetLastError() set. */
 static BOOL create_process_with_output(wchar_t *cmd, HANDLE out, PROCESS_INFORMATION *pi)
 {
     STARTUPINFOEXW six;
@@ -1577,25 +1621,31 @@ static BOOL create_process_with_output(wchar_t *cmd, HANDLE out, PROCESS_INFORMA
         attrs = (LPPROC_THREAD_ATTRIBUTE_LIST)HeapAlloc(GetProcessHeap(), 0, size);
     if (attrs) {
         if (InitializeProcThreadAttributeList(attrs, 1, 0, &size)) {
-            BOOL ok = FALSE;
+            BOOL tried = FALSE, ok = FALSE;
+            DWORD err = ERROR_SUCCESS;
             if (UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
                                           inherit, sizeof(inherit), NULL, NULL)) {
                 six.StartupInfo.cb = sizeof(six);
                 six.lpAttributeList = attrs;
+                tried = TRUE;
                 ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE,
                                     CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT,
                                     NULL, NULL, &six.StartupInfo, pi);
-                if (!ok)
-                    agent_log("devcon: start with a restricted handle list failed (%lu), "
-                              "retrying without it.", GetLastError());
+                if (!ok) err = GetLastError();
             }
             DeleteProcThreadAttributeList(attrs);
-            if (ok) {
-                HeapFree(GetProcessHeap(), 0, attrs);
-                return TRUE;
+            HeapFree(GetProcessHeap(), 0, attrs);
+            if (ok) return TRUE;
+            if (tried && err != ERROR_INVALID_PARAMETER) {
+                SetLastError(err);
+                return FALSE;
             }
+            if (tried)
+                agent_log("devcon: start with a restricted handle list was rejected (%lu), "
+                          "retrying without it.", err);
+        } else {
+            HeapFree(GetProcessHeap(), 0, attrs);
         }
-        HeapFree(GetProcessHeap(), 0, attrs);
     }
 
     six.StartupInfo.cb = sizeof(STARTUPINFOW);
@@ -1698,55 +1748,159 @@ static BOOL run_devcon(const wchar_t *args, char *output, int output_size,
 
 /* ---- IDD driver status check ---- */
 
-/* Check the AppSandboxVDD driver state and report "idd_status:<status>" to the host
-   (ok / error / disabled / not_found / unknown), derived from devcon's PnP devnode
-   state. Called by the device-check thread when a host connects (force=1: always
-   send, so a reconnect re-syncs the host's latched idd_ready) AND periodically
-   (force=0: send only on change) -- so the host's display-readiness tracks the LIVE
-   VDD state, which can self-heal via ensure_vdd_running(). The host re-latches every
-   line, so the change-gate avoids spamming the daemon log/events. */
-static void report_idd_status(int force)
-{
-    static char last_status[16];   /* last value the host received */
-    char output[4096];
-    DWORD exit_code = 0;
-    const char *st = "not_found";
+/* What devcon status says about Root\AppSandboxVDD. */
+typedef enum {
+    VDD_RUNNING,        /* "Driver is running." */
+    VDD_PROBLEM,        /* "Device has a problem: N." */
+    VDD_DISABLED,       /* "Device is disabled." */
+    VDD_STOPPED,        /* "Device is currently stopped." */
+    VDD_NOT_FOUND,      /* "No matching devices found." */
+    VDD_UNRECOGNISED,   /* any other output */
+    VDD_NO_DEVCON,      /* devcon could not be started */
+    VDD_TIMED_OUT       /* devcon did not finish in time: no reading */
+} VddState;
 
-    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
+/* The "idd_status:<value>" the host receives for each state. */
+static const char *idd_status_name(VddState st)
+{
+    switch (st) {
+    case VDD_RUNNING:   return "ok";
+    case VDD_PROBLEM:   return "error";
+    case VDD_DISABLED:  return "disabled";
+    case VDD_NOT_FOUND:
+    case VDD_NO_DEVCON: return "not_found";
+    default:            return "unknown";
+    }
+}
+
+/* The latest reading, for the status sent right after "hello": the state + 1
+   in the low 4 bits, GetTickCount64() above them; 0 before the first one.
+   A reading older than VDD_READING_MAX_AGE_MS is not sent (the device-check
+   thread sends a live one). */
+static volatile LONG64 g_vdd_last_reading;
+#define VDD_READING_MAX_AGE_MS 120000ULL
+
+/* Runs devcon status once (device-check thread only) and remembers the
+   reading. output receives devcon's text. */
+static VddState read_vdd_state(char *output, int output_size)
+{
+    DWORD exit_code = 0;
+    VddState st;
+
+    if (!run_devcon(L"status Root\\AppSandboxVDD", output, output_size, &exit_code,
                     DEVCON_QUERY_TIMEOUT_MS)) {
         agent_log("IDD status: devcon failed to launch (%lu).", GetLastError());
-        st = "not_found";
+        output[0] = '\0';
+        st = VDD_NO_DEVCON;
     } else if (exit_code == DEVCON_TIMED_OUT) {
+        return VDD_TIMED_OUT;
+    } else if (strstr(output, "running")) {
+        st = VDD_RUNNING;
+    } else if (strstr(output, "disabled")) {
+        st = VDD_DISABLED;
+    } else if (strstr(output, "problem")) {
+        st = VDD_PROBLEM;
+    } else if (strstr(output, "stopped")) {
+        st = VDD_STOPPED;
+    } else if (strstr(output, "No matching")) {
+        st = VDD_NOT_FOUND;
+    } else {
+        st = VDD_UNRECOGNISED;
+    }
+    InterlockedExchange64(&g_vdd_last_reading,
+                          (LONG64)((GetTickCount64() << 4) | (ULONGLONG)(st + 1)));
+    return st;
+}
+
+/* The latest reading as an idd_status value, or NULL when there is none
+   recent enough. Any thread. */
+static const char *recent_idd_status(void)
+{
+    LONG64 reading = InterlockedCompareExchange64(&g_vdd_last_reading, 0, 0);
+    ULONGLONG at;
+
+    if (!reading) return NULL;
+    at = (ULONGLONG)reading >> 4;
+    if (GetTickCount64() - at > VDD_READING_MAX_AGE_MS) return NULL;
+    return idd_status_name((VddState)((reading & 0xF) - 1));
+}
+
+/* Report "idd_status:<status>" (ok / error / disabled / not_found / unknown)
+   for a reading. Called by the device-check thread when a host connects
+   (force=1: always send, so a reconnect re-syncs the host's latched
+   idd_ready) AND periodically (force=0: send only on change) -- so the
+   host's display-readiness tracks the LIVE VDD state, which can self-heal
+   via ensure_vdd_running(). The host re-latches every line, so the
+   change-gate avoids spamming the daemon log/events. agent.log gets a line
+   when the reading changes. */
+static void report_idd_status(VddState st, const char *output, int force)
+{
+    static char last_sent[16];      /* last value the host received */
+    static int  last_logged = -1;   /* last VddState written to agent.log */
+    const char *name;
+
+    if (st == VDD_TIMED_OUT) {
         /* No answer from PnP: nothing new to tell, except on connect, where
            the host waits for a first status. */
         agent_log("IDD status: devcon status timed out.");
         if (!force) return;
-        st = "unknown";
-    } else if (strstr(output, "running")) {
-        agent_log("IDD status: AppSandboxVDD running.");
-        st = "ok";
-    } else if (strstr(output, "problem")) {
-        agent_log("IDD status: AppSandboxVDD has a problem. Output: %s", output);
-        st = "error";
-    } else if (strstr(output, "disabled")) {
-        agent_log("IDD status: AppSandboxVDD disabled.");
-        st = "disabled";
-    } else if (strstr(output, "No matching")) {
-        agent_log("IDD status: AppSandboxVDD not found.");
-        st = "not_found";
+        name = "unknown";
     } else {
-        agent_log("IDD status: unknown. Output: %s", output);
-        st = "unknown";
+        name = idd_status_name(st);
+        if ((int)st != last_logged) {
+            if (st == VDD_RUNNING || st == VDD_DISABLED || st == VDD_NOT_FOUND)
+                agent_log("IDD status: AppSandboxVDD %s.", st == VDD_RUNNING ? "running" :
+                          st == VDD_DISABLED ? "disabled" : "not found");
+            else if (st != VDD_NO_DEVCON)
+                agent_log("IDD status: %s. Output: %.400s", name, output);
+            last_logged = (int)st;
+        }
     }
 
     /* Send only when the value changes (force overrides on connect); remember
        it only once the host has it. */
-    if (force || strcmp(st, last_status) != 0) {
+    if (force || strcmp(name, last_sent) != 0) {
         char line[32];
-        sprintf_s(line, sizeof(line), "idd_status:%s", st);
+        sprintf_s(line, sizeof(line), "idd_status:%s", name);
         if (send_to_host(line) > 0)
-            strcpy_s(last_status, sizeof(last_status), st);
+            strcpy_s(last_sent, sizeof(last_sent), name);
     }
+}
+
+/* ---- Messages for the host log from the device-check thread ----
+ * Results of work done while no host may be connected (staged display-driver
+ * update, GPU crash workaround, a display driver that needs attention) are
+ * sent at once when a host is connected, otherwise kept and sent when the
+ * next host connects. Used only by the device-check thread. */
+#define DEVICE_NOTES 4
+static char g_device_notes[DEVICE_NOTES][600];
+
+static void send_device_notes(void)
+{
+    int i;
+    for (i = 0; i < DEVICE_NOTES; i++)
+        if (g_device_notes[i][0] && agent_log_to_host("%s", g_device_notes[i]) > 0)
+            g_device_notes[i][0] = '\0';
+}
+
+static void device_note(const char *fmt, ...)
+{
+    char text[600];
+    va_list ap;
+    int i;
+    char *c;
+
+    va_start(ap, fmt);
+    _vsnprintf_s(text, sizeof(text), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    for (c = text; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';   /* one host-log line */
+    for (i = 0; i < DEVICE_NOTES; i++) {
+        if (!g_device_notes[i][0]) {
+            strcpy_s(g_device_notes[i], sizeof(g_device_notes[i]), text);
+            break;
+        }
+    }
+    send_device_notes();
 }
 
 /* ---- VDD device check: restart if not running ---- */
@@ -1778,16 +1932,14 @@ static void run_logged(const wchar_t *cmd_line, const char *what)
     agent_log("%s: exit %lu.", what, code);
 }
 
-/* Result of the last staged display-driver install, sent to the host log
-   once it connects (the install runs at service start, before that).
-   Used only by the device-check thread. */
-static char g_vdd_update_note[600];
-
+/* Installs a display driver staged by the host. Runs at service start on
+   the device-check thread; the result goes to the host log (device_note). */
 static void apply_pending_vdd_update(void)
 {
     wchar_t dir[MAX_PATH], marker[MAX_PATH], cer[MAX_PATH], sys_dir[MAX_PATH];
     wchar_t cmd[1024], *slash;
     char output[1024];
+    char note[600] = "";
     DWORD exit_code = 0;
     /* devcon update's exit code: 0 done, 1 done but a restart is needed (the
        old driver file was still in use), 2 failed; DEVCON_TIMED_OUT when it
@@ -1827,20 +1979,20 @@ static void apply_pending_vdd_update(void)
         if (update_code == DEVCON_TIMED_OUT) {
             agent_log("VDD update: devcon did not finish within %lu s: %.400s",
                       DEVCON_UPDATE_TIMEOUT_MS / 1000, output);
-            _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+            _snprintf_s(note, sizeof(note), _TRUNCATE,
                         "display driver update: devcon did not finish within %lu s and was stopped; "
                         "the VM was not restarted (see C:\\Windows\\AppSandbox\\agent.log).",
                         DEVCON_UPDATE_TIMEOUT_MS / 1000);
         } else {
             agent_log("VDD update: devcon exit %lu: %.400s", update_code, output);
-            _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+            _snprintf_s(note, sizeof(note), _TRUNCATE,
                         "display driver update: devcon exit %lu: %.400s", update_code, output);
         }
     } else {
         DWORD err = GetLastError();
         update_code = 2;
         agent_log("VDD update: devcon failed to launch (%lu).", err);
-        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+        _snprintf_s(note, sizeof(note), _TRUNCATE,
                     "display driver update: devcon failed to launch (%lu)", err);
     }
     if (run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
@@ -1854,7 +2006,7 @@ static void apply_pending_vdd_update(void)
        restart request. */
     if (update_code == 1) {
         wchar_t restart[MAX_PATH + 96];
-        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+        _snprintf_s(note, sizeof(note), _TRUNCATE,
                     "display driver update installed; restarting the VM in 15 seconds to finish it.");
         agent_log("VDD update: restart required, restarting in 15 s.");
         swprintf_s(restart, ARRAYSIZE(restart),
@@ -1862,17 +2014,11 @@ static void apply_pending_vdd_update(void)
                    sys_dir);
         run_logged(restart, "VDD update: restart");
     } else if (update_code == 0) {
-        _snprintf_s(g_vdd_update_note, sizeof(g_vdd_update_note), _TRUNCATE,
+        _snprintf_s(note, sizeof(note), _TRUNCATE,
                     "display driver updated.");
     }
-    {
-        /* Flatten line breaks for the one-line host log. */
-        char *c;
-        for (c = g_vdd_update_note; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
-    }
-    /* Host already connected: tell it now (otherwise at its connect check). */
-    if (agent_log_to_host("%s", g_vdd_update_note) > 0)
-        g_vdd_update_note[0] = '\0';
+    if (note[0])
+        device_note("%s", note);
 }
 
 /* ---- Controllers: ViGEmBus (virtual Xbox 360 pads) ----
@@ -1929,77 +2075,157 @@ static void ensure_vigem_installed(void)
    when two consecutive checks, at least VDD_RECHECK_MIN_MS apart, saw
    "disabled" (enable it) or a problem / stopped device (restart it).
    Anything else -- an unrecognised, empty or timed-out status -- is left
-   alone. Runs only on the device-check thread. */
-#define VDD_RECHECK_MIN_MS 10000
+   alone.
+   Repairs back off: attempt N+1 waits VDD_REPAIR_BACKOFF_MS[N] after
+   attempt N, and after VDD_REPAIR_MAX_ATTEMPTS the agent stops (a problem
+   that enable or restart cannot fix, e.g. a signature or IddCx init failure,
+   would otherwise restart the driver forever) and says so once. The count
+   starts again once the driver has been running for VDD_REPAIR_RESET_MS
+   since the last attempt.
+   st/status: the reading from read_vdd_state. Returns TRUE when it ran
+   devcon enable or restart. Runs only on the device-check thread. */
+#define VDD_RECHECK_MIN_MS      10000ULL
+#define VDD_REPAIR_MAX_ATTEMPTS 3
+#define VDD_REPAIR_RESET_MS     (10ULL * 60 * 1000)
+static const ULONGLONG VDD_REPAIR_BACKOFF_MS[VDD_REPAIR_MAX_ATTEMPTS] = { 0, 120000, 300000 };
 
-static void ensure_vdd_running(void)
+static BOOL ensure_vdd_running(VddState st, const char *status)
 {
-    static int   bad_readings = 0;     /* consecutive disabled / problem readings */
-    static DWORD first_bad_tick = 0;
-    char output[4096];
+    static int       bad_readings = 0;     /* consecutive disabled / problem readings */
+    static ULONGLONG first_bad_tick = 0;
+    static int       attempts = 0;         /* repairs since the driver last ran for a while */
+    static ULONGLONG last_attempt_tick = 0;
+    static BOOL      wait_logged = FALSE;
+    static BOOL      gave_up = FALSE;
+    char output[1024];
     DWORD exit_code = 0;
-    BOOL disabled, stuck;
+    ULONGLONG now = GetTickCount64();
+    BOOL disabled = st == VDD_DISABLED;
 
-    if (!run_devcon(L"status Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
-                    DEVCON_QUERY_TIMEOUT_MS)) {
-        agent_log("ensure_vdd_running: devcon failed to launch (%lu).", GetLastError());
-        return;
-    }
-    if (exit_code == DEVCON_TIMED_OUT) {
-        agent_log("ensure_vdd_running: devcon status timed out - leaving the VDD alone.");
-        return;
-    }
-
-    if (strstr(output, "running") || strstr(output, "No matching")) {
-        bad_readings = 0;   /* fine, or not installed yet */
-        return;
-    }
-
-    disabled = strstr(output, "disabled") != NULL;
-    stuck = !disabled && (strstr(output, "problem") != NULL || strstr(output, "stopped") != NULL);
-    if (!disabled && !stuck) {
-        agent_log("VDD: unrecognised status - leaving it alone. Output: %.400s", output);
+    switch (st) {
+    case VDD_RUNNING:
         bad_readings = 0;
-        return;
+        wait_logged = FALSE;
+        if (attempts && now - last_attempt_tick >= VDD_REPAIR_RESET_MS) {
+            attempts = 0;
+            gave_up = FALSE;
+        }
+        return FALSE;
+    case VDD_NOT_FOUND:     /* not installed yet */
+        bad_readings = 0;
+        return FALSE;
+    case VDD_DISABLED:
+    case VDD_PROBLEM:
+    case VDD_STOPPED:
+        break;
+    case VDD_UNRECOGNISED:
+        agent_log("VDD: unrecognised status - leaving it alone. Output: %.400s", status);
+        bad_readings = 0;
+        return FALSE;
+    default:                /* no reading (devcon missing or timed out) */
+        return FALSE;
+    }
+
+    /* Problem 14 (CM_PROB_NEED_RESTART): only a restart of Windows helps,
+       restarting the device does not. */
+    {
+        const char *problem = strstr(status, "problem: ");
+        if (problem && atoi(problem + 9) == 14) {
+            static BOOL restart_logged = FALSE;
+            if (!restart_logged) {
+                restart_logged = TRUE;
+                agent_log("VDD: waits for a restart of Windows (problem 14) - not restarting the device.");
+            }
+            bad_readings = 0;
+            return FALSE;
+        }
     }
 
     if (bad_readings == 0)
-        first_bad_tick = GetTickCount();
+        first_bad_tick = now;
     bad_readings++;
-    if (bad_readings < 2 || GetTickCount() - first_bad_tick < VDD_RECHECK_MIN_MS) {
+    if (bad_readings < 2 || now - first_bad_tick < VDD_RECHECK_MIN_MS) {
         agent_log("VDD: %s - checking again before acting.", disabled ? "disabled" : "problem");
-        return;
+        return FALSE;
     }
+
+    if (attempts >= VDD_REPAIR_MAX_ATTEMPTS) {
+        if (!gave_up) {
+            gave_up = TRUE;
+            agent_log("VDD: still %s after %d repair attempts - not trying again until it has "
+                      "run for a while or Windows restarts. Status: %.400s",
+                      disabled ? "disabled" : "not working", attempts, status);
+            device_note("The display driver (AppSandboxVDD) in this VM still does not work after %d "
+                        "repair attempts; restart the VM, and if that does not help, update the guest "
+                        "components (see C:\\Windows\\AppSandbox\\agent.log).", attempts);
+        }
+        return FALSE;
+    }
+    if (attempts > 0 && now - last_attempt_tick < VDD_REPAIR_BACKOFF_MS[attempts]) {
+        if (!wait_logged) {
+            wait_logged = TRUE;
+            agent_log("VDD: %s again - waiting %llu s after the last repair before trying again.",
+                      disabled ? "disabled" : "problem",
+                      (VDD_REPAIR_BACKOFF_MS[attempts] - (now - last_attempt_tick)) / 1000);
+        }
+        return FALSE;
+    }
+
     bad_readings = 0;
+    wait_logged = FALSE;
+    attempts++;
+    last_attempt_tick = now;
 
     /* A device in CM_PROB_DISABLED (explicitly disabled) has its CONFIGFLAG_DISABLED bit set;
        `devcon restart` (DICS_PROPCHANGE: stop->start) reports success but CANNOT clear that bit,
        so the device snaps straight back to disabled. Only `devcon enable` (DICS_ENABLE) clears it.
        So: ENABLE a disabled device; RESTART a stuck-but-enabled ("problem") one. */
     if (disabled) {
-        agent_log("VDD: disabled - enabling.");
+        agent_log("VDD: disabled - enabling (attempt %d of %d).", attempts, VDD_REPAIR_MAX_ATTEMPTS);
         if (!run_devcon(L"enable Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
                         DEVCON_CHANGE_TIMEOUT_MS)) {
             agent_log("VDD enable: devcon failed to launch (%lu).", GetLastError());
-            return;
+            return FALSE;
         }
         if (exit_code == DEVCON_TIMED_OUT)
             agent_log("VDD enable: devcon timed out: %.400s", output);
         else
             agent_log("VDD enable (exit=%lu): %.400s", exit_code, output);
-        return;
+        return TRUE;
     }
 
-    agent_log("VDD: problem - restarting. Status: %.400s", output);
+    agent_log("VDD: problem - restarting (attempt %d of %d). Status: %.400s",
+              attempts, VDD_REPAIR_MAX_ATTEMPTS, status);
     if (!run_devcon(L"restart Root\\AppSandboxVDD", output, sizeof(output), &exit_code,
                     DEVCON_CHANGE_TIMEOUT_MS)) {
         agent_log("VDD restart: devcon failed to launch (%lu).", GetLastError());
-        return;
+        return FALSE;
     }
     if (exit_code == DEVCON_TIMED_OUT)
         agent_log("VDD restart: devcon timed out: %.400s", output);
     else
         agent_log("VDD restart (exit=%lu): %.400s", exit_code, output);
+    return TRUE;
+}
+
+/* Reads the VDD state once, repairs it if needed and sends idd_status:
+   forced first when a host just connected, then (or periodically) only on
+   a change, after any repair. Device-check thread only. */
+static void check_vdd(BOOL host_just_connected)
+{
+    char output[4096];
+    VddState st = read_vdd_state(output, sizeof(output));
+    BOOL repaired;
+
+    if (host_just_connected) {
+        report_idd_status(st, output, 1);
+        send_device_notes();
+    }
+    repaired = ensure_vdd_running(st, output);
+    if (repaired)
+        st = read_vdd_state(output, sizeof(output));
+    if (repaired || !host_just_connected)
+        report_idd_status(st, output, 0);
 }
 
 /* ---- Hyper-V Video device check: disable if running ---- */
@@ -2317,12 +2543,21 @@ static ULONG primary_nic_index(void)
  * CleanShutdown (DWORD under HKLM\SOFTWARE\AppSandbox\Agent) is 0 while the
  * service runs and 1 once it is told to stop or that Windows shuts down.
  * Finding 0 at the first service start of a boot means the last session
- * ended some other way: a crash (bugcheck), a reset or a power-off. The host
- * log is told once, at the first connection, together with the newest crash
- * dump not reported before. Best effort: any registry or file error just
- * skips the report. */
+ * ended some other way: a crash (bugcheck), a reset, a power-off, or Force
+ * Stop in App Sandbox, the usual way to end a disposable VM. So the host log
+ * is told only when there is evidence of a crash: the bugcheck Windows
+ * recorded in this boot's System log (WER-SystemErrorReporting 1001, or
+ * Kernel-Power 41 with a bugcheck code) or a crash dump not reported before.
+ * Without it, only agent.log gets a line. Windows writes the bugcheck event
+ * and extracts the dump a while after boot, so the report is put together at
+ * the first host connection and sent once. Best effort: any registry, event
+ * log or file error just leaves that part out. */
 
-static char      g_reset_note[600];     /* set before the listener starts, then used only by handle_client */
+static BOOL      g_prev_unclean;        /* CleanShutdown was 0 at the first start in this boot */
+static ULONGLONG g_last_dump_reported;  /* LastMinidumpReported at service start */
+/* Used only by the connection thread (handle_client): */
+static BOOL      g_session_report_built;
+static char      g_reset_note[900];     /* built, not sent yet */
 static ULONGLONG g_reset_dump_time;     /* write time of the dump named in g_reset_note */
 
 static void mark_clean_shutdown(DWORD clean)
@@ -2367,15 +2602,13 @@ static BOOL newest_minidump(ULONGLONG after, wchar_t *name, int name_len, ULONGL
 }
 
 /* At service start: read the previous session's marker, set it to 0 for
-   this one, and prepare the host-log note. */
+   this one, and note in agent.log how the previous session ended. */
 static void check_previous_session(void)
 {
     static volatile LONG started_flag = 0;
     HKEY key;
     DWORD value = 1, type = 0, size = sizeof(value);
-    ULONGLONG last_dump = 0, dump_time = 0;
-    BOOL unclean = FALSE, have_dump;
-    wchar_t dump[MAX_PATH];
+    ULONGLONG last_dump = 0;
     /* A restart of this service within the same boot (it crashed and the SCM
        restarted it) is not a Windows session ending. */
     BOOL first_start = first_time_this_boot(L"StartedThisBoot", &started_flag);
@@ -2385,39 +2618,197 @@ static void check_previous_session(void)
         return;
     if (RegQueryValueExW(key, L"CleanShutdown", NULL, &type, (BYTE *)&value, &size) == ERROR_SUCCESS &&
         type == REG_DWORD && size == sizeof(value) && value == 0)
-        unclean = first_start;
+        g_prev_unclean = first_start;
     size = sizeof(last_dump);
     if (RegQueryValueExW(key, L"LastMinidumpReported", NULL, &type, (BYTE *)&last_dump, &size) != ERROR_SUCCESS ||
         type != REG_QWORD || size != sizeof(last_dump))
         last_dump = 0;
     RegCloseKey(key);
+    g_last_dump_reported = last_dump;
     mark_clean_shutdown(0);
 
-    have_dump = newest_minidump(last_dump, dump, MAX_PATH, &dump_time);
-    if (unclean) {
-        agent_log("Previous Windows session ended unexpectedly (CleanShutdown was 0).%s%ls",
-                  have_dump ? " Newest crash dump: " : "", have_dump ? dump : L"");
+    if (g_prev_unclean)
+        agent_log("The previous Windows session did not shut down normally (CleanShutdown was 0): "
+                  "a crash, a reset, a power-off or Force Stop. Crash details, if any, are reported "
+                  "at the first host connection.");
+}
+
+/* Text of the n-th (0-based) <Data> element of an event's XML, or of the
+   <Data> element named 'name' when name is not NULL. Entities are not
+   decoded. FALSE when there is no such element. */
+static BOOL event_data(const wchar_t *xml, int n, const wchar_t *name, wchar_t *out, size_t out_len)
+{
+    const wchar_t *p = xml, *end;
+    size_t len;
+
+    for (;;) {
+        p = wcsstr(p, L"<Data");
+        if (!p) return FALSE;
+        end = wcschr(p, L'>');
+        if (!end) return FALSE;
+        if (name) {
+            /* Name='x' or Name="x" inside this start tag */
+            const wchar_t *attr = wcsstr(p, L"Name=");
+            if (attr && attr < end && (attr[5] == L'\'' || attr[5] == L'"') &&
+                wcsncmp(attr + 6, name, wcslen(name)) == 0 && attr[6 + wcslen(name)] == attr[5])
+                break;
+        } else if (n-- == 0) {
+            break;
+        }
+        p = end;
+    }
+    out[0] = L'\0';
+    if (end[-1] == L'/') return TRUE;   /* <Data .../>: empty */
+    p = end + 1;
+    end = wcschr(p, L'<');
+    if (!end) return FALSE;
+    len = (size_t)(end - p);
+    if (len >= out_len) len = out_len - 1;
+    wmemcpy(out, p, len);
+    out[len] = L'\0';
+    return TRUE;
+}
+
+/* XML of the newest System-log event from 'provider' with 'event_id' logged
+   in the last within_ms milliseconds, or NULL (free() it). */
+static wchar_t *newest_system_event(const wchar_t *provider, int event_id, ULONGLONG within_ms)
+{
+    wchar_t query[300];
+    EVT_HANDLE results, event = NULL;
+    DWORD returned = 0, used = 0, props = 0;
+    wchar_t *xml = NULL;
+
+    swprintf_s(query, ARRAYSIZE(query),
+               L"*[System[Provider[@Name='%s'] and EventID=%d and "
+               L"TimeCreated[timediff(@SystemTime) <= %llu]]]",
+               provider, event_id, within_ms);
+    results = EvtQuery(NULL, L"System", query, EvtQueryChannelPath | EvtQueryReverseDirection);
+    if (!results) return NULL;
+    if (EvtNext(results, 1, &event, 2000, 0, &returned) && returned == 1) {
+        if (!EvtRender(NULL, event, EvtRenderEventXml, 0, NULL, &used, &props) &&
+            GetLastError() == ERROR_INSUFFICIENT_BUFFER && used) {
+            xml = (wchar_t *)calloc(used / sizeof(wchar_t) + 1, sizeof(wchar_t));
+            if (xml && !EvtRender(NULL, event, EvtRenderEventXml, used, xml, &used, &props)) {
+                free(xml);
+                xml = NULL;
+            }
+        }
+        EvtClose(event);
+    }
+    EvtClose(results);
+    return xml;
+}
+
+/* The bugcheck Windows recorded in this boot (so for the previous session):
+   text as "0x0000003b (0x..., 0x..., 0x..., 0x...)", the code and first
+   parameter, and the dump file WER named (may be empty). */
+typedef struct {
+    char      text[200];
+    ULONGLONG code, param1;
+    wchar_t   dump[MAX_PATH];
+} BugcheckInfo;
+
+static BOOL recorded_bugcheck(BugcheckInfo *bc)
+{
+    /* Events since this boot, plus a margin for the clock being set at boot. */
+    ULONGLONG within = GetTickCount64() + 120000;
+    wchar_t value[200], *xml;
+    BOOL found = FALSE;
+
+    ZeroMemory(bc, sizeof(*bc));
+    /* "The computer has rebooted from a bugcheck": param1 is the bugcheck
+       text, param2 the dump file. */
+    xml = newest_system_event(L"Microsoft-Windows-WER-SystemErrorReporting", 1001, within);
+    if (xml && event_data(xml, 0, NULL, value, ARRAYSIZE(value)) && value[0]) {
+        const wchar_t *open = wcschr(value, L'(');
+        bc->code = wcstoull(value, NULL, 0);
+        bc->param1 = open ? wcstoull(open + 1, NULL, 0) : 0;
+        _snprintf_s(bc->text, sizeof(bc->text), _TRUNCATE, "%ls", value);
+        if (!event_data(xml, 1, NULL, bc->dump, ARRAYSIZE(bc->dump)))
+            bc->dump[0] = L'\0';
+        found = bc->code != 0;
+    }
+    free(xml);
+    if (found) return TRUE;
+
+    /* Kernel-Power 41 ("rebooted without cleanly shutting down") carries the
+       bugcheck code when there was one, 0 otherwise. */
+    xml = newest_system_event(L"Microsoft-Windows-Kernel-Power", 41, within);
+    if (xml && event_data(xml, 0, L"BugcheckCode", value, ARRAYSIZE(value)) &&
+        (bc->code = wcstoull(value, NULL, 0)) != 0) {
+        ULONGLONG p[4] = { 0, 0, 0, 0 };
+        static const wchar_t *const names[4] = {
+            L"BugcheckParameter1", L"BugcheckParameter2", L"BugcheckParameter3", L"BugcheckParameter4"
+        };
+        int k;
+        for (k = 0; k < 4; k++)
+            if (event_data(xml, 0, names[k], value, ARRAYSIZE(value)))
+                p[k] = wcstoull(value, NULL, 0);
+        bc->param1 = p[0];
+        _snprintf_s(bc->text, sizeof(bc->text), _TRUNCATE,
+                    "0x%08llX (0x%llX, 0x%llX, 0x%llX, 0x%llX)", bc->code, p[0], p[1], p[2], p[3]);
+        found = TRUE;
+    }
+    free(xml);
+    return found;
+}
+
+static BOOL windows_build(DWORD *build, DWORD *ubr);
+static int gpu_crash_build_status(DWORD build, DWORD ubr);
+
+/* Puts the host-log note together (see above). Connection thread only. */
+static void build_session_report(void)
+{
+    static volatile LONG crash_reported_flag = 0;
+    BugcheckInfo bc = { 0 };
+    wchar_t dump[MAX_PATH];
+    ULONGLONG dump_time = 0;
+    BOOL have_dump = newest_minidump(g_last_dump_reported, dump, MAX_PATH, &dump_time);
+    BOOL have_bugcheck = (g_prev_unclean || have_dump) && recorded_bugcheck(&bc);
+    char *c;
+
+    if (have_bugcheck && first_time_this_boot(L"CrashReportedThisBoot", &crash_reported_flag)) {
+        DWORD build = 0, ubr = 0;
+        /* SYSTEM_SERVICE_EXCEPTION with an access violation, on a build with
+           the GPU-PV dxgkrnl bug (see gpu_crash_workaround). */
+        BOOL known = bc.code == 0x3B && (bc.param1 & 0xFFFFFFFFULL) == 0xC0000005ULL &&
+                     (!windows_build(&build, &ubr) || gpu_crash_build_status(build, ubr) == 1);
+
+        agent_log("Previous Windows session ended with bugcheck %s.%s%ls", bc.text,
+                  have_dump ? " Crash dump: " : "", have_dump ? dump : L"");
         _snprintf_s(g_reset_note, sizeof(g_reset_note), _TRUNCATE,
-                    "log:the previous Windows session in this VM ended unexpectedly (crash or reset); "
-                    "see C:\\Windows\\Minidump and the System event log%s%ls%s",
-                    have_dump ? " (newest crash dump: " : "", have_dump ? dump : L"",
-                    have_dump ? ")" : "");
+                    "log:Windows in this VM crashed in its previous session (bugcheck %s)%s%ls%ls%s%s",
+                    bc.text,
+                    have_dump || bc.dump[0] ? "; crash dump: " : "",
+                    have_dump ? L"C:\\Windows\\Minidump\\" : L"",
+                    have_dump ? dump : bc.dump,
+                    known ? ". This matches a known Windows bug in VMs with a GPU (dxgkrnl, GPU-PV); "
+                            "installing the latest Windows update in the VM fixes it" : "",
+                    known ? "." : "");
     } else if (have_dump) {
         agent_log("New crash dump found: %ls", dump);
         _snprintf_s(g_reset_note, sizeof(g_reset_note), _TRUNCATE,
                     "log:Windows wrote a crash dump in this VM: C:\\Windows\\Minidump\\%ls "
                     "(see the System event log)", dump);
+    } else if (g_prev_unclean) {
+        agent_log("No crash was recorded for the previous Windows session (Force Stop, power-off or "
+                  "reset); nothing reported to the host.");
     }
+    for (c = g_reset_note; *c; c++) if (*c == '\r' || *c == '\n') *c = ' ';
     if (have_dump)
         g_reset_dump_time = dump_time;
 }
 
-/* Send the note prepared by check_previous_session() once, on the first
-   connection that takes it, and remember the dump as reported. */
+/* Send the note once, on the first connection that takes it, and remember
+   the dump as reported. */
 static void report_previous_session(AsbConn *client)
 {
     HKEY key;
 
+    if (!g_session_report_built) {
+        g_session_report_built = TRUE;
+        build_session_report();
+    }
     if (!g_reset_note[0] || send_line(client, g_reset_note) <= 0)
         return;
     g_reset_note[0] = '\0';
@@ -2430,23 +2821,313 @@ static void report_previous_session(AsbConn *client)
     }
 }
 
+/* ---- GPU crash workaround (Windows feature overrides) ----
+ * Windows 11 builds 26100, 26200 and 26300 from UBR 9550 (KB5124010,
+ * September 2026; KB5127648 brought it to all three) have a dxgkrnl bug in
+ * GPU-PV guests: asking every display adapter about video-encoder or
+ * exclusive-engine support also reaches the Microsoft Basic Render (WARP)
+ * adapter, which has no VMBus channel, and the guest bugchecks with 0x3B
+ * (c0000005 in DXGVMBUSMESSAGE::InitializeMessage) and restarts. Chromium
+ * apps (Edge, Discord, Steam's web views) and games trigger it through
+ * MFTEnumEx(MFT_CATEGORY_VIDEO_ENCODER), and Task Manager, dxdiag and the
+ * Game DVR service do too. KB5127936 / the November 10 2026 update (26200 and
+ * 26300 UBR 9818) fixes it; 26100 Home/Pro gets no more updates.
+ *
+ * The workaround turns off the two features that make those queries, with
+ * boot-store feature overrides (priority 8 = User), the same keys ViVeTool
+ * writes for "/disable /id:56095990,62328181":
+ *   56095990  Feature_Servicing_MFTEnumEngineAccessFilter (mfplat)
+ *   62328181  Feature_D3DVideoEncoderExclusiveAccess (D3D12Core)
+ * Override key names are obfuscated IDs, computed with ViVeTool's
+ * ObfuscateFeatureId: rotl1(bswap(id ^ 0x74161A4E) ^ 0x8FB23D4F) ^ 0x833EA8FF.
+ * Windows reads them at boot, so they take effect after the next restart.
+ *
+ * Applied only to an affected build with a GPU-PV adapter (or GPU shares from
+ * the host). The keys this agent created are listed in FeatureOverridesSet
+ * (AGENT_REG_KEY) and are the only ones it ever changes or removes: an
+ * existing override key it did not create is left alone. They are removed
+ * again on a fixed or unaffected build, and when GpuStabilityTweaks (DWORD,
+ * AGENT_REG_KEY) is 0, which turns the workaround off. Device-check thread
+ * only. */
+#define FEATURE_OVERRIDES_KEY L"SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8"
+
+static const struct {
+    const wchar_t *key;        /* obfuscated ID: the override's key name */
+    DWORD          feature;    /* feature ID as ViVeTool shows it */
+} GPU_CRASH_FEATURES[] = {
+    { L"3985002639", 56095990 },   /* Feature_Servicing_MFTEnumEngineAccessFilter */
+    { L"3933573262", 62328181 },   /* Feature_D3DVideoEncoderExclusiveAccess */
+};
+#define GPU_CRASH_FEATURE_COUNT (sizeof(GPU_CRASH_FEATURES) / sizeof(GPU_CRASH_FEATURES[0]))
+
+/* TRUE when a display adapter driven by vrd.inf (GPU-PV) is present. */
+static BOOL gpu_pv_adapter_present(void)
+{
+    HDEVINFO devs = SetupDiGetClassDevsW(&GUID_DISPLAY_CLASS, NULL, NULL, DIGCF_PRESENT);
+    SP_DEVINFO_DATA dev_info;
+    DWORD idx;
+    BOOL found = FALSE;
+
+    if (devs == INVALID_HANDLE_VALUE) return FALSE;
+    dev_info.cbSize = sizeof(dev_info);
+    for (idx = 0; !found && SetupDiEnumDeviceInfo(devs, idx, &dev_info); idx++) {
+        DEVPROPTYPE prop_type;
+        wchar_t inf_path[MAX_PATH] = {0};
+        if (SetupDiGetDevicePropertyW(devs, &dev_info, &DPKEY_DriverInfPath, &prop_type,
+                                      (PBYTE)inf_path, sizeof(inf_path), NULL, 0) &&
+            _wcsicmp(inf_path, L"vrd.inf") == 0)
+            found = TRUE;
+    }
+    SetupDiDestroyDeviceInfoList(devs);
+    return found;
+}
+
+/* CurrentBuild and UBR of this Windows; FALSE when they cannot be read. */
+static BOOL windows_build(DWORD *build, DWORD *ubr)
+{
+    wchar_t text[16];
+    DWORD size = sizeof(text);
+
+    *build = 0;
+    *ubr = 0;
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                     L"CurrentBuild", RRF_RT_REG_SZ, NULL, text, &size) != ERROR_SUCCESS)
+        return FALSE;
+    *build = (DWORD)wcstoul(text, NULL, 10);
+    size = sizeof(*ubr);
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                     L"UBR", RRF_RT_REG_DWORD, NULL, ubr, &size) != ERROR_SUCCESS)
+        *ubr = 0;
+    return *build != 0;
+}
+
+/* 1 when this Windows build has the GPU-PV crash bug, 2 when it is a build
+   of an affected release that has the fix, 0 otherwise. */
+static int gpu_crash_build_status(DWORD build, DWORD ubr)
+{
+    if ((build == 26200 || build == 26300) && ubr >= 9818) return 2;
+    if ((build == 26100 || build == 26200 || build == 26300) && ubr >= 9550) return 1;
+    return 0;
+}
+
+/* Which of GPU_CRASH_FEATURES this agent created (FeatureOverridesSet). */
+static void read_overrides_set(BOOL ours[GPU_CRASH_FEATURE_COUNT])
+{
+    wchar_t list[256];
+    DWORD size = sizeof(list) - 2 * sizeof(wchar_t);
+    const wchar_t *name;
+    size_t f;
+
+    for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++) ours[f] = FALSE;
+    ZeroMemory(list, sizeof(list));
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, L"FeatureOverridesSet",
+                     RRF_RT_REG_MULTI_SZ, NULL, list, &size) != ERROR_SUCCESS)
+        return;
+    for (name = list; *name; name += wcslen(name) + 1)
+        for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++)
+            if (wcscmp(name, GPU_CRASH_FEATURES[f].key) == 0) ours[f] = TRUE;
+}
+
+static BOOL write_overrides_set(const BOOL ours[GPU_CRASH_FEATURE_COUNT])
+{
+    wchar_t list[256];
+    size_t at = 0, f;
+    HKEY key;
+    LSTATUS rc;
+
+    ZeroMemory(list, sizeof(list));
+    for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++) {
+        if (!ours[f]) continue;
+        wcscpy_s(list + at, ARRAYSIZE(list) - at - 1, GPU_CRASH_FEATURES[f].key);
+        at += wcslen(GPU_CRASH_FEATURES[f].key) + 1;
+    }
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, 0, NULL, 0, KEY_SET_VALUE,
+                        NULL, &key, NULL) != ERROR_SUCCESS)
+        return FALSE;
+    if (at)
+        rc = RegSetValueExW(key, L"FeatureOverridesSet", 0, REG_MULTI_SZ, (const BYTE *)list,
+                            (DWORD)((at + 1) * sizeof(wchar_t)));
+    else {
+        rc = RegDeleteValueW(key, L"FeatureOverridesSet");
+        if (rc == ERROR_FILE_NOT_FOUND) rc = ERROR_SUCCESS;
+    }
+    RegFlushKey(key);
+    RegCloseKey(key);
+    return rc == ERROR_SUCCESS;
+}
+
+/* Creates the override key for feature f if it does not exist yet. Returns
+   1 when this call created it, 0 when it exists already (not touched), -1 on
+   an error. The key is listed in FeatureOverridesSet before it is created, so
+   a crash in between cannot leave an override nobody removes. */
+static int create_feature_override(size_t f, BOOL ours[GPU_CRASH_FEATURE_COUNT])
+{
+    static const wchar_t *const zero_values[] = {
+        L"EnabledStateOptions", L"Variant", L"VariantPayload", L"VariantPayloadKind"
+    };
+    wchar_t path[160];
+    HKEY key;
+    DWORD disposition = 0, disabled = 1, zero = 0, i;
+    LSTATUS rc;
+    BOOL was_ours = ours[f];
+
+    swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", FEATURE_OVERRIDES_KEY, GPU_CRASH_FEATURES[f].key);
+    rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, KEY_QUERY_VALUE, &key);
+    if (rc == ERROR_SUCCESS) {
+        RegCloseKey(key);
+        return 0;
+    }
+    if (rc != ERROR_FILE_NOT_FOUND)
+        return -1;
+    if (!was_ours) {
+        ours[f] = TRUE;
+        if (!write_overrides_set(ours)) {
+            ours[f] = FALSE;
+            return -1;
+        }
+    }
+    rc = RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, KEY_SET_VALUE, NULL, &key,
+                         &disposition);
+    if (rc != ERROR_SUCCESS || disposition != REG_CREATED_NEW_KEY) {
+        if (rc == ERROR_SUCCESS) RegCloseKey(key);
+        if (!was_ours) {
+            ours[f] = FALSE;
+            write_overrides_set(ours);
+        }
+        if (rc != ERROR_SUCCESS)
+            agent_log("GPU crash workaround: cannot create the override for feature %lu (error %ld).",
+                      GPU_CRASH_FEATURES[f].feature, (long)rc);
+        return rc == ERROR_SUCCESS ? 0 : -1;
+    }
+    /* EnabledState 1 = disabled (0 default, 2 enabled). */
+    rc = RegSetValueExW(key, L"EnabledState", 0, REG_DWORD, (const BYTE *)&disabled, sizeof(disabled));
+    for (i = 0; rc == ERROR_SUCCESS && i < ARRAYSIZE(zero_values); i++)
+        rc = RegSetValueExW(key, zero_values[i], 0, REG_DWORD, (const BYTE *)&zero, sizeof(zero));
+    RegFlushKey(key);
+    RegCloseKey(key);
+    if (rc != ERROR_SUCCESS) {
+        agent_log("GPU crash workaround: cannot write the override for feature %lu (error %ld).",
+                  GPU_CRASH_FEATURES[f].feature, (long)rc);
+        return -1;
+    }
+    return 1;
+}
+
+/* Removes the override for feature f that this agent created, unless its
+   state was changed since (then it now belongs to whoever changed it).
+   Either way it is no longer listed as ours. Returns TRUE when removed. */
+static BOOL remove_feature_override(size_t f, BOOL ours[GPU_CRASH_FEATURE_COUNT])
+{
+    wchar_t path[160];
+    DWORD state = 0, size = sizeof(state);
+    LSTATUS rc;
+    BOOL removed = FALSE, keep = FALSE;
+
+    swprintf_s(path, ARRAYSIZE(path), L"%s\\%s", FEATURE_OVERRIDES_KEY, GPU_CRASH_FEATURES[f].key);
+    rc = RegGetValueW(HKEY_LOCAL_MACHINE, path, L"EnabledState", RRF_RT_REG_DWORD, NULL, &state, &size);
+    if (rc == ERROR_SUCCESS && state == 1) {
+        LSTATUS del = RegDeleteKeyW(HKEY_LOCAL_MACHINE, path);
+        removed = del == ERROR_SUCCESS;
+        keep = !removed;    /* still ours: try again next time */
+        if (!removed)
+            agent_log("GPU crash workaround: cannot remove the override for feature %lu (error %ld).",
+                      GPU_CRASH_FEATURES[f].feature, (long)del);
+    } else if (rc == ERROR_SUCCESS) {
+        agent_log("GPU crash workaround: the override for feature %lu was changed (state %lu); "
+                  "leaving it as it is.", GPU_CRASH_FEATURES[f].feature, state);
+    }
+    if (!keep) {
+        ours[f] = FALSE;
+        write_overrides_set(ours);
+    }
+    return removed;
+}
+
+/* Applies or reverts the workaround (see above) and logs the decision when
+   it differs from the last one. gpu_shares: the host sent GPU shares. */
+static void gpu_crash_workaround(BOOL gpu_shares)
+{
+    static char last_decision[200];
+    char decision[200];
+    BOOL ours[GPU_CRASH_FEATURE_COUNT];
+    DWORD build = 0, ubr = 0, tweaks = 1, size = sizeof(tweaks);
+    BOOL have_build, affected, fixed, gpu, any_ours = FALSE;
+    int applied = 0, removed = 0, foreign = 0;
+    size_t f;
+
+    read_overrides_set(ours);
+    for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++) any_ours |= ours[f];
+    if (RegGetValueW(HKEY_LOCAL_MACHINE, AGENT_REG_KEY, L"GpuStabilityTweaks", RRF_RT_REG_DWORD,
+                     NULL, &tweaks, &size) != ERROR_SUCCESS)
+        tweaks = 1;
+    have_build = windows_build(&build, &ubr);
+    fixed = gpu_crash_build_status(build, ubr) == 2;
+    affected = gpu_crash_build_status(build, ubr) == 1;
+    gpu = gpu_shares || gpu_pv_adapter_present();
+
+    if (tweaks == 0 || (have_build && !affected)) {
+        for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++)
+            if (ours[f] && remove_feature_override(f, ours)) removed++;
+        _snprintf_s(decision, sizeof(decision), _TRUNCATE, "%s%s",
+                    tweaks == 0 ? "turned off (GpuStabilityTweaks=0)"
+                                : fixed ? "not needed (this build has the fix)"
+                                        : "not needed (this build is not affected)",
+                    any_ours ? "; removing the overrides it set" : "");
+    } else if (!have_build) {
+        _snprintf_s(decision, sizeof(decision), _TRUNCATE, "Windows build unknown, nothing changed");
+    } else if (!gpu) {
+        _snprintf_s(decision, sizeof(decision), _TRUNCATE,
+                    "affected build, but no GPU-PV adapter; nothing changed");
+    } else {
+        for (f = 0; f < GPU_CRASH_FEATURE_COUNT; f++) {
+            int rc = create_feature_override(f, ours);
+            if (rc > 0) applied++;
+            else if (rc == 0 && !ours[f]) foreign++;
+        }
+        _snprintf_s(decision, sizeof(decision), _TRUNCATE,
+                    "affected build with GPU-PV: feature overrides %s%s",
+                    applied ? "set now (take effect after the next restart)" : "in place",
+                    foreign ? "; an override set by someone else was left alone" : "");
+    }
+
+    if (strcmp(decision, last_decision) != 0 || applied || removed) {
+        agent_log("GPU crash workaround: Windows build %lu.%lu - %s.", build, ubr, decision);
+        strcpy_s(last_decision, sizeof(last_decision), decision);
+    }
+    if (applied)
+        device_note("GPU crash workaround applied: Windows %lu.%lu in this VM has a known bug that can "
+                    "crash and restart it when apps use the GPU (Edge, Discord, Steam, games). The "
+                    "workaround takes effect after the VM restarts; installing the latest Windows update "
+                    "in the VM also fixes it.", build, ubr);
+    if (removed)
+        agent_log("GPU crash workaround: %d override(s) removed; the change takes effect after the "
+                  "next restart.", removed);
+}
+
 /* ---- Device checks (VDD, Hyper-V Video, idd_status) ----
  * devcon waits for PnP and can take many seconds while PnP is busy (boot,
  * driver installs). The checks therefore run on their own thread and never
- * on the connection thread, which must keep answering host commands: the
- * host drops the connection when a reply takes longer than its 5 s receive
- * timeout. All devcon use is serialized on this thread, including the staged
- * display-driver update at service start. */
+ * on the connection thread, which must keep answering host commands: current
+ * hosts drop the connection when a tagged reply takes longer than 60 s (older
+ * hosts after 5 s without any line). All devcon use is serialized on this
+ * thread, including the staged display-driver update at service start. */
 #define DEVICE_CHECK_INTERVAL_MS 20000
 
 static HANDLE        g_device_check_wake;       /* auto-reset: run a check now */
 static volatile LONG g_device_check_connect;    /* a host connected: full check, forced idd_status */
 static volatile LONG g_device_check_logoff;     /* a user logged off: Hyper-V Video check only */
+static volatile LONG g_device_check_gpu;        /* the host sent GPU shares: GPU crash workaround */
 
 static void request_device_check(volatile LONG *reason)
 {
     InterlockedExchange(reason, 1);
     if (g_device_check_wake) SetEvent(g_device_check_wake);
+}
+
+/* The host sent GPU shares: the VM has a GPU (gpu_crash_workaround). */
+static void gpu_shares_received(void)
+{
+    request_device_check(&g_device_check_gpu);
 }
 
 /* param != NULL: also run the service-start tasks first. */
@@ -2456,12 +3137,15 @@ static DWORD WINAPI device_check_thread(LPVOID param)
     DWORD count = 1;
 
     if (param) {
+        /* Before the display-driver update, which may restart Windows. */
+        gpu_crash_workaround(FALSE);
+
         /* A newer display driver staged by the host while the VM was off. */
         apply_pending_vdd_update();
         ensure_vigem_installed();
 
         /* Ensure VDD device is running (may need restart after logout teardown) */
-        ensure_vdd_running();
+        check_vdd(FALSE);
 
         /* Ensure Hyper-V Video adapter is disabled (VDD replaces it) */
         ensure_hyperv_video_disabled(FALSE);
@@ -2475,18 +3159,18 @@ static DWORD WINAPI device_check_thread(LPVOID param)
         if (w != WAIT_TIMEOUT && w != WAIT_OBJECT_0 + 1) break;   /* stop, or the wait failed */
 
         if (InterlockedExchange(&g_device_check_connect, 0)) {
-            /* New connection: the host resets idd_ready and waits for a status. */
-            report_idd_status(1);
-            if (g_vdd_update_note[0] && agent_log_to_host("%s", g_vdd_update_note) > 0)
-                g_vdd_update_note[0] = '\0';
-            ensure_vdd_running();
+            /* New connection: the host resets idd_ready and waits for a status
+               (check_vdd sends it first, then the pending notes). */
+            check_vdd(TRUE);
             ensure_hyperv_video_disabled(TRUE);
         } else if (w == WAIT_TIMEOUT && host_connected()) {
             /* Periodic check while a host is connected (VDD recovery is expensive) */
-            ensure_vdd_running();
+            check_vdd(FALSE);
             ensure_hyperv_video_disabled(TRUE);
-            report_idd_status(0);   /* re-report the (possibly self-healed) VDD state; on-change only */
         }
+
+        if (InterlockedExchange(&g_device_check_gpu, 0))
+            gpu_crash_workaround(TRUE);
 
         if (InterlockedExchange(&g_device_check_logoff, 0)) {
             /* Disable Hyper-V Video after logoff (may have been re-enabled).
@@ -2523,6 +3207,19 @@ static void handle_client(AsbConn *client)
     }
 
     report_previous_session(client);
+
+    /* The host clears its display readiness on every connection and opens no
+       display until it gets idd_status. Send the device-check thread's last
+       reading now: that thread may be busy for minutes (a staged driver
+       update, a repair) before it gets to the live, forced status below. */
+    {
+        const char *cached = recent_idd_status();
+        if (cached) {
+            char line[32];
+            sprintf_s(line, sizeof(line), "idd_status:%s", cached);
+            send_line(client, line);
+        }
+    }
 
     /* The device-check thread reports the IDD driver status (forced, so a
        reconnect re-syncs), any display-driver update result, and runs the
@@ -3197,8 +3894,9 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
     g_status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
     set_service_status(SERVICE_START_PENDING, 0);
 
-    /* Wire p9copy logging into agent_log */
-    p9_set_log(p9copy_log);
+    /* p9copy and the GPU runtime setup log through agent_log */
+    p9_set_log(agent_log);
+    gl_vk_set_log(agent_log);
 
     /* Note how the previous Windows session ended (before any host connects) */
     check_previous_session();
@@ -3262,16 +3960,10 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
         agent_log(device_thread_done ? "Device-check thread exited."
                                      : "Device-check thread still busy (devcon); leaving it to process exit.");
     }
-    CloseHandle(g_stop_event);
-    DeleteCriticalSection(&g_clip_proc_cs);
-    DeleteCriticalSection(&g_input_proc_cs);
-    /* A device check still inside devcon may yet send to the host: keep its
-       lock and wake event alive until the process exits. */
-    if (device_thread_done) {
-        if (g_device_check_wake) CloseHandle(g_device_check_wake);
-        g_device_check_wake = NULL;
-        DeleteCriticalSection(&g_send_cs);
-    }
+    /* The locks and events stay alive: threads that are still finishing (GPU
+       copy, a device check inside devcon, ViGEm setup, a connection thread
+       waiting for the GPU copy) may still use them, and the process exits
+       right after SERVICE_STOPPED. */
 
     agent_log("Service stopped.");
     set_service_status(SERVICE_STOPPED, 0);
@@ -3396,7 +4088,8 @@ int main(int argc, char *argv[])
             /* Not running as service — run listener directly for debugging */
             HANDLE device_thread;
             printf("Running in console mode (Ctrl+C to stop)...\n");
-            p9_set_log(p9copy_log);
+            p9_set_log(agent_log);
+            gl_vk_set_log(agent_log);
             InitializeCriticalSection(&g_send_cs);
             InitializeCriticalSection(&g_clip_proc_cs);
             InitializeCriticalSection(&g_input_proc_cs);
@@ -3410,11 +4103,8 @@ int main(int argc, char *argv[])
                 WaitForSingleObject(device_thread, INFINITE);
                 CloseHandle(device_thread);
             }
-            if (g_device_check_wake) CloseHandle(g_device_check_wake);
-            CloseHandle(g_stop_event);
-            DeleteCriticalSection(&g_input_proc_cs);
-            DeleteCriticalSection(&g_clip_proc_cs);
-            DeleteCriticalSection(&g_send_cs);
+            /* Locks and events stay alive until the process exits (see
+               service_main). */
         }
     }
     return 0;

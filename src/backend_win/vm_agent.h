@@ -37,7 +37,10 @@ ASB_API void vm_agent_set_hwnd(HWND hwnd);
    timeout_ms for the agent's tagged reply and returns TRUE on "ok"; timeout_ms == 0
    is fire-and-forget -- the command is queued for the connection thread and TRUE is
    returned without waiting for any reply (shutdown/restart, which ride the guest
-   powering off and have no reliable synchronous reply). Thread-safe. */
+   powering off and have no reliable synchronous reply); if the connection drops
+   before it is sent, it is sent after the agent reconnects. One command is queued
+   per VM: a newer one replaces a queued one that was not sent yet, whose waiting
+   caller then gets FALSE. Thread-safe. */
 ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
                            char *response, int response_max, DWORD timeout_ms);
 

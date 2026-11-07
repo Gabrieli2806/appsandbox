@@ -3,6 +3,10 @@
 
 #include <windows.h>
 
+/* Logging callback (the agent's agent_log); without one nothing is logged. */
+typedef void (*GlVkLogFn)(const char *fmt, ...);
+void gl_vk_set_log(GlVkLogFn fn);
+
 BOOL gpu_prefers_system_opengl(void);
 BOOL gl_vk_provision_runtime(const wchar_t *dir, const wchar_t *native_dir,
                              const wchar_t *sys, BOOL *native_runtime);
