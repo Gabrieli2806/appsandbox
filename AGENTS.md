@@ -286,3 +286,46 @@ Drop files from the host onto the VM window; they are copied into an
 - Test builds: push to `release/test` (fork) → CI publishes `test-build-N`.
 - When unsure whether a change reaches existing VMs, assume it does not and
   check rule 3.
+
+## 12. Current state (handoff)
+
+Read this first when continuing the work on another machine or with another
+agent. Keep it short and current.
+
+- **Branches** (fork `Toroluis34/appsandbox`): work on
+  `feature/performance-mode`; `release/test` is fast-forwarded to it and CI
+  ("Windows test build") publishes `test-build-N` (zip + MSIX). Also on
+  push: `ci.yml` (x64 + ARM64 build, web syntax, `tools/check-sources.py`)
+  and CodeQL. Upstream is `jamesstringer90/appsandbox` (`main`).
+- **Local checks without Windows**: mingw syntax check, e.g.
+  `x86_64-w64-mingw32-gcc -fsyntax-only -DUNICODE -D_UNICODE -DWINVER=0x0A00
+  -D_WIN32_WINNT=0x0A00 -Isrc -Isrc/core -Isrc/app_win -Isrc/backend_win
+  -Ivendor/webview2 <file.c>` (missing WDK/imapi/DNS headers are expected
+  errors); `node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"`.
+  MSVC is only in CI; the owner tests on real hardware.
+- **Done recently** (test-build-27 to 29): adaptive-resize look (rounded
+  picture, shadow, dimmed blur); viewer teardown/use-after-free and
+  GPU-reset recovery; Settings → Folders and logs, About; exit confirmation
+  with running VMs; worker-thread VM ops; WebView2 lockdown and
+  ProcessFailed handling; core fixes (export/import, ISO auto-detach,
+  snapshots, data/VM-folder ACLs, private-namespace instance lock);
+  clipboard hardening; Store packaging + `docs/RELEASE_CHECKLIST.md`;
+  guest agent: Windows GPU-PV 0x3B crash workaround (feature overrides),
+  bugcheck reports, log rotation, VDD HIGH GPU priority; D3D12 reads decoded
+  frames in place.
+- **Open / to verify**:
+  - WebView2 `0x800700AA` at app start after build 27 (data folder ACL
+    hardening is the suspect). Build 29 moved the user data folder to
+    `%LOCALAPPDATA%\AppSandbox\WebView2` with fallbacks; confirm with the
+    owner's `appsandbox.log` ("WebView2: user data folder ...").
+  - D3DMappingLayers signature/digest check (`d3dlayers.c`) is unverified
+    against a real download; if guests lose GL/Vulkan, relax it.
+  - Not done: shortcuts by VM id (`--vm-id`), Start-menu shortcuts under
+    MSIX (`FOLDERID_CommonPrograms` when packaged), theme following Windows
+    by default, x64-on-ARM64 start-up check, per-OS RAM minimum, cancel for
+    long operations, Ubuntu apt InRelease verification (`tools/iso-patch`).
+- **Owner decisions** (see `docs/RELEASE_CHECKLIST.md`): product name and
+  branding (upstream's "App Sandbox"), code-signing certificate, driver
+  attestation signing (guests still need test signing), privacy policy,
+  bundling ViGEmBus.
+

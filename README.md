@@ -19,6 +19,10 @@ Windows features:
 - **Performance mode** (default): the VM's GPU encodes the screen as H.264 or HEVC (NVENC on NVIDIA, Media Foundation otherwise) and the viewer decodes it on your GPU, like Moonlight — smooth at high resolutions and frame rates. **Quality mode** sends exact, uncompressed pixels. Codec and bit rate are per VM.
 - **Game controllers**: Xbox (XInput) controllers on the host appear in the guest as Xbox 360 controllers (needs ViGEmBus in the guest)
 - Floating toolbar, FPS/resolution in the title bar (both optional), borderless fullscreen
+- Direct3D 11 or Direct3D 12 renderer for the VM window (Settings → VM windows)
+- Custom icon per VM; **manual install** of any OS from its ISO ("Other")
+- Settings → **Folders and logs** (open the VM, data, log and app folders; copy diagnostic info) and **About**
+- Stability: the guest agent works around the Windows GPU-PV crash (bugcheck 0x3B with Edge/Discord/Steam) and reports guest crashes to the host log; the viewer recovers from GPU driver resets (see Troubleshooting)
 - Desktop and Start-menu shortcuts that start a VM straight into its window
 - Import/export of VMs; one-click (or automatic) update of the guest components
 - Host to client hot-key support
