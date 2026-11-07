@@ -26,6 +26,15 @@ struct SharedTex {
     UINT             w, h, mips;
 };
 
+/* A D3D11 texture that is itself shareable (the video decoder's output),
+   opened in D3D12 and read in place: no per-frame copy. */
+#define DIRECT_SLOTS 4
+struct DirectTex {
+    ID3D11Texture2D *tex11;     /* referenced while cached */
+    ID3D12Resource  *res12;
+    UINT64           last_used;
+};
+
 struct Dx12Presenter {
     Dx12LogFn                 log;
     void                     *log_user;
@@ -61,6 +70,10 @@ struct Dx12Presenter {
     ID3D12PipelineState      *pso_blend;
 
     SharedTex                 pic, bg;
+    DirectTex                 direct[DIRECT_SLOTS];
+    UINT64                    frame_no;
+    UINT64                    frame_fence;          /* fence value of the last submitted frame */
+    BOOL                      direct_failed;        /* opening in place failed once: always copy */
     BOOL                      present_err_logged;   /* log a failing Present once */
 };
 
@@ -83,6 +96,102 @@ static void wait_idle(Dx12Presenter *p)
         p->fence->SetEventOnCompletion(v, p->fence_event);
         WaitForSingleObject(p->fence_event, 2000);
     }
+}
+
+/* BGRA texture view in shader-visible heap slot `slot` (t0 picture,
+   t1 backdrop). Only written while the GPU is not using the heap. */
+static void write_srv(Dx12Presenter *p, ID3D12Resource *res, UINT mips, UINT slot)
+{
+    D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
+    v.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+    v.Texture2D.MipLevels = mips;
+    D3D12_CPU_DESCRIPTOR_HANDLE dst = p->srv_heap->GetCPUDescriptorHandleForHeapStart();
+    dst.ptr += (SIZE_T)slot * p->srv_inc;
+    p->dev->CreateShaderResourceView(res, &v, dst);
+}
+
+/* Wait until the GPU finished the last submitted frame (normally it has:
+   the wait happens one frame later than the submit). */
+static void wait_last_frame(Dx12Presenter *p)
+{
+    if (!p->fence || !p->frame_fence) return;
+    if (p->fence->GetCompletedValue() < p->frame_fence) {
+        p->fence->SetEventOnCompletion(p->frame_fence, p->fence_event);
+        WaitForSingleObject(p->fence_event, 2000);
+    }
+}
+
+static void release_direct(Dx12Presenter *p)
+{
+    for (UINT i = 0; i < DIRECT_SLOTS; i++) {
+        SAFE_RELEASE(p->direct[i].res12);
+        SAFE_RELEASE(p->direct[i].tex11);
+        p->direct[i].last_used = 0;
+    }
+}
+
+/* The D3D12 view of a shareable D3D11 texture, opened once and cached;
+   NULL when `tex` is not shareable or opening it failed. The caller has
+   waited for the last frame, so an evicted entry is no longer in use. */
+static ID3D12Resource *direct_resource(Dx12Presenter *p, ID3D11Texture2D *tex)
+{
+    D3D11_TEXTURE2D_DESC sd;
+    if (p->direct_failed) return nullptr;
+    tex->GetDesc(&sd);
+    if (!(sd.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE) || sd.MipLevels != 1 ||
+        sd.Format != DXGI_FORMAT_B8G8R8A8_UNORM)
+        return nullptr;
+
+    UINT victim = 0;
+    for (UINT i = 0; i < DIRECT_SLOTS; i++) {
+        if (p->direct[i].tex11 == tex) {
+            p->direct[i].last_used = p->frame_no;
+            return p->direct[i].res12;
+        }
+        if (p->direct[i].last_used < p->direct[victim].last_used) victim = i;
+    }
+
+    DirectTex *d = &p->direct[victim];
+    SAFE_RELEASE(d->res12);
+    SAFE_RELEASE(d->tex11);
+    IDXGIResource1 *r1 = nullptr;
+    HANDLE h = nullptr;
+    HRESULT hr = tex->QueryInterface(__uuidof(IDXGIResource1), (void **)&r1);
+    if (SUCCEEDED(hr)) hr = r1->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ, nullptr, &h);
+    SAFE_RELEASE(r1);
+    if (SUCCEEDED(hr)) {
+        hr = p->dev->OpenSharedHandle(h, __uuidof(ID3D12Resource), (void **)&d->res12);
+        CloseHandle(h);
+    }
+    if (FAILED(hr)) {
+        plog(p, L"D3D12: reading the decoder output in place failed (0x%08X); copying frames instead", hr);
+        p->direct_failed = TRUE;
+        return nullptr;
+    }
+    tex->AddRef();
+    d->tex11 = tex;
+    d->last_used = p->frame_no;
+    return d->res12;
+}
+
+/* Bind a D3D11 SRV's texture in place as heap slot `slot`; FALSE when it
+   has to be copied instead. */
+static BOOL bind_direct(Dx12Presenter *p, ID3D11ShaderResourceView *srv, UINT slot)
+{
+    ID3D11Resource *res = nullptr;
+    ID3D11Texture2D *tex = nullptr;
+    ID3D12Resource *r12 = nullptr;
+    srv->GetResource(&res);
+    if (res && SUCCEEDED(res->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&tex)))
+        r12 = direct_resource(p, tex);
+    SAFE_RELEASE(tex);
+    SAFE_RELEASE(res);
+    if (!r12) return FALSE;
+
+    write_srv(p, r12, 1, slot);
+    return TRUE;
 }
 
 static ID3DBlob *compile(Dx12Presenter *p, const char *src, const char *target)
@@ -127,8 +236,11 @@ static BOOL ensure_shared(Dx12Presenter *p, SharedTex *t, ID3D11Texture2D *src, 
 {
     D3D11_TEXTURE2D_DESC sd;
     src->GetDesc(&sd);
-    if (t->tex11 && t->w == sd.Width && t->h == sd.Height && t->mips == sd.MipLevels)
+    if (t->tex11 && t->w == sd.Width && t->h == sd.Height && t->mips == sd.MipLevels) {
+        /* The slot may have held an in-place texture last frame. */
+        write_srv(p, t->res12, t->mips, slot);
         return TRUE;
+    }
 
     wait_idle(p);                  /* the GPU may still read the old one */
     release_shared(t);
@@ -158,14 +270,7 @@ static BOOL ensure_shared(Dx12Presenter *p, SharedTex *t, ID3D11Texture2D *src, 
     }
     if (FAILED(hr)) { plog(p, L"D3D12: sharing a texture failed (0x%08X)", hr); release_shared(t); return FALSE; }
 
-    D3D12_SHADER_RESOURCE_VIEW_DESC v = {};
-    v.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-    v.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
-    v.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
-    v.Texture2D.MipLevels = sd.MipLevels;
-    D3D12_CPU_DESCRIPTOR_HANDLE dst = p->srv_heap->GetCPUDescriptorHandleForHeapStart();
-    dst.ptr += (SIZE_T)slot * p->srv_inc;
-    p->dev->CreateShaderResourceView(t->res12, &v, dst);
+    write_srv(p, t->res12, sd.MipLevels, slot);
 
     t->w = sd.Width;
     t->h = sd.Height;
@@ -402,9 +507,17 @@ extern "C" BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
     if (!p || !p->swap || !pic) return FALSE;
     if (blend && (!p->pso_blend || !bg)) blend = FALSE;
 
-    /* D3D11 side: copy the picture (and backdrop) into the shared textures,
-       then signal the shared fence. */
-    if (!copy_in(p, &p->pic, pic, 0)) return FALSE;
+    /* The previous frame must be done before its allocator, descriptors and
+       shared textures are reused. Waiting here instead of right after its
+       Present lets the caller receive and decode the next frame while the
+       GPU draws. */
+    wait_last_frame(p);
+    p->frame_no++;
+
+    /* D3D11 side: the decoder's output is read in place; other pictures
+       (and the backdrop) are copied into the shared textures. Then signal
+       the shared fence. */
+    if (!bind_direct(p, pic, 0) && !copy_in(p, &p->pic, pic, 0)) return FALSE;
     if (blend && !copy_in(p, &p->bg, bg, 1)) blend = FALSE;
     UINT64 copied = ++p->copy_value;
     p->ctx11_4->Signal(p->fence11, copied);
@@ -463,7 +576,8 @@ extern "C" BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
     ID3D12CommandList *lists[] = { p->list };
     p->queue->ExecuteCommandLists(1, lists);
     HRESULT hr = p->swap->Present(0, 0);
-    wait_idle(p);                                      /* one frame in flight; allocator reuse */
+    if (SUCCEEDED(p->queue->Signal(p->fence, ++p->fence_value)))   /* waited on next frame */
+        p->frame_fence = p->fence_value;
     if (FAILED(hr)) {
         /* Once until a frame gets through again (it repeats every frame);
            a lost device is reported by dx12_device_removed_reason. */
@@ -475,6 +589,11 @@ extern "C" BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
     }
     p->present_err_logged = FALSE;
     return TRUE;
+}
+
+extern "C" void dx12_frame_begin(Dx12Presenter *p)
+{
+    if (p) wait_last_frame(p);
 }
 
 extern "C" HRESULT dx12_device_removed_reason(Dx12Presenter *p)
@@ -493,6 +612,7 @@ extern "C" void dx12_destroy(Dx12Presenter *p)
     wait_idle(p);
     release_shared(&p->pic);
     release_shared(&p->bg);
+    release_direct(p);
     SAFE_RELEASE(p->pso_blend);
     SAFE_RELEASE(p->pso_plain);
     SAFE_RELEASE(p->root);

@@ -118,6 +118,9 @@ typedef struct {
 
 /* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */
+/* The thread that pumps the app's window messages: HCS waits on it poll
+   and pump instead of blocking. Call before hcs_init (asb_set_ui_thread). */
+void hcs_set_ui_thread(DWORD thread_id);
 BOOL hcs_init(void);
 
 /* Clean up HCS module. */

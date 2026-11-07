@@ -3311,6 +3311,11 @@ ASB_API void asb_set_vm_removed_callback(AsbVmRemovedCallback cb, void *user_dat
 
 /* ---- Init / Cleanup ---- */
 
+ASB_API void asb_set_ui_thread(DWORD thread_id)
+{
+    hcs_set_ui_thread(thread_id);
+}
+
 ASB_API HRESULT asb_init(void)
 {
     if (g_initialized) return S_OK;

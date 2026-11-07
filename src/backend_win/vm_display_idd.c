@@ -3168,6 +3168,9 @@ static BOOL idd_decode_video(VmDisplayIdd *d)
     }
     LeaveCriticalSection(&d->frame_cs);
     if (!work || !len) return FALSE;
+    /* Direct3D 12 reads the decoder's output in place; the frame it is
+       still drawing must be done before the decoder may write again. */
+    if (d->dx12) dx12_frame_begin(d->dx12);
 
     while (off + sizeof(VideoQEntry) <= len) {
         VideoQEntry e;

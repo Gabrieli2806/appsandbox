@@ -112,19 +112,30 @@ See the [QEMU build notes](vendor/qemu-ivshmem/README.md) for the pinned source 
 rebuild instructions.
 
 # Tips:
-The default username is `user` and the default password is `test123`
+Windows VMs: you choose the username and password when you create the VM (the username defaults to `user`; there is no default password).
 
 [Windows] Display options: the VM's **Display** tab, or right-click the VM window's title bar → Display (resolution, refresh rate, Quality/Performance mode, codec). In Performance mode the title shows `GPU H.264` or `GPU HEVC`; HEVC needs "HEVC Video Extensions" from the Microsoft Store on the host.
 
 [Windows] Game controllers: install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) once inside the Windows VM; controllers are sent while the VM window has focus.
 
-[Windows] Logs: the Activity panel / `appsandbox.log` on the host; inside a Windows guest `C:\Windows\AppSandbox\agent.log` and `C:\ProgramData\AppSandboxVDD.log` (display driver, encoder).
+[Windows] Logs: the Activity panel / `%ProgramData%\AppSandbox\appsandbox.log` on the host (Settings → Folders and logs opens it); inside a Windows guest `C:\Windows\AppSandbox\agent.log` and `C:\ProgramData\AppSandboxVDD.log` (display driver, encoder).
 
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
 
 [Windows] Need a high performance remote desktop to remotely access your VM? [Phaze](https://phaze.app) works well  
 
 [Windows] You can check if the GPU-PV driver setup is working by running gpu-test.exe inside your App Sandbox Windows VM, gpu-test.exe will show a box with 6 rotating cubes, each using a different rendering engine (D3D9, D3D10, D3D11, D3D12, OpenGL and Vulkan).  If one or more fail, they will not correctly show a rotating cube for that rendering API.  [gpu-test.zip](https://github.com/jamesstringer90/appsandbox/releases/download/v0.1.2/gpu-test.zip). Note: The rendering API succeeding means that the GPU-PV worked, but sometimes games or apps are coded in such a way that they will not detect the GPU-PV system correctly and still show an error.
+
+## Troubleshooting
+
+**The Windows VM crashes and restarts when Edge, Discord, Steam or some games start (GPU-PV).**
+This is a bug in Windows itself (cumulative updates from September/October 2026, builds 26100/26200/26300 with UBR 9550 or later). An app that looks for a hardware video encoder (Chromium/Edge/Discord/Steam, Game DVR, Task Manager, dxdiag) makes the guest's `dxgkrnl` crash with bugcheck **0x3B** (SYSTEM_SERVICE_EXCEPTION).
+- Fix: install **KB5127936** or the **November 10 2026** (or later) cumulative update **inside the VM** (and on the host). Windows 11 24H2 (26100) Home/Pro no longer gets the fix: upgrade the VM to 25H2.
+- Until then the App Sandbox guest agent applies Microsoft's feature-flag workaround on affected builds automatically; it takes effect after the VM's **next restart**, and the Activity log says when it was applied. It removes itself once the VM has the fixed update. To turn it off: `HKLM\SOFTWARE\AppSandbox\Agent` → `GpuStabilityTweaks` (DWORD) = `0` in the VM.
+- How to confirm: host Event Viewer → Hyper-V-Worker-Admin, event **18590** with error code `0x3B`; in the VM, System log event **1001** (BugCheck) with `0x0000003b (0x00000000c0000005, …)`. After a crash the agent also writes the bugcheck code to the Activity log.
+- NVIDIA hosts with driver **621.01** and an RTX 50 card: update to **621.14** or later (621.01 can freeze video playback and reset the GPU).
+
+**The VM display freezes or the GPU resets under heavy load.** The display driver now runs the video encoder at HIGH GPU priority (Sunshine's recommendation for NVIDIA). `HKLM\SOFTWARE\AppSandbox\VDD` → `RealtimeGpuPriority` = `1` in the VM restores the old REALTIME priority.
 
 ## Building from source
 

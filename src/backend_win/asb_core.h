@@ -115,6 +115,11 @@ ASB_API void asb_log_write_line(const wchar_t *line);
    Loads HCS/HCN DLLs, enumerates GPUs, loads VM list from vms.cfg, scans templates. */
 ASB_API HRESULT asb_init(void);
 
+/* Names the thread that runs the app's message loop, so long HCS calls made
+   on it keep the window responsive. Call before asb_init when asb_init runs
+   on another thread. */
+ASB_API void asb_set_ui_thread(DWORD thread_id);
+
 /* Shut down all running VMs and free resources. */
 ASB_API void asb_cleanup(void);
 

@@ -448,13 +448,11 @@ static const wchar_t *app_version(void)
     return version;
 }
 
-/* appsandbox.log is written relative to the current directory (the exe's
-   folder for a zip install, %ProgramData%\AppSandbox for the Microsoft Store
-   version; see main.c). */
+/* The core writes appsandbox.log by absolute path:
+   %ProgramData%\AppSandbox\appsandbox.log for every install (asb_paths.h). */
 static void log_file_path(wchar_t *out, size_t cap)
 {
-    DWORD n = GetFullPathNameW(L"appsandbox.log", (DWORD)cap, out, NULL);
-    if (!n || n >= cap) out[0] = 0;
+    asb_log_path(out, cap);
 }
 
 static void app_directory(wchar_t *out, size_t cap)
@@ -2950,14 +2948,30 @@ static void handle_webview2_message(const wchar_t *json)
                         L"-o StrictHostKeyChecking=no -o \"UserKnownHostsFile=%sappsandbox_known_hosts\" ",
                         base, tmp);
                 }
-                if (inst->admin_user[0])
-                    _snwprintf_s(cmd, 1024, _TRUNCATE,
-                        L"cmd.exe /v:off /k ssh %s-p %lu -l \"%s\" localhost",
-                        keyopt, inst->ssh_port, inst->admin_user);
-                else
-                    _snwprintf_s(cmd, 1024, _TRUNCATE,
-                        L"cmd.exe /k ssh %s-p %lu localhost",
-                        keyopt, inst->ssh_port);
+                {
+                    /* Both programs by full path: this process is elevated,
+                       so nothing may be picked up from the current directory
+                       or a user-writable PATH entry. The Windows OpenSSH
+                       client is used when installed; otherwise "ssh" from
+                       PATH, as before. */
+                    wchar_t sys[MAX_PATH], ssh[MAX_PATH + 32];
+                    UINT sn = GetSystemDirectoryW(sys, MAX_PATH);
+                    if (!sn || sn >= MAX_PATH) wcscpy_s(sys, MAX_PATH, L"C:\\Windows\\System32");
+                    swprintf_s(ssh, ARRAYSIZE(ssh), L"%s\\OpenSSH\\ssh.exe", sys);
+                    if (GetFileAttributesW(ssh) == INVALID_FILE_ATTRIBUTES)
+                        wcscpy_s(ssh, ARRAYSIZE(ssh), L"ssh");
+                    else
+                        swprintf_s(ssh, ARRAYSIZE(ssh), L"\"%s\\OpenSSH\\ssh.exe\"", sys);
+                    /* /s: cmd strips exactly the outer quotes of the command. */
+                    if (inst->admin_user[0])
+                        _snwprintf_s(cmd, 1024, _TRUNCATE,
+                            L"\"%s\\cmd.exe\" /v:off /s /k \"%s %s-p %lu -l \"%s\" localhost\"",
+                            sys, ssh, keyopt, inst->ssh_port, inst->admin_user);
+                    else
+                        _snwprintf_s(cmd, 1024, _TRUNCATE,
+                            L"\"%s\\cmd.exe\" /s /k \"%s %s-p %lu localhost\"",
+                            sys, ssh, keyopt, inst->ssh_port);
+                }
                 ui_log(L"SSH: %s", cmd);
                 if (CreateProcessW(NULL, cmd, NULL, NULL, FALSE,
                                     CREATE_NEW_CONSOLE, NULL, NULL, &si_, &pi_)) {
@@ -3506,6 +3520,7 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
     BOOL dark = TRUE;
 
     g_ui_thread_id = GetCurrentThreadId();
+    asb_set_ui_thread(g_ui_thread_id);   /* the core starts on a worker thread */
     g_hInstance = hInstance;
     g_is_home_edition = detect_home_edition();
     asb_set_hinstance(hInstance);

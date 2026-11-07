@@ -147,6 +147,26 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
 - Controllers in the guest need **ViGEmBus**; the agent installs it if
   `drivers\ViGEmBus_setup.exe` ships with the guest components (not bundled
   by CI yet — third-party binary, needs an explicit decision).
+- Renderers: D3D11 swap chain, or `vm_display_d3d12.cpp` (Settings → VM
+  windows → Renderer). D3D12 reads the decoder's output textures in place
+  (they are created shareable) and copies only raw frames and the backdrop;
+  it waits for the previous frame at the start of the next one
+  (`dx12_frame_begin` before decoding), not after `Present`.
+- Adaptive backdrop: `g_ps_blur_hlsl` (dimmed, desaturated blurred cover +
+  rounded picture with shadow and outline); the 16-float constant layout is
+  documented above the shader and filled by `d3d_blend_consts` for both
+  renderers. A lost device (TDR, driver update) rebuilds the renderer.
+- Guest stability switches (in the guest, DWORD):
+  `HKLM\SOFTWARE\AppSandbox\Agent\GpuStabilityTweaks=0` turns off and
+  reverts the agent's feature-flag workaround for the Windows GPU-PV 0x3B
+  crash (`gpu_crash_workaround` in `tools/agent/agent.c`; only on builds
+  26100/26200/26300 with UBR ≥ 9550, removed again once UBR ≥ 9818);
+  `HKLM\SOFTWARE\AppSandbox\VDD\RealtimeGpuPriority=1` restores the VDD's
+  REALTIME process GPU priority (default HIGH). The agent reports the last
+  bugcheck (System log 1001 / Kernel-Power 41) to the host after a crash.
+- Logs: host `%ProgramData%\AppSandbox\appsandbox.log` (absolute path,
+  rotates at 10 MB); guest `C:\Windows\AppSandbox\agent.log` (rotates at
+  8 MB to `agent.old.log`).
 
 ## 6b. Manual-install VMs (os type "Other")
 
@@ -157,7 +177,9 @@ the Hyper-V basic console: `hcs_vm.c` adds `VideoMonitor.ConnectionOptions`
 (`\\.\pipe\<name>.BasicSession`, ACL = current user) and `ui.c`
 `do_connect_vm` routes these VMs to the RDP viewer (`vm_display.c`). Secure
 Boot is skipped. `install_complete` is TRUE from creation. The ISO stays
-attached until "Remove installer ISO" (`asb_vm_eject_iso`). Shutdown falls
+attached until "Remove installer ISO" (`asb_vm_eject_iso`). (Windows and
+Ubuntu VMs detach their installer ISO automatically once the agent reports
+the installation complete.) Shutdown falls
 back to `HcsShutDownComputeSystem`. Not yet: headless API create for
 "Other", import of "Other" exports, Secure Boot option.
 
@@ -169,6 +191,12 @@ State returns as JSON via `webview2_post`: `vmListChanged {vms, hostInfo}`,
 `hostInfo`, `fullState`, `log`, `alert`, …; per-VM fields are built in
 `build_vm_json`, host fields in `send_host_info`. Add the field in C, render
 it in `app.js`, style in `style.css`. Keep `.win-only` for Windows-host UI.
+Settings → Folders and logs / About use `openFolder`, `openVmFolder`,
+`copyVmPath`, `copyDiagnostics`, `openLink`, `showDocument`; long VM
+operations (force stop, delete, shut down) run on a worker thread and answer
+with `notice`/`createResult`/`exitProgress` messages. The core starts on a
+worker thread: the UI names its thread with `asb_set_ui_thread` first so
+HCS waits made on it keep pumping messages.
 
 ## 8. Headless API (agent-facing)
 

@@ -1735,20 +1735,29 @@ ASB_API void vm_clipboard_destroy(VmClipboard clip)
         if (old != INVALID_SOCKET) closesocket(old);
     }
 
-    if (clip->writer_thread) {
-        WaitForSingleObject(clip->writer_thread, 3000);
-        CloseHandle(clip->writer_thread);
-    }
-    if (clip->reader_thread) {
-        WaitForSingleObject(clip->reader_thread, 3000);
-        CloseHandle(clip->reader_thread);
-    }
-    /* The push worker waits on writer_cs while the writer thread streams a
-       file, so it is joined after the writer thread has released the lock. */
-    if (clip->push_event) SetEvent(clip->push_event);
-    if (clip->push_thread) {
-        WaitForSingleObject(clip->push_thread, 3000);
-        CloseHandle(clip->push_thread);
+    {
+        BOOL stuck = FALSE;
+        if (clip->writer_thread) {
+            if (WaitForSingleObject(clip->writer_thread, 3000) != WAIT_OBJECT_0) stuck = TRUE;
+            CloseHandle(clip->writer_thread);
+        }
+        if (clip->reader_thread) {
+            if (WaitForSingleObject(clip->reader_thread, 3000) != WAIT_OBJECT_0) stuck = TRUE;
+            CloseHandle(clip->reader_thread);
+        }
+        /* The push worker waits on writer_cs while the writer thread streams a
+           file, so it is joined after the writer thread has released the lock. */
+        if (clip->push_event) SetEvent(clip->push_event);
+        if (clip->push_thread) {
+            if (WaitForSingleObject(clip->push_thread, 3000) != WAIT_OBJECT_0) stuck = TRUE;
+            CloseHandle(clip->push_thread);
+        }
+        if (stuck) {
+            /* A thread that is still running would touch freed memory (and
+               the viewer's log callback): keep the state instead. */
+            OutputDebugStringW(L"vm_clipboard: a thread did not stop; its state is kept\n");
+            return;
+        }
     }
     if (clip->push_event) {
         CloseHandle(clip->push_event);

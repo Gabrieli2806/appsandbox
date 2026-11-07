@@ -396,6 +396,14 @@ foreach ($sub in @('examples', 'tests')) {
     $global:LASTEXITCODE = 0
 }
 
+# License and third-party notices beside AppSandbox.exe (Settings > About
+# shows them offline).
+foreach ($f in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
+    $fsrc = Join-Path $repo $f
+    if (-not (Test-Path $fsrc)) { throw "Missing $f in the repository root." }
+    Copy-Item $fsrc (Join-Path $stage $f) -Force
+}
+
 # Tripwire: the signed drivers come from the deposit (not the build) - fail loudly if any
 # expected artifact is missing rather than shipping a partial zip.
 $required = @(
@@ -404,7 +412,8 @@ $required = @(
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
     'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
     'drivers\devcon.exe', 'resources', 'web',
-    'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests'
+    'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests',
+    'LICENSE', 'THIRD-PARTY-NOTICES.md'
 )
 if ($Platform -eq 'x64') {
     $required += 'resources\nvidia\appsandbox-nvidia-vk-gl-shim.dll', 'resources\nvidia\appsandbox-nvidia-vk-gl-shim32.dll'

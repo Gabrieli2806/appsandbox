@@ -48,6 +48,11 @@ BOOL dx12_present(Dx12Presenter *p, ID3D11ShaderResourceView *pic,
    (driver update or reset, TDR). The viewer then rebuilds its renderer. */
 HRESULT dx12_device_removed_reason(Dx12Presenter *p);
 
+/* Waits until the GPU finished the last presented frame (normally at once).
+   Call before D3D11 writes into a texture that frame may still read in
+   place, such as the video decoder's output. */
+void dx12_frame_begin(Dx12Presenter *p);
+
 /* Adapter name, for the log/title. */
 const wchar_t *dx12_adapter_name(Dx12Presenter *p);
 

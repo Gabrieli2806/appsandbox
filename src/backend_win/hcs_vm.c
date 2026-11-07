@@ -677,9 +677,18 @@ static void cache_runtime_id(VmInstance *instance)
 
 /* ---- Public API ---- */
 
+void hcs_set_ui_thread(DWORD thread_id)
+{
+    g_ui_thread_id = thread_id;
+}
+
 BOOL hcs_init(void)
 {
-    g_ui_thread_id = GetCurrentThreadId();
+    /* The app starts the core on a worker thread, so it names its UI
+       thread with hcs_set_ui_thread first; callers that did not (headless
+       mode) keep the old rule: the thread that initialises HCS. */
+    if (!g_ui_thread_id)
+        g_ui_thread_id = GetCurrentThreadId();
 
     g_hcs_dll = LoadLibraryExW(L"computecore.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!g_hcs_dll)

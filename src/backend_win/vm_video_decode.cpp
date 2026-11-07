@@ -118,8 +118,16 @@ static HRESULT ensure_output_textures(VmVideoDecoder *d)
     td.SampleDesc.Count = 1;
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    /* Shareable (NT handle), so the Direct3D 12 presenter can read the
+       picture in place instead of copying every frame. Plain textures if a
+       driver refuses that. */
+    td.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
     for (int i = 0; i < 2; i++) {
         HRESULT hr = d->device->CreateTexture2D(&td, nullptr, &d->out_tex[i]);
+        if (FAILED(hr) && td.MiscFlags) {
+            td.MiscFlags = 0;
+            hr = d->device->CreateTexture2D(&td, nullptr, &d->out_tex[i]);
+        }
         if (FAILED(hr)) return hr;
         hr = d->device->CreateShaderResourceView(d->out_tex[i], nullptr, &d->out_srv[i]);
         if (FAILED(hr)) return hr;
