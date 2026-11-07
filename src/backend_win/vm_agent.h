@@ -40,7 +40,8 @@ ASB_API void vm_agent_set_hwnd(HWND hwnd);
    powering off and have no reliable synchronous reply); if the connection drops
    before it is sent, it is sent after the agent reconnects. One command is queued
    per VM: a newer one replaces a queued one that was not sent yet, whose waiting
-   caller then gets FALSE. Thread-safe. */
+   caller then gets FALSE. A command that waits for its reply does not replace a
+   queued fire-and-forget one; it returns FALSE without being sent. Thread-safe. */
 ASB_API BOOL vm_agent_send(VmInstance *instance, const char *command,
                            char *response, int response_max, DWORD timeout_ms);
 

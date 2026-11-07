@@ -76,7 +76,8 @@ typedef struct AgentConn {
     SOCKET         sock;
     volatile BOOL  stop;
     /* Command slot. One command at a time; a newer one replaces a queued one
-       that has not been sent yet. Callers (vm_agent_send: idd_connect from
+       that has not been sent yet, but a command that waits for its reply
+       never replaces a queued fire-and-forget one. Callers (vm_agent_send: idd_connect from
        the viewer's receive thread, shutdown/restart from the UI or headless
        API) and the connection thread use these fields only under the slot's
        lock (conn_lock), and waiters sleep on conn_cv. */
@@ -604,7 +605,17 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
 
         vm->agent_online = TRUE;
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
-        vm->shutdown_requested = FALSE;
+        /* A shutdown/restart kept across the reconnect is still on its way:
+           leave shutdown_requested as it is, so the UI does not reconnect the
+           display (idd_connect) meanwhile and the shutdown watchdog still runs. */
+        {
+            BOOL kept_pending;
+            EnterCriticalSection(conn_lock(conn));
+            kept_pending = conn->cmd_pending && conn->cmd_no_waiter;
+            LeaveCriticalSection(conn_lock(conn));
+            if (!kept_pending)
+                vm->shutdown_requested = FALSE;
+        }
         vm->last_heartbeat = GetTickCount64();
         ui_log(L"Agent online for \"%s\".", vm->name);
 
@@ -877,11 +888,23 @@ BOOL vm_agent_send(VmInstance *instance, const char *command,
 
     /* Hand the command to the connection thread (it owns the socket and is the
        sole sender). The slot holds one command: a newer one replaces a queued
-       one that was not sent yet (its caller then gets FALSE). A caller that
-       gives up waiting does not stop the connection thread waiting for that
-       reply (up to AGENT_REPLY_TIMEOUT_MS); a command queued meanwhile stays
-       pending and is sent once that reply is in. */
+       one that was not sent yet (its caller then gets FALSE), except that a
+       command that waits for its reply never replaces a queued fire-and-forget
+       one (shutdown, restart): that one was already reported as accepted, so
+       the newer command fails instead. A caller that gives up waiting does
+       not stop the connection thread waiting for that reply (up to
+       AGENT_REPLY_TIMEOUT_MS); a command queued meanwhile stays pending and is
+       sent once that reply is in. */
     EnterCriticalSection(lock);
+    if (conn->cmd_pending && conn->cmd_no_waiter && timeout_ms != 0) {
+        char queued[sizeof(conn->cmd)];
+        memcpy(queued, conn->cmd, sizeof(queued));
+        queued[sizeof(queued) - 1] = '\0';
+        LeaveCriticalSection(lock);
+        ui_log(L"Agent: command \"%S\" for \"%s\" not sent (\"%S\" is pending)",
+               command, instance->name, queued);
+        return FALSE;
+    }
     if (conn->cmd_pending)   /* replaced: its caller, if waiting, gives up */
         WakeAllConditionVariable(conn_cv(conn));
     my_gen = ++conn->cmd_gen;
