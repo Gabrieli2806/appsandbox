@@ -353,6 +353,7 @@ static void clip_handle_data_request(UINT fmt)
                 LeaveCriticalSection(&g_send_cs);
             } else {
                 reader_log("GetClipboardData(CF_HDROP) returned NULL.");
+                CloseClipboard();   /* left open, no guest app could copy or paste */
                 goto send_empty;
             }
             CloseClipboard();
@@ -534,7 +535,11 @@ static void handle_client(AsbConn *s)
     WaitForSingleObject(recv_th, INFINITE);
     CloseHandle(recv_th);
 
+    /* Unpublish under the send lock: the caller frees the connection, and the
+       window thread may be in the middle of a long send on it. */
+    EnterCriticalSection(&g_send_cs);
     g_client_sock = NULL;
+    LeaveCriticalSection(&g_send_cs);
     reader_log("Host disconnected.");
 }
 

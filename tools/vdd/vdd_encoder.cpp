@@ -696,7 +696,8 @@ static HRESULT OpenNvenc(VddEncoder* e)
     st = e->nv.nvEncOpenEncodeSessionEx(&op, &e->nvEnc);
     if (st != NV_ENC_SUCCESS) {
         EncLog(e, "Encoder: NVENC session on this GPU failed (%d)", (int)st);
-        e->nvEnc = nullptr;
+        // A failed open can still hand back a session, and NVENC requires it
+        // to be destroyed: CloseNvenc does that when nvEnc is set.
         CloseNvenc(e);
         return E_FAIL;
     }

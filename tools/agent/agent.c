@@ -1956,7 +1956,11 @@ static void apply_pending_vdd_update(void)
     /* Remove the marker first: if the install crashes or hangs this service,
        the next start must not try again in a loop. The host log shows how to
        retry (Update guest components). */
-    DeleteFileW(marker);
+    SetFileAttributesW(marker, FILE_ATTRIBUTE_NORMAL);
+    if (!DeleteFileW(marker) && GetFileAttributesW(marker) != INVALID_FILE_ATTRIBUTES) {
+        agent_log("VDD update: cannot remove the marker (%lu); not installing.", GetLastError());
+        return;
+    }
     GetSystemDirectoryW(sys_dir, MAX_PATH);
     swprintf_s(cer, MAX_PATH, L"%s\\drivers\\AppSandboxVDD.cer", dir);
     if (GetFileAttributesW(cer) != INVALID_FILE_ATTRIBUTES) {
@@ -3295,8 +3299,10 @@ static void handle_client(AsbConn *client)
             if (!enable_privilege(SE_SHUTDOWN_NAME))
                 agent_log("Warning: could not enable SeShutdownPrivilege (%lu)", GetLastError());
             if (!InitiateSystemShutdownExW(NULL, L"AppSandbox shutdown", 0, TRUE, FALSE,
-                    SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED))
+                    SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED)) {
                 agent_log("InitiateSystemShutdownExW failed: %lu", GetLastError());
+                start_input_monitor();   /* the VM keeps running: give it its input back */
+            }
             /* Keep connection open — host will see it drop when VM powers off */
         }
         else if (strcmp(cmd, "restart") == 0) {
@@ -3306,8 +3312,10 @@ static void handle_client(AsbConn *client)
             if (!enable_privilege(SE_SHUTDOWN_NAME))
                 agent_log("Warning: could not enable SeShutdownPrivilege (%lu)", GetLastError());
             if (!InitiateSystemShutdownExW(NULL, L"AppSandbox restart", 0, TRUE, TRUE,
-                    SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED))
+                    SHTDN_REASON_MAJOR_OTHER | SHTDN_REASON_FLAG_PLANNED)) {
                 agent_log("InitiateSystemShutdownExW failed: %lu", GetLastError());
+                start_input_monitor();   /* the VM keeps running: give it its input back */
+            }
         }
         else if (strncmp(cmd, "gpu_query_response:", 19) == 0) {
             int share_count = atoi(cmd + 19);

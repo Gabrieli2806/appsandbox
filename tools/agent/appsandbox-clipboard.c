@@ -683,7 +683,11 @@ static void handle_client(AsbConn *s)
     WaitForSingleObject(recv_th, INFINITE);
     CloseHandle(recv_th);
 
+    /* Unpublish under the send lock: the caller frees the connection, and the
+       window thread may be in the middle of a long send on it. */
+    EnterCriticalSection(&g_send_cs);
     g_client_sock = NULL;
+    LeaveCriticalSection(&g_send_cs);
     clip_free_pending();
     g_clip_fmt_count = 0;
     clip_remove_dir_recursive(g_clip_temp_dir);

@@ -313,7 +313,24 @@ agent. Keep it short and current.
   guest agent: Windows GPU-PV 0x3B crash workaround (feature overrides),
   bugcheck reports, log rotation, VDD HIGH GPU priority; D3D12 reads decoded
   frames in place.
+- **Stability pass** (after test-build-30): guest state (`vm.vmgs`) stays in
+  the VM folder across snapshots; unreadable `vms.cfg` no longer overwritten;
+  stop/delete vs. HCS exit callback; re-entrant `reconcile_displays`; headless
+  API loop survives a dropped request; viewer (swap chain sized at open, one
+  queued frame message, cross-thread log posted); clipboard and agent socket
+  teardown; `Install-AppSandbox.ps1` installs its exact package. The host
+  projects build locally with Build Tools 2026: add
+  `/p:PlatformToolset=v145` (drivers still need the WDK, CI only).
 - **Open / to verify**:
+  - From the stability pass, not changed: `gpu_crash_build_status` never
+    returns "fixed" for build 26100 (section 6 says UBR ≥ 9818 for all three
+    builds; confirm against the KB); the VDD teardown waits 5–10 s for its
+    threads and then frees their state (`VddDestroySwapProc`); the guest
+    clipboard writer does not match `FORMAT_DATA_RESP` to its request and
+    shares `g_clip_fmts` between threads without a lock; guest helpers have no
+    invalid-parameter handler, so a `swprintf_s` path overflow ends them; the
+    VM list JSON uses a fixed 131072-character buffer (`send_vm_list`);
+    `asb_display.c` (unused) is behind the input and display protocols.
   - WebView2 `0x800700AA` at app start after build 27 (data folder ACL
     hardening is the suspect). Build 29 moved the user data folder to
     `%LOCALAPPDATA%\AppSandbox\WebView2` with fallbacks; confirm with the

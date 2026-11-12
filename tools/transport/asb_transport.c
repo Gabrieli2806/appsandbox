@@ -269,7 +269,9 @@ int asb_transport_init(void) {
         RegCloseKey(k);
     }
     WSAStartup(MAKEWORD(2, 2), &wsa);   /* needed by PC backend + the ssh/9p TCP relays either way */
-    if (!force_hv && (force_iv || open_ivshmem() == 0)) {
+    /* The override still has to map the device; without one, use AF_HYPERV. */
+    (void)force_iv;
+    if (!force_hv && open_ivshmem() == 0) {
         g_is_ivshmem = 1;
         g_guest_pid  = (uint32_t)GetCurrentProcessId();
         g_accept_seq = (LONG)(GetTickCount64() & 0x3FFFFFFF);   /* nonzero seed: owner_id unique across PID reuse */
