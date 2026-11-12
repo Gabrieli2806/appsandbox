@@ -69,7 +69,9 @@ jobs:
           $global:LASTEXITCODE = 0
 
           $required = 'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
-                      'drivers\AppSandboxVDD.cer', 'drivers\devcon.exe', 'LICENSE', 'THIRD-PARTY-NOTICES.md'
+                      'drivers\AppSandboxVDD.cer', 'drivers\devcon.exe', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+                      'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
+                      'resources\appsandbox-agent.exe', 'web\index.html'
           $missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
           if ($missing.Count) { throw "Missing artifacts: $($missing -join ', ')" }
 

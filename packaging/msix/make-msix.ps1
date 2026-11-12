@@ -258,19 +258,45 @@ try {
     # ---- Installer helper for test builds ----
     if ($cerOut) {
         $install = @'
+#Requires -RunAsAdministrator
 # Installs the App Sandbox MSIX test build. Run in an elevated PowerShell:
 #   powershell -ExecutionPolicy Bypass -File .\Install-AppSandbox.ps1
+# The package is installed for the user who runs this script.
 $ErrorActionPreference = 'Stop'
 $dir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $cer = Join-Path $dir 'AppSandbox-MSIX-test.cer'
-$msix = Get-ChildItem $dir -Filter 'AppSandbox-*-__ARCH__.msix' | Select-Object -First 1
-if (-not $msix) { throw "No AppSandbox-*.msix next to this script." }
+# This exact package: older builds unzipped into the same folder are ignored.
+$msix = Join-Path $dir '__MSIX__'
+if (-not (Test-Path $msix)) { throw "__MSIX__ is not next to this script." }
+if (-not (Test-Path $cer)) { throw "AppSandbox-MSIX-test.cer is not next to this script." }
+$new = (New-Object Security.Cryptography.X509Certificates.X509Certificate2 $cer).Thumbprint
+if ((Get-AuthenticodeSignature $msix).SignerCertificate.Thumbprint -ne $new) {
+    throw "AppSandbox-MSIX-test.cer does not belong to __MSIX__. Unzip the build into an empty folder."
+}
+# Updating a running app would end it, and ending it turns its VMs off.
+if (Get-Process -Name AppSandbox -ErrorAction SilentlyContinue) {
+    throw "App Sandbox is running (check the tray). Shut down your VMs and exit it, then run this script again."
+}
 # The test certificate must be trusted machine-wide for MSIX to install.
 Import-Certificate -FilePath $cer -CertStoreLocation 'Cert:\LocalMachine\TrustedPeople' | Out-Null
-Add-AppxPackage -Path $msix.FullName -ForceUpdateFromAnyVersion
+try {
+    Add-AppxPackage -Path $msix -ForceUpdateFromAnyVersion
+} catch {
+    if ("$_" -match '0x80073CFB') {
+        Write-Host "A different package with this same version is installed. Remove it and run this script again:"
+        Write-Host "  Get-AppxPackage __NAME__ | Remove-AppxPackage"
+        Write-Host "VMs and settings in %ProgramData%\AppSandbox are kept."
+    }
+    throw
+}
+# Each test build has its own certificate: drop the ones from earlier builds.
+Get-ChildItem Cert:\LocalMachine\TrustedPeople |
+    Where-Object { $_.Subject -eq '__PUBLISHER__' -and $_.Thumbprint -ne $new } |
+    Remove-Item -ErrorAction SilentlyContinue
 Write-Host "App Sandbox installed. Start it from the Start menu."
 '@
-        Set-Content -Path (Join-Path $OutDir 'Install-AppSandbox.ps1') -Value $install.Replace('__ARCH__', $Arch) -Encoding UTF8
+        $install = $install.Replace('__MSIX__', (Split-Path -Leaf $msix)).Replace('__PUBLISHER__', $Publisher).Replace('__NAME__', $Name)
+        Set-Content -Path (Join-Path $OutDir 'Install-AppSandbox.ps1') -Value $install -Encoding UTF8
     }
     Write-Host "MSIX: $msix"
 } finally {

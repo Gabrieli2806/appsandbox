@@ -29,6 +29,11 @@
 #include "iso_patch_log.h"
 #include "target_arch.h"
 #include "engine/squashfs.h"
+/* xz.h declares xz_crc64_init() only with XZ_USE_CRC64 (the decoder sources
+ * get it from xz_config.h). */
+#ifndef XZ_USE_CRC64
+#define XZ_USE_CRC64
+#endif
 #include "engine/xz/xz.h"
 
 #include <windows.h>
