@@ -925,13 +925,39 @@ static DWORD guest_security_mode(const VmConfig *config)
         | (windows && !ASB_IS_ARM64 ? 2u : 0u);
 }
 
-static BOOL guest_state_paths(const VmConfig *config, wchar_t paths[3][MAX_PATH])
+/* Folder of vm.vmgs / vm.vmrs / vm.security (TPM and UEFI variables). It is
+   the VM folder, also when the current disk is a branch in the snapshots
+   subfolder: the guest state must not change when the first snapshot moves
+   the disk there. VMs that already ran from the snapshots subfolder keep the
+   state they have there. */
+static BOOL guest_state_dir(const wchar_t *vhdx_path, wchar_t dir[MAX_PATH])
 {
-    wchar_t dir[MAX_PATH], *slash;
-    wcscpy_s(dir, MAX_PATH, config->vhdx_path);
+    wchar_t probe[MAX_PATH], *slash;
+    size_t len;
+    BOOL branch;
+
+    if (wcslen(vhdx_path) >= MAX_PATH) return FALSE;
+    wcscpy_s(dir, MAX_PATH, vhdx_path);
     slash = wcsrchr(dir, L'\\');
     if (!slash) return FALSE;
+    branch = _wcsnicmp(slash + 1, L"branch_", 7) == 0
+          || _wcsnicmp(slash + 1, L"snapshot_", 9) == 0;
     *slash = L'\0';
+    len = wcslen(dir);
+    if (branch && len > 10 && _wcsicmp(dir + len - 10, L"\\snapshots") == 0) {
+        if (len + 9 < MAX_PATH) {
+            swprintf_s(probe, MAX_PATH, L"%s\\vm.vmgs", dir);
+            if (GetFileAttributesW(probe) != INVALID_FILE_ATTRIBUTES) return TRUE;
+        }
+        dir[len - 10] = L'\0';
+    }
+    return TRUE;
+}
+
+static BOOL guest_state_paths(const VmConfig *config, wchar_t paths[3][MAX_PATH])
+{
+    wchar_t dir[MAX_PATH];
+    if (!guest_state_dir(config->vhdx_path, dir)) return FALSE;
     return swprintf_s(paths[0], MAX_PATH, L"%s\\vm.vmgs", dir) > 0
         && swprintf_s(paths[1], MAX_PATH, L"%s\\vm.vmrs", dir) > 0
         && swprintf_s(paths[2], MAX_PATH, L"%s\\vm.security", dir) > 0;
@@ -1141,11 +1167,8 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
 
     /* VMGS + VMRS paths are included regardless of TPM/SecureBoot.
        GuestState section is always included in the JSON. */
-    wcscpy_s(dir, MAX_PATH, config->vhdx_path);
-    {
-        wchar_t *last_slash = wcsrchr(dir, L'\\');
-        if (last_slash) *last_slash = L'\0';
-    }
+    if (!guest_state_dir(config->vhdx_path, dir))
+        return FALSE;
     swprintf_s(vmgs_path, MAX_PATH, L"%s\\vm.vmgs", dir);
     swprintf_s(vmrs_path, MAX_PATH, L"%s\\vm.vmrs", dir);
 

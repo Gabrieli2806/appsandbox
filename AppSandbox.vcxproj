@@ -95,6 +95,9 @@
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
+           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
+      <StackReserveSize>4194304</StackReserveSize>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
@@ -122,6 +125,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
+           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
+      <StackReserveSize>4194304</StackReserveSize>
       <GenerateDebugInformation>true</GenerateDebugInformation>
       <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
@@ -151,6 +157,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
+           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
+      <StackReserveSize>4194304</StackReserveSize>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
@@ -182,6 +191,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
+      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
+           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
+      <StackReserveSize>4194304</StackReserveSize>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>

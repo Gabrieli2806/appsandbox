@@ -396,8 +396,10 @@ static void core_event(int type, AsbVm vm, int value, const wchar_t *message, BO
     char text[16384];
     event.vm_id = vm ? vm_inst(vm)->unique_id : 0;
     event.type = type; event.int_value = value; event.staging = staging;
-    if (vm) WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1,
-                               event.vm_name, sizeof(event.vm_name), NULL, NULL);
+    /* A name that does not fit leaves the buffer unterminated. */
+    if (vm && !WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1,
+                                   event.vm_name, sizeof(event.vm_name), NULL, NULL))
+        event.vm_name[sizeof(event.vm_name) - 1] = 0;
     if (message) {
         text[0] = 0;
         WideCharToMultiByte(CP_UTF8, 0, message, -1, text, sizeof(text), NULL, NULL);
@@ -1021,12 +1023,24 @@ static void load_vm_list(void)
     BOOL gpu_changed = FALSE;
 
     get_config_path(path, MAX_PATH);
-    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) {
+        /* Missing file = first run. A file that exists but cannot be opened
+           (locked, access denied) must not be replaced by an empty list. */
+        if (GetFileAttributesW(path) != INVALID_FILE_ATTRIBUTES) {
+            asb_log(L"Error: cannot read %s; the VM list was not loaded and will not be overwritten.", path);
+            g_config_load_failed = TRUE;
+        }
+        return;
+    }
     (void)fread(bom, 1, sizeof(bom), f);
     fclose(f);
     unicode_config = (bom[0] == 0xEF && bom[1] == 0xBB && bom[2] == 0xBF) ||
                      (bom[0] == 0xFF && bom[1] == 0xFE);
-    if (_wfopen_s(&f, path, unicode_config ? L"r,ccs=UTF-8" : L"r") != 0 || !f) return;
+    if (_wfopen_s(&f, path, unicode_config ? L"r,ccs=UTF-8" : L"r") != 0 || !f) {
+        asb_log(L"Error: cannot read %s; the VM list was not loaded and will not be overwritten.", path);
+        g_config_load_failed = TRUE;
+        return;
+    }
 
     while (fgetws(line, 1024, f)) {
         size_t len = wcslen(line);
@@ -1674,6 +1688,7 @@ typedef struct {
     GUID     network_id;
     GUID     endpoint_id;
     BOOL     has_network;
+    int      requested_network_mode; /* what the user chose; a failed attach must not replace it */
     wchar_t  net_adapter[256];
     HRESULT  result;
     wchar_t  error_msg[512];
@@ -1972,8 +1987,12 @@ disk_ready:
                shared with other VMs. Orphan networks are cleaned up at next
                launch by hcn_cleanup_stale_networks(). */
         }
-        if (FAILED(hr))
+        if (FAILED(hr)) {
+            asb_log(L"Warning: network unavailable (0x%08X); \"%s\" starts without it this time.",
+                    hr, args->config.name);
+            args->requested_network_mode = args->config.network_mode;
             args->config.network_mode = NET_NONE;
+        }
     }
 
     args->config.image_path[0] = L'\0';
@@ -2071,7 +2090,9 @@ done:
                     inst->gpu_mode = heap_inst->gpu_mode;
                     wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
                     update_vm_gpu_name(inst);
-                    inst->network_mode = heap_inst->network_mode;
+                    /* A failed attach is for this boot only: keep the saved choice. */
+                    inst->network_mode = args->requested_network_mode
+                        ? args->requested_network_mode : heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
@@ -2970,6 +2991,7 @@ typedef struct {
     GUID        network_id;
     GUID        endpoint_id;
     BOOL        has_network;
+    int         requested_network_mode; /* what the user chose; a failed attach must not replace it */
     wchar_t     net_adapter[256];
     HRESULT     result;
     wchar_t     error_msg[512];
@@ -3154,8 +3176,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
                 if (is_nat) save_vm_list();
             }
         }
-        if (FAILED(hr))
+        if (FAILED(hr)) {
+            asb_log(L"Warning: network unavailable (0x%08X); \"%s\" starts without it this time.",
+                    hr, args->config.name);
+            args->requested_network_mode = args->config.network_mode;
             args->config.network_mode = NET_NONE;
+        }
     }
 
     /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
@@ -3200,6 +3226,12 @@ static DWORD WINAPI linux_create_thread(LPVOID param)
     }
 
 done:
+    /* Clean up staging dir (sources, packages and the account markers). */
+    {
+        wchar_t staging_dir[MAX_PATH];
+        if (swprintf_s(staging_dir, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir) > 0)
+            remove_dir_recursive(staging_dir);
+    }
     {
         VmInstance *inst;
         int idx;
@@ -3223,7 +3255,9 @@ done:
                     inst->gpu_mode = heap_inst->gpu_mode;
                     wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
                     update_vm_gpu_name(inst);
-                    inst->network_mode = heap_inst->network_mode;
+                    /* A failed attach is for this boot only: keep the saved choice. */
+                    inst->network_mode = args->requested_network_mode
+                        ? args->requested_network_mode : heap_inst->network_mode;
                     inst->network_id = args->network_id;
                     inst->endpoint_id = args->endpoint_id;
                     HeapFree(GetProcessHeap(), 0, heap_inst);
@@ -3377,8 +3411,15 @@ ASB_API void asb_cleanup(void)
         vm_ssh_proxy_stop(&VM_AT(i));
         vm_agent_stop(&VM_AT(i));
         idd_probe_stop(&VM_AT(i));
-        if (VM_AT(i).running) hcs_terminate_vm(&VM_AT(i));
-        hcs_close_vm(&VM_AT(i));
+        if (InterlockedExchange((LONG *)&VM_AT(i).running, FALSE)) hcs_terminate_vm(&VM_AT(i));
+        /* Close here, not on hcs_close_vm's helper thread: computecore.dll is
+           unloaded right below. */
+        hcs_unregister_vm_callback(&VM_AT(i));
+        {
+            HCS_SYSTEM h = VM_AT(i).handle;
+            VM_AT(i).handle = NULL;
+            hcs_close_handle_sync(h);
+        }
     }
 
     hcs_cleanup();
@@ -4421,6 +4462,9 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         args->config.network_mode = inst->network_mode;
         wcscpy_s(args->config.mac_address, ARRAYSIZE(args->config.mac_address), inst->mac_address);
         args->config.test_mode = inst->test_mode;
+        /* hcs_create_vm copies this back to the instance: a restarted
+           template build must still be finalized when it exits. */
+        args->config.is_template = inst->is_template;
         wcscpy_s(args->config.admin_user, 128, inst->admin_user);
         args->config.ssh_enabled = inst->ssh_enabled;
         wcscpy_s(args->config.resources_iso_path, MAX_PATH, inst->resources_iso_path);
@@ -4485,9 +4529,12 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
     if (VM_AT(idx).starting || VM_AT(idx).building_vhdx) return E_ACCESSDENIED;
     inst = &VM_AT(idx);
 
-    if (!inst->running) { asb_log(L"VM \"%s\" is not running.", inst->name); return S_FALSE; }
-
-    inst->running = FALSE;
+    /* Claim the teardown: the HCS exit callback does the same compare-and-swap,
+       so only one of the two closes the compute system. */
+    if (!InterlockedCompareExchange((LONG *)&inst->running, FALSE, TRUE)) {
+        asb_log(L"VM \"%s\" is not running.", inst->name);
+        return S_FALSE;
+    }
     inst->shutdown_requested = FALSE;
     inst->hyperv_video_off = FALSE;
     inst->ssh_key_deployed = FALSE;   /* disk may change while stopped (revert) -- re-deploy next boot */
@@ -4516,11 +4563,12 @@ ASB_API HRESULT asb_vm_stop(AsbVm vm)
 
 ASB_API HRESULT asb_vm_delete(AsbVm vm)
 {
-    int idx, i;
+    int idx;
     wchar_t dir[MAX_PATH];
     VmInstance *inst;
     DWORD attrs;
     HRESULT hr;
+    LONG was_running;
 
     idx = vm_index_of(vm);
     if (idx < 0) return E_INVALIDARG;
@@ -4550,12 +4598,15 @@ ASB_API HRESULT asb_vm_delete(AsbVm vm)
         }
     } else if (!(attrs & FILE_ATTRIBUTE_DIRECTORY)) return HRESULT_FROM_WIN32(ERROR_DIRECTORY);
 
+    /* Claim the teardown before terminating (see asb_vm_stop): otherwise the
+       HCS exit callback tears the same compute system down at the same time. */
+    was_running = InterlockedExchange((LONG *)&inst->running, FALSE);
     hcs_stop_monitor(inst);
     vm_ssh_proxy_stop(inst);
     vm_agent_stop(inst);
     idd_probe_stop(inst);
 
-    if (inst->running)
+    if (was_running)
         hcs_terminate_vm(inst);
 
     asb_vm_cleanup_network(inst);
