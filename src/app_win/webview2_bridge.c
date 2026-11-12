@@ -1134,7 +1134,11 @@ static void CALLBACK retry_timer_proc(HWND hwnd, UINT msg, UINT_PTR id, DWORD ti
 static void start_failed(HRESULT hr)
 {
     if (g_shutting_down) return;
-    if (hr == WV2_E_BUSY && (g_busy_retries < BUSY_RETRIES || g_udf_kind + 1 < UDF_COUNT)) {
+    /* Access denied is a data folder problem too, but waiting does not help:
+       go straight to the next folder. */
+    if (hr == E_ACCESSDENIED && g_udf_kind + 1 < UDF_COUNT) g_busy_retries = BUSY_RETRIES;
+    if ((hr == WV2_E_BUSY || hr == E_ACCESSDENIED) &&
+        (g_busy_retries < BUSY_RETRIES || g_udf_kind + 1 < UDF_COUNT)) {
         UINT delay = BUSY_RETRY_MS;
         if (g_busy_retries < BUSY_RETRIES) {
             if (g_busy_retries == 0)
@@ -1144,7 +1148,7 @@ static void start_failed(HRESULT hr)
             g_udf_kind++;
             g_busy_retries = 0;
             delay = 10;
-            ui_log(L"WebView2: the data folder stayed in use; trying another one");
+            ui_log(L"WebView2: the data folder cannot be used (0x%08X); trying another one", (unsigned)hr);
         }
         kill_restart_timer();
         g_restart_timer = SetTimer(NULL, 0, delay, retry_timer_proc);
@@ -1172,6 +1176,9 @@ static void restart_webview(int kind)
     g_declined_failure = FAIL_NONE;
     g_restart_retries = 0;
     g_busy_retries = 0;
+    /* A start that failed may have walked to the last data folder: the user
+       asked again, so begin with the preferred one. */
+    if (kind == FAIL_START) g_udf_kind = UDF_LOCAL_APPDATA;
     kill_restart_timer();
 
     /* The page process ended but the browser process runs: load the page
@@ -1608,7 +1615,16 @@ void jb_append_escaped(JsonBuilder *jb, const wchar_t *s)
         case L'\n': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'n'; break;
         case L'\r': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L'r'; break;
         case L'\t': jb->buf[jb->len++] = L'\\'; jb->buf[jb->len++] = L't'; break;
-        default:    jb->buf[jb->len++] = *p; break;
+        default:
+            /* Other control characters are not valid in a JSON string, and
+               one of them makes WebView2 reject the whole message. */
+            if (*p < 0x20) {
+                int n = swprintf_s(jb->buf + jb->len, jb->cap - jb->len, L"\\u%04x", (unsigned)*p);
+                if (n > 0) jb->len += (size_t)n;
+            } else {
+                jb->buf[jb->len++] = *p;
+            }
+            break;
         }
     }
     jb->buf[jb->len] = L'\0';

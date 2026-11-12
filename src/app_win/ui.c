@@ -309,21 +309,38 @@ static void reconcile_displays(void)
     VmDisplayIdd *idd[ASB_MAX_VMS] = {0};
     UINT64 ids[ASB_MAX_VMS] = {0};
     int i;
+    VmDisplay *dead_rdp[ASB_MAX_VMS] = {0};
+    VmDisplayIdd *dead_idd[ASB_MAX_VMS] = {0};
     for (i = 0; i < ASB_MAX_VMS; ++i) {
         VmInstance *vm = asb_find_vm_by_id(g_display_vm_ids[i]);
         int idx = vm ? asb_vm_index((AsbVm)vm) : -1;
         if (idx < 0 || !vm->running) {
-            safe_destroy_rdp(i);
-            safe_destroy_idd(i);
+            dead_rdp[i] = g_displays[i];
+            dead_idd[i] = g_idd_displays[i];
         } else {
             rdp[idx] = g_displays[i];
             idd[idx] = g_idd_displays[i];
             ids[idx] = vm->unique_id;
         }
     }
+    /* Destroying a display pumps messages, and those can run this function
+       or open a display again: make the tables final before destroying. */
     memcpy(g_displays, rdp, sizeof(rdp));
     memcpy(g_idd_displays, idd, sizeof(idd));
     memcpy(g_display_vm_ids, ids, sizeof(ids));
+    for (i = 0; i < ASB_MAX_VMS; ++i) {
+        if (dead_rdp[i]) {
+            ++g_pump_depth;
+            vm_display_disconnect(dead_rdp[i]);
+            vm_display_destroy(dead_rdp[i]);
+            --g_pump_depth;
+        }
+        if (dead_idd[i]) {
+            ++g_pump_depth;
+            vm_display_idd_destroy(dead_idd[i]);
+            --g_pump_depth;
+        }
+    }
 }
 
 /* TRUE while a command runs on the UI thread or a VM operation runs on the
@@ -1234,6 +1251,7 @@ static void do_connect_rdp(int idx)
     VmInstance *v;
     wchar_t pipe[300];
     int tries;
+    if (g_destroying) return;   /* the exit teardown would never destroy it */
     if (idx < 0 || idx >= asb_vm_count()) return;
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
@@ -1263,6 +1281,7 @@ static void do_connect_rdp(int idx)
 static void do_connect_idd(int idx)
 {
     VmInstance *v;
+    if (g_destroying) return;   /* the exit teardown would never destroy it */
     if (idx < 0 || idx >= asb_vm_count()) return;
     v = asb_vm_instance(asb_vm_get(idx));
     if (!v || !v->running) { ui_log(L"VM \"%s\" is not running.", v ? v->name : L"?"); return; }
@@ -1492,6 +1511,8 @@ static void launch_vm_tick(HWND hwnd)
         if (FAILED(hr)) {
             ShowWindow(hwnd, SW_RESTORE);
             ui_show_alert(L"The VM could not be started. See the log in App Sandbox.");
+        } else if (_wcsicmp(v->os_type, L"Other") == 0) {
+            open_console_when_running(v->unique_id);   /* no display driver to auto-open */
         }
     }
     send_vm_list();

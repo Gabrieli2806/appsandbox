@@ -1025,15 +1025,19 @@ void vm_display_destroy(VmDisplay *display)
     /* Tell the display thread to close (d->running = FALSE signals
        programmatic close so WM_CLOSE won't re-notify main_hwnd). */
     display->running = FALSE;
-    if (display->hwnd && IsWindow(display->hwnd))
-        PostMessageW(display->hwnd, WM_CLOSE, 0, 0);
 
-    /* Wait for the display thread, pumping messages to keep UI responsive */
+    /* Wait for the display thread, pumping messages to keep UI responsive.
+       WM_CLOSE is posted again on every pass: the thread may not have created
+       its window yet. */
     if (display->thread) {
+        ULONGLONG deadline = GetTickCount64() + 30000;
         DWORD result;
-        do {
+        for (;;) {
+            if (display->hwnd && IsWindow(display->hwnd))
+                PostMessageW(display->hwnd, WM_CLOSE, 0, 0);
             result = MsgWaitForMultipleObjects(
-                1, &display->thread, FALSE, 5000, QS_ALLINPUT);
+                1, &display->thread, FALSE, 250, QS_ALLINPUT);
+            if (result == WAIT_OBJECT_0 || result == WAIT_FAILED) break;
             if (result == WAIT_OBJECT_0 + 1) {
                 MSG msg;
                 while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
@@ -1041,7 +1045,13 @@ void vm_display_destroy(VmDisplay *display)
                     DispatchMessageW(&msg);
                 }
             }
-        } while (result == WAIT_OBJECT_0 + 1);
+            if (GetTickCount64() > deadline) {
+                /* A thread that still runs (the RDP control can hang in
+                   Disconnect) would use freed memory: keep the state. */
+                ui_log(L"Display: the console window thread did not stop; its state is kept.");
+                return;
+            }
+        }
         CloseHandle(display->thread);
     }
 

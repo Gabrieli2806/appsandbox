@@ -986,7 +986,6 @@ static DWORD WINAPI clip_push_thread_proc(LPVOID param)
         }
     }
 
-    clip->push_thread = NULL;
     return 0;
 }
 
@@ -1210,7 +1209,6 @@ static DWORD WINAPI clip_writer_thread_proc(LPVOID param)
         if (clip->stop) break;
     }
 
-    clip->writer_thread = NULL;
     return 0;
 }
 
@@ -1632,7 +1630,6 @@ static DWORD WINAPI clip_reader_thread_proc(LPVOID param)
         if (clip->stop) break;
     }
 
-    clip->reader_thread = NULL;
     return 0;
 }
 

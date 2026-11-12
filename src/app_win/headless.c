@@ -671,13 +671,19 @@ static int handle_request(PHTTP_REQUEST req)
     }
     if (verb == HttpVerbDELETE && wcsncmp(path, L"/v1/templates/", 14) == 0) {
         const wchar_t *name = path + 14;
+        char nu[256] = {0};
+        /* The name goes back in the JSON answer: it must fit and need no escaping. */
+        if (wcslen(name) > 63 || wcspbrk(name, L"\"\\") ||
+            !WideCharToMultiByte(CP_UTF8, 0, name, -1, nu, sizeof(nu), NULL, NULL)) {
+            send_err(req->RequestId, 400, "Bad Request", "invalid_arg", "invalid template name");
+            return 0;
+        }
         HRESULT hr = asb_template_delete(name);
         if (hr == HRESULT_FROM_WIN32(ERROR_BUSY)) {
             send_err(req->RequestId, 409, "Conflict", "template_in_use",
                      "This template is still required by an existing VM or an active disk copy.");
             return 0;
         }
-        char nu[256] = {0}; WideCharToMultiByte(CP_UTF8,0,name,-1,nu,sizeof(nu),NULL,NULL);
         send_hr(req->RequestId, "deleteTemplate", nu, 0, hr);
         return 0;
     }
@@ -862,7 +868,9 @@ static int handle_request(PHTTP_REQUEST req)
             send_err(req->RequestId, 409, "Conflict", "vm_starting", "VM start is in progress; retry once it completes");
             return 0;
         }
-        WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1, nu, sizeof(nu), NULL, NULL);
+        /* A name that does not fit leaves the buffer unterminated. */
+        if (!WideCharToMultiByte(CP_UTF8, 0, asb_vm_name(vm), -1, nu, sizeof(nu), NULL, NULL))
+            nu[0] = 0;
 
         if (sub == NULL) {
             VmInstance *inst = asb_vm_instance(vm);
@@ -1403,6 +1411,10 @@ static DWORD WINAPI api_thread(LPVOID unused)
             req = grown;
             rc = HttpReceiveHttpRequest(g_req_queue, id, 0, req, capacity, &bytes, NULL);
         }
+        /* That one request is gone (client dropped, or it grew again): keep
+           serving. Any other error means the queue was shut down. */
+        if (rc == ERROR_CONNECTION_INVALID || rc == ERROR_HANDLE_EOF || rc == ERROR_MORE_DATA)
+            continue;
         if (rc != NO_ERROR) break;
         const wchar_t *path = req->CookedUrl.pAbsPath;
         if (!g_gui_hwnd || !auth_ok(req) ||

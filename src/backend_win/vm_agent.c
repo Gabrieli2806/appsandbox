@@ -598,8 +598,11 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
         /* Wait for hello from agent */
         n = recv_line(s, buf, sizeof(buf), NULL);
         if (n <= 0 || strcmp(buf, "hello") != 0) {
-            closesocket(s);
-            conn->sock = INVALID_SOCKET;
+            /* Claim it first: vm_agent_stop() may have closed it already. */
+            SOCKET old = (SOCKET)InterlockedExchangePointer(
+                (PVOID volatile *)&conn->sock, (PVOID)INVALID_SOCKET);
+            if (old != INVALID_SOCKET)
+                closesocket(old);
             continue;
         }
 

@@ -14,6 +14,7 @@
 #include <winsock2.h>
 #include <windows.h>
 #include <commctrl.h>
+#include <dwmapi.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -194,6 +195,7 @@ static const UINT g_refresh_rates[] = { 60, 120, 144 };
 #define WM_IDD_VIDEO_STATUS     (WM_USER + 107)  /* guest reported video on/off; wp=1 prefs changed */
 #define WM_IDD_SET_CODEC        (WM_USER + 108)  /* wp = CODEC_* */
 #define WM_IDD_SET_BITRATE      (WM_USER + 109)  /* wp = Mbit/s, 0 = auto */
+#define WM_IDD_LOG              (WM_USER + 111)  /* lp = heap copy of a line logged on another thread */
 #define WM_IDD_SET_ICON         (WM_USER + 110)  /* reload the VM's custom icon */
 
 /* Timer for Present cadence when no frames arrive */
@@ -370,6 +372,7 @@ struct VmDisplayIdd {
     /* Guest driver generation on the current frame connection: -1 unknown,
        0 older (no hello before the first frame), >= 2 from its hello. */
     volatile LONG  guest_driver;
+    volatile LONG  frame_msg_pending; /* a WM_IDD_FRAME_READY is in the queue */
     UINT           frames_since_connect;
 
     /* Performance mode (GPU video). stream_mode is the user's choice,
@@ -688,18 +691,12 @@ static void ensure_idd_class(HINSTANCE hInst)
 
 /* ---- Debug log panel ---- */
 
-static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
+/* Window thread only. */
+static void idd_log_add(VmDisplayIdd *d, const wchar_t *buf)
 {
-    wchar_t buf[512];
-    va_list ap;
     LRESULT count;
 
-    if (!d || !d->log_list_hwnd || d->stop) return;
-
-    va_start(ap, fmt);
-    vswprintf_s(buf, 512, fmt, ap);
-    va_end(ap);
-
+    if (!d->log_list_hwnd) return;
     count = SendMessageW(d->log_list_hwnd, LB_ADDSTRING, 0, (LPARAM)buf);
 
     /* Trim old entries */
@@ -711,6 +708,38 @@ static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
     /* Scroll to bottom and force repaint even when not focused */
     SendMessageW(d->log_list_hwnd, LB_SETTOPINDEX, (WPARAM)(count - 1), 0);
     UpdateWindow(d->log_list_hwnd);
+}
+
+static void idd_log(VmDisplayIdd *d, const wchar_t *fmt, ...)
+{
+    wchar_t buf[512];
+    va_list ap;
+
+    if (!d || !d->log_list_hwnd || d->stop) return;
+
+    va_start(ap, fmt);
+    vswprintf_s(buf, 512, fmt, ap);
+    va_end(ap);
+
+    /* The other threads log while they hold frame_cs or input_lock, which the
+       window thread takes too: a SendMessage from them could wait forever. */
+    if (GetCurrentThreadId() != GetWindowThreadProcessId(d->log_list_hwnd, NULL)) {
+        wchar_t *copy = _wcsdup(buf);
+        if (copy && !(d->hwnd && PostMessageW(d->hwnd, WM_IDD_LOG, 0, (LPARAM)copy)))
+            free(copy);
+        return;
+    }
+    idd_log_add(d, buf);
+}
+
+/* One WM_IDD_FRAME_READY in the queue at a time. With a renderer that waits
+   for the screen (D3D12), a guest that sends faster than the host refreshes
+   would otherwise fill the queue and starve input and timers. */
+static void idd_post_frame_ready(VmDisplayIdd *d)
+{
+    if (InterlockedExchange(&d->frame_msg_pending, 1) == 0 &&
+        !PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0))
+        InterlockedExchange(&d->frame_msg_pending, 0);
 }
 
 /* Also into the main App Sandbox log (for messages users need to see). */
@@ -4076,7 +4105,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
                     PostMessageW(d->hwnd, WM_IDD_CURSOR_CHANGED, 0, 0);
                 }
                 if (d->hwnd && IsWindow(d->hwnd))
-                    PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+                    idd_post_frame_ready(d);
                 if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
                     closesocket(input_s);
                     input_s = INVALID_SOCKET;
@@ -4254,7 +4283,7 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
 
             /* Signal the window thread to repaint */
             if (d->hwnd && IsWindow(d->hwnd))
-                PostMessageW(d->hwnd, WM_IDD_FRAME_READY, 0, 0);
+                idd_post_frame_ready(d);
 
             /* Reconnect input socket if send_input flagged it dead */
             if (d->input_socket == INVALID_SOCKET && input_s != INVALID_SOCKET) {
@@ -4469,6 +4498,9 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         d->open = FALSE;
         return 1;
     }
+    /* The window got its WM_SIZE before the swap chain existed: size the
+       buffers to the real client area (the saved resolution, not the default). */
+    d3d_resize_swap_chain(d);
 
     idd_apply_icon(d);
 
@@ -4947,7 +4979,15 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_IDD_FRAME_READY:
-        if (d) d3d_render_frame(d);
+        if (d) {
+            InterlockedExchange(&d->frame_msg_pending, 0);
+            d3d_render_frame(d);
+        }
+        return 0;
+
+    case WM_IDD_LOG:
+        if (d && lp) idd_log_add(d, (const wchar_t *)lp);
+        free((void *)lp);
         return 0;
 
     case WM_CLIPBOARDUPDATE:
