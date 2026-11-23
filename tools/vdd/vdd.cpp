@@ -1492,15 +1492,49 @@ static void VddInitAdapter(VDD_DEVICE_CONTEXT* ctx)
 /*  Render adapter                                                           */
 /* ========================================================================= */
 
-/* The hardware GPU to compose on: the non-software adapter with the most
-   dedicated memory (the GPU-PV adapter of the GPU given to the VM). FALSE
-   when only WARP / basic adapters exist. HKLM\SOFTWARE\AppSandbox
+/* D3DKMT_ADAPTERTYPE bits, by value: the named bit-fields past the first
+   four exist only when the headers target a newer WDDM than this driver. */
+#define VDD_KMT_RENDER    0x01u   /* RenderSupported */
+#define VDD_KMT_SOFTWARE  0x04u   /* SoftwareDevice */
+#define VDD_KMT_INDIRECT  0x40u   /* IndirectDisplayDevice */
+#define VDD_KMT_PARAVIRT  0x80u   /* Paravirtualized (GPU-PV) */
+
+/* The WDDM type of an adapter (render, indirect display, software,
+   paravirtualized). FALSE when it cannot be read. */
+static BOOL VddAdapterType(LUID luid, D3DKMT_ADAPTERTYPE* type)
+{
+    D3DKMT_OPENADAPTERFROMLUID open = {};
+    D3DKMT_QUERYADAPTERINFO q = {};
+    D3DKMT_CLOSEADAPTER close = {};
+    NTSTATUS st;
+
+    open.AdapterLuid = luid;
+    if (D3DKMTOpenAdapterFromLuid(&open) < 0) return FALSE;
+    ZeroMemory(type, sizeof(*type));
+    q.hAdapter = open.hAdapter;
+    q.Type = KMTQAITYPE_ADAPTERTYPE;
+    q.pPrivateDriverData = type;
+    q.PrivateDriverDataSize = sizeof(*type);
+    st = D3DKMTQueryAdapterInfo(&q);
+    close.hAdapter = open.hAdapter;
+    D3DKMTCloseAdapter(&close);
+    return st >= 0;
+}
+
+/* The hardware GPU to compose on: the GPU-PV adapter of the GPU given to the
+   VM (a paravirtualized render adapter; the one with the most dedicated
+   memory if there are several). Indirect display adapters are skipped: DXGI
+   lists each one (this driver's, and those of other virtual display drivers
+   in the guest) under the name and memory of the GPU it renders on, and
+   composing on one of them would chain a virtual display onto another.
+   FALSE when only WARP / basic adapters exist. HKLM\SOFTWARE\AppSandbox
    DisplayRenderAdapter = "default" keeps the OS choice. */
 static BOOL VddFindRenderAdapter(LUID* out, char* name, size_t name_cap)
 {
     IDXGIFactory1* factory = nullptr;
     IDXGIAdapter1* adapter = nullptr;
     SIZE_T best_mem = 0;
+    BOOL best_pv = FALSE;
     BOOL found = FALSE;
 
     {
@@ -1517,14 +1551,22 @@ static BOOL VddFindRenderAdapter(LUID* out, char* name, size_t name_cap)
     if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory))) return FALSE;
     for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; i++) {
         DXGI_ADAPTER_DESC1 d = {};
+        D3DKMT_ADAPTERTYPE type = {};
         if (SUCCEEDED(adapter->GetDesc1(&d)) &&
             !(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) &&
             d.VendorId != 0x1414 /* Microsoft: WARP, Basic Render, Hyper-V video */ &&
-            (!found || d.DedicatedVideoMemory > best_mem)) {
-            found = TRUE;
-            best_mem = d.DedicatedVideoMemory;
-            *out = d.AdapterLuid;
-            WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, (int)name_cap, NULL, NULL);
+            VddAdapterType(d.AdapterLuid, &type) &&
+            (type.Value & VDD_KMT_RENDER) &&
+            !(type.Value & (VDD_KMT_SOFTWARE | VDD_KMT_INDIRECT))) {
+            BOOL pv = (type.Value & VDD_KMT_PARAVIRT) ? TRUE : FALSE;
+            if (!found || (pv && !best_pv) ||
+                (pv == best_pv && d.DedicatedVideoMemory > best_mem)) {
+                found = TRUE;
+                best_pv = pv;
+                best_mem = d.DedicatedVideoMemory;
+                *out = d.AdapterLuid;
+                WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, (int)name_cap, NULL, NULL);
+            }
         }
         adapter->Release();
         adapter = nullptr;
@@ -1561,7 +1603,8 @@ static BOOL VddApplyRenderAdapter(VDD_DEVICE_CONTEXT* ctx)
         ctx->renderSeenCount = 1;
     }
     if (ctx->renderSeenCount < 3) {
-        VddLog("RenderAdapter: \"%s\" found, waiting for it to settle (%u/3)", name, ctx->renderSeenCount);
+        VddLog("RenderAdapter: \"%s\" (LUID=%08X:%08X) found, waiting for it to settle (%u/3)",
+               name, luid.HighPart, luid.LowPart, ctx->renderSeenCount);
         return FALSE;
     }
     {

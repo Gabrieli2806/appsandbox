@@ -572,6 +572,16 @@ agent. Keep it short and current.
   channel coming back after a guest restart (the listener's retry).
   The host log line `Monitor: props query failed 0x8037010D` every 5 s is
   the HCS monitor thread in `hcs_vm.c`, not the MCP server.
+- **GPU freeze at VM start** (owner report, host needs Win+Ctrl+Shift+B):
+  not reproduced in 13 boots measured with a host GPU probe. Found and
+  fixed: the VDD's render-adapter choice took the first DXGI adapter with
+  the most memory, which in a guest with other virtual display drivers
+  (Apollo/Sunshine install two) is an *indirect* display adapter listed
+  under the NVIDIA name; it now takes the paravirtualized render adapter
+  (D3DKMT adapter type). Also seen at every boot, outside App Sandbox:
+  Apollo/Vibepollo in the guest opens about ten NVENC sessions while the
+  guest GPU is still settling. If the freeze comes back, test with the
+  guest's ApolloService on delayed start.
 - **Open / to verify**:
   - From the stability pass, not changed: `gpu_crash_build_status` never
     returns "fixed" for build 26100 (section 6 says UBR ≥ 9818 for all three
