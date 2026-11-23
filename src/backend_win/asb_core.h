@@ -289,6 +289,13 @@ ASB_API BOOL asb_get_viewer_toolbar(void);
    Applies to VM windows opened afterwards. */
 ASB_API void asb_set_viewer_renderer(int renderer);
 ASB_API int  asb_get_viewer_renderer(void);
+/* MCP server for AI agents (src/app_win/mcp.c): whether it listens, and
+   whether it only offers the tools that change nothing. Both off by default;
+   saved with asb_save(). */
+ASB_API void asb_set_mcp_enabled(BOOL enabled);
+ASB_API BOOL asb_get_mcp_enabled(void);
+ASB_API void asb_set_mcp_read_only(BOOL read_only);
+ASB_API BOOL asb_get_mcp_read_only(void);
 ASB_API HRESULT asb_vm_update_guest_tools(AsbVm vm);
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm);
 

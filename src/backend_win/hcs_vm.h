@@ -114,7 +114,10 @@ typedef struct {
     BOOL        ssh_deploy_key;          /* TRUE = deploy the AppSandbox public key to the guest */
     volatile BOOL ssh_key_deployed;      /* TRUE once the guest agent has written authorized_keys */
     wchar_t     ssh_pubkey[512];         /* AppSandbox public-key line to deploy (ed25519) */
+    volatile LONG agent_caps;            /* VM_AGENT_CAP_*: what the connected agent announced ("caps:") */
 } VmInstance;
+
+#define VM_AGENT_CAP_EXEC  0x1   /* it has the command channel (8) */
 
 /* Initialize HCS - loads computecore.dll dynamically.
    Returns TRUE if HCS is available. */

@@ -374,6 +374,9 @@ static BOOL g_auto_update_tools = TRUE;
 static BOOL g_viewer_title_stats = TRUE;   /* resolution, FPS, codec in the title */
 static BOOL g_viewer_toolbar = TRUE;       /* floating toolbar at the top edge */
 static int  g_viewer_renderer = 11;        /* 11 = Direct3D 11, 12 = Direct3D 12 */
+/* MCP server for AI agents (Settings > AI agents). Off by default. */
+static BOOL g_mcp_enabled = FALSE;
+static BOOL g_mcp_read_only = FALSE;
 
 static BOOL g_initialized = FALSE;
 
@@ -907,7 +910,8 @@ static BOOL save_vm_list(void)
     }
 
     if (g_last_iso_path[0] != L'\0' || g_suppress_tray_warn || !g_auto_update_tools ||
-        !g_viewer_title_stats || !g_viewer_toolbar || g_viewer_renderer != 11) {
+        !g_viewer_title_stats || !g_viewer_toolbar || g_viewer_renderer != 11 ||
+        g_mcp_enabled || g_mcp_read_only) {
         fwprintf(f, L"[Settings]\n");
         if (g_last_iso_path[0] != L'\0')
             fwprintf(f, L"LastIsoPath=%s\n", g_last_iso_path);
@@ -921,6 +925,10 @@ static BOOL save_vm_list(void)
             fwprintf(f, L"ViewerToolbar=0\n");
         if (g_viewer_renderer != 11)
             fwprintf(f, L"ViewerRenderer=%d\n", g_viewer_renderer);
+        if (g_mcp_enabled)
+            fwprintf(f, L"McpEnabled=1\n");
+        if (g_mcp_read_only)
+            fwprintf(f, L"McpReadOnly=1\n");
         fwprintf(f, L"\n");
     }
 
@@ -1100,6 +1108,10 @@ static void load_vm_list(void)
                 g_viewer_toolbar = (_wtoi(line + 14) != 0);
             else if (wcsncmp(line, L"ViewerRenderer=", 15) == 0)
                 g_viewer_renderer = _wtoi(line + 15) == 12 ? 12 : 11;
+            else if (wcsncmp(line, L"McpEnabled=", 11) == 0)
+                g_mcp_enabled = (_wtoi(line + 11) != 0);
+            else if (wcsncmp(line, L"McpReadOnly=", 12) == 0)
+                g_mcp_read_only = (_wtoi(line + 12) != 0);
             continue;
         }
 
@@ -5263,6 +5275,10 @@ ASB_API void asb_set_viewer_prefs(BOOL title_stats, BOOL toolbar)
 ASB_API BOOL asb_get_viewer_title_stats(void) { return g_viewer_title_stats; }
 ASB_API BOOL asb_get_viewer_toolbar(void) { return g_viewer_toolbar; }
 ASB_API void asb_set_viewer_renderer(int renderer) { g_viewer_renderer = renderer == 12 ? 12 : 11; }
+ASB_API void asb_set_mcp_enabled(BOOL enabled) { g_mcp_enabled = enabled ? TRUE : FALSE; }
+ASB_API BOOL asb_get_mcp_enabled(void) { return g_mcp_enabled; }
+ASB_API void asb_set_mcp_read_only(BOOL read_only) { g_mcp_read_only = read_only ? TRUE : FALSE; }
+ASB_API BOOL asb_get_mcp_read_only(void) { return g_mcp_read_only; }
 ASB_API int  asb_get_viewer_renderer(void) { return g_viewer_renderer; }
 
 ASB_API BOOL asb_vm_guest_tools_outdated(AsbVm vm)

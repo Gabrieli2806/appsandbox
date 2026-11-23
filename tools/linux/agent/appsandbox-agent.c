@@ -1066,6 +1066,9 @@ static void handle_client(int fd)
         agent_log("hello: send failed");
         goto out;
     }
+    /* What this agent can do (older hosts ignore the line): exec = the
+     * command channel on AF_VSOCK :8. */
+    send_line(fd, "caps:exec");
 
     if (pthread_create(&hb, NULL, heartbeat_thread, NULL) != 0) {
         agent_log("heartbeat: pthread_create failed: %s", strerror(errno));
@@ -1204,6 +1207,461 @@ static void on_term(int sig)
     }
 }
 
+/* ---- Guest command channel: AF_VSOCK :8 ----
+ *
+ * The host's MCP tools (run_command, copy_to_guest, copy_from_guest)
+ * connect here. One request and one response per connection, each on
+ * its own thread, so a long command never holds up the control channel.
+ * Commands run as this service (root). Only the host can connect: vsock
+ * is reachable from the hypervisor side alone.
+ *
+ * The wire format is src/core/asb_exec_protocol.h (shared by the host
+ * and the Windows agent); it is repeated here because this daemon is
+ * built from this single file. Keep the two in step.
+ */
+
+#define EXEC_VSOCK_PORT       8u
+#define ASX_REQUEST_MAGIC     0x51585341u  /* "ASXQ" */
+#define ASX_RESPONSE_MAGIC    0x52585341u  /* "ASXR" */
+#define ASX_VERSION           1u
+#define ASX_OP_PING           1u
+#define ASX_OP_EXEC           2u
+#define ASX_OP_WRITE_FILE     3u
+#define ASX_OP_READ_FILE      4u
+#define ASX_FLAG_TIMED_OUT      0x1u
+#define ASX_FLAG_OUT_TRUNCATED  0x2u
+#define ASX_FLAG_ERR_TRUNCATED  0x4u
+#define ASX_STATUS_OK           0u
+#define ASX_STATUS_BAD_REQUEST  1u
+#define ASX_STATUS_UNSUPPORTED  2u
+#define ASX_STATUS_TOO_LARGE    3u
+#define ASX_STATUS_OS_ERROR     4u
+#define ASX_MAX_STRING        32768u
+#define ASX_MAX_OUTPUT        (4u * 1024 * 1024)
+
+#pragma pack(push, 1)
+typedef struct {
+    uint32_t magic, version, op, flags, timeout_ms, limit, a_len, b_len;
+    uint64_t data_len;
+} asx_request_t;
+typedef struct {
+    uint32_t magic, version, status, os_error, exit_code, flags, text_len, out_len, err_len, reserved;
+    uint64_t total;
+} asx_response_t;
+#pragma pack(pop)
+typedef char asx_check_request[sizeof(asx_request_t) == 40 ? 1 : -1];
+typedef char asx_check_response[sizeof(asx_response_t) == 48 ? 1 : -1];
+
+#define EXEC_MAX_CONNECTIONS  16
+#define EXEC_DEFAULT_TIMEOUT  60000u
+#define EXEC_IO_TIMEOUT_SEC   60
+#define EXEC_FILE_CHUNK       (256 * 1024)
+
+static int             g_exec_connections = 0;
+static pthread_mutex_t g_exec_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int exec_recv_all(int fd, void *buf, size_t len)
+{
+    char *p = buf;
+    while (len > 0) {
+        ssize_t n = recv(fd, p, len, 0);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; len -= (size_t)n;
+    }
+    return 0;
+}
+
+static int exec_send_all(int fd, const void *buf, size_t len)
+{
+    const char *p = buf;
+    while (len > 0) {
+        ssize_t n = send(fd, p, len, MSG_NOSIGNAL);
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) return -1;
+        p += n; len -= (size_t)n;
+    }
+    return 0;
+}
+
+/* Read and drop len bytes the host is still sending. */
+static void exec_discard(int fd, uint64_t len)
+{
+    char scratch[4096];
+    while (len > 0) {
+        size_t want = len > sizeof(scratch) ? sizeof(scratch) : (size_t)len;
+        if (exec_recv_all(fd, scratch, want) < 0) return;
+        len -= want;
+    }
+}
+
+/* Send a response without EXEC output or file data. */
+static void exec_respond(int fd, uint32_t status, uint32_t os_error, const char *text)
+{
+    asx_response_t r;
+    memset(&r, 0, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.status = status; r.os_error = os_error;
+    r.text_len = text ? (uint32_t)strlen(text) : 0;
+    if (exec_send_all(fd, &r, sizeof(r)) == 0 && r.text_len)
+        exec_send_all(fd, text, r.text_len);
+}
+
+static void exec_respond_errno(int fd, const char *what, int err)
+{
+    char text[600];
+    snprintf(text, sizeof(text), "%s: %s (errno %d)", what, strerror(err), err);
+    exec_respond(fd, ASX_STATUS_OS_ERROR, (uint32_t)err, text);
+}
+
+static uint64_t exec_now_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000u + (uint64_t)ts.tv_nsec / 1000000u;
+}
+
+typedef struct {
+    int      fd;
+    char    *data;
+    uint32_t len, cap;
+    int      truncated;
+} exec_capture_t;
+
+/* Read what the pipe has; returns 0 at end of file. Bytes past the limit
+ * are read and dropped so the child never stalls. */
+static int exec_capture_read(exec_capture_t *cap)
+{
+    char scratch[4096];
+    ssize_t n;
+    if (cap->len < cap->cap) {
+        n = read(cap->fd, cap->data + cap->len, cap->cap - cap->len);
+        if (n > 0) cap->len += (uint32_t)n;
+    } else {
+        n = read(cap->fd, scratch, sizeof(scratch));
+        if (n > 0) cap->truncated = 1;
+    }
+    if (n < 0 && (errno == EINTR || errno == EAGAIN)) return 1;
+    return n > 0;
+}
+
+static void exec_run(int fd, const asx_request_t *req, const char *cmd, const char *cwd)
+{
+    int out_pipe[2] = { -1, -1 }, err_pipe[2] = { -1, -1 };
+    exec_capture_t out = { 0 }, err = { 0 };
+    uint32_t limit = req->limit ? req->limit : 65536;
+    uint32_t timeout = req->timeout_ms ? req->timeout_ms : EXEC_DEFAULT_TIMEOUT;
+    uint64_t deadline;
+    int status = 0, timed_out = 0, reaped = 0;
+    asx_response_t r;
+    pid_t pid;
+
+    if (!cmd[0]) {
+        exec_respond(fd, ASX_STATUS_BAD_REQUEST, 0, "the command must not be empty");
+        return;
+    }
+    if (limit > ASX_MAX_OUTPUT) limit = ASX_MAX_OUTPUT;
+    out.data = malloc(limit); err.data = malloc(limit);
+    out.cap = err.cap = limit;
+    if (!out.data || !err.data || pipe(out_pipe) < 0 || pipe(err_pipe) < 0) {
+        exec_respond_errno(fd, "preparing the command failed", errno ? errno : ENOMEM);
+        goto done;
+    }
+
+    pid = fork();
+    if (pid < 0) {
+        exec_respond_errno(fd, "starting the command failed", errno);
+        goto done;
+    }
+    if (pid == 0) {
+        int nul, i;
+        /* Own session and process group: the time limit ends the whole group. */
+        setsid();
+        nul = open("/dev/null", O_RDONLY);
+        if (nul >= 0) dup2(nul, 0);
+        dup2(out_pipe[1], 1);
+        dup2(err_pipe[1], 2);
+        for (i = 3; i < 1024; i++) close(i);
+        if (cwd[0] && chdir(cwd) < 0) {
+            dprintf(2, "cannot change to the working directory %s: %s\n", cwd, strerror(errno));
+            _exit(126);
+        }
+        execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+        _exit(127);
+    }
+    close(out_pipe[1]); out_pipe[1] = -1;
+    close(err_pipe[1]); err_pipe[1] = -1;
+    out.fd = out_pipe[0]; err.fd = err_pipe[0];
+
+    deadline = exec_now_ms() + timeout;
+    /* Read both pipes until they close (the command and everything it
+     * started are done) or the time limit passes. */
+    while (out.fd >= 0 || err.fd >= 0) {
+        struct pollfd pfd[2];
+        uint64_t now = exec_now_ms();
+        int n;
+        if (now >= deadline || g_stop) { timed_out = 1; break; }
+        pfd[0].fd = out.fd; pfd[0].events = POLLIN; pfd[0].revents = 0;
+        pfd[1].fd = err.fd; pfd[1].events = POLLIN; pfd[1].revents = 0;
+        n = poll(pfd, 2, (int)((deadline - now) < 500 ? (deadline - now) : 500));
+        if (n < 0 && errno != EINTR) break;
+        if (n <= 0) {
+            /* The command itself ended but something it left behind keeps
+             * the pipes open: do not wait for that. */
+            if (!reaped && waitpid(pid, &status, WNOHANG) == pid) reaped = 1;
+            if (reaped) break;
+            continue;
+        }
+        if (out.fd >= 0 && (pfd[0].revents & (POLLIN | POLLHUP | POLLERR)) && !exec_capture_read(&out)) out.fd = -1;
+        if (err.fd >= 0 && (pfd[1].revents & (POLLIN | POLLHUP | POLLERR)) && !exec_capture_read(&err)) err.fd = -1;
+    }
+    if (timed_out) {
+        kill(-pid, SIGKILL);
+        kill(pid, SIGKILL);
+    }
+    if (!reaped) {
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {}
+    }
+
+    memset(&r, 0, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.exit_code = WIFEXITED(status) ? (uint32_t)WEXITSTATUS(status)
+                : WIFSIGNALED(status) ? 128u + (uint32_t)WTERMSIG(status) : 255u;
+    if (timed_out) r.flags |= ASX_FLAG_TIMED_OUT;
+    if (out.truncated) r.flags |= ASX_FLAG_OUT_TRUNCATED;
+    if (err.truncated) r.flags |= ASX_FLAG_ERR_TRUNCATED;
+    r.out_len = out.len; r.err_len = err.len;
+    if (exec_send_all(fd, &r, sizeof(r)) == 0 &&
+        (!out.len || exec_send_all(fd, out.data, out.len) == 0) && err.len)
+        exec_send_all(fd, err.data, err.len);
+    agent_log("exec: exit %u%s, %u + %u bytes of output", r.exit_code,
+              timed_out ? " (time limit)" : "", out.len, err.len);
+
+done:
+    if (out_pipe[0] >= 0) close(out_pipe[0]);
+    if (out_pipe[1] >= 0) close(out_pipe[1]);
+    if (err_pipe[0] >= 0) close(err_pipe[0]);
+    if (err_pipe[1] >= 0) close(err_pipe[1]);
+    free(out.data); free(err.data);
+}
+
+static void exec_write_file(int fd, const asx_request_t *req, const char *path)
+{
+    char temp[4200], *chunk = malloc(EXEC_FILE_CHUNK);
+    uint64_t left = req->data_len;
+    int file = -1, err = 0;
+
+    /* A refusal is sent after the content has been read and dropped, so it
+     * reaches the host as an answer and not as a broken connection. */
+    if (path[0] != '/' || strlen(path) > 4000 || !chunk) {
+        exec_discard(fd, left);
+        exec_respond(fd, ASX_STATUS_BAD_REQUEST, 0,
+                     "the guest path must be a full path such as /root/driver.ko (at most 4000 bytes)");
+        goto done;
+    }
+    {
+        char dir[4200], *slash;
+        snprintf(dir, sizeof(dir), "%s", path);
+        slash = strrchr(dir, '/');
+        if (slash && slash != dir) { *slash = '\0'; mkpath_p(dir); }
+    }
+    snprintf(temp, sizeof(temp), "%s.asbpart", path);
+    file = open(temp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    if (file < 0) {
+        err = errno;
+        exec_discard(fd, left);
+        exec_respond_errno(fd, "creating the file in the guest failed", err);
+        goto done;
+    }
+    while (left > 0) {
+        size_t n = left > EXEC_FILE_CHUNK ? EXEC_FILE_CHUNK : (size_t)left, off = 0;
+        if (exec_recv_all(fd, chunk, n) < 0) { err = ECONNRESET; break; }
+        left -= n;
+        while (off < n) {
+            ssize_t w = write(file, chunk + off, n - off);
+            if (w < 0 && errno == EINTR) continue;
+            if (w <= 0) { err = errno ? errno : ENOSPC; break; }
+            off += (size_t)w;
+        }
+        if (err) { exec_discard(fd, left); break; }
+    }
+    close(file);
+    if (!err && rename(temp, path) < 0) err = errno;
+    if (err) {
+        unlink(temp);
+        if (err != ECONNRESET) exec_respond_errno(fd, "writing the file in the guest failed", err);
+        agent_log("exec: writing %s failed: %s", path, strerror(err));
+        goto done;
+    }
+    exec_respond(fd, ASX_STATUS_OK, 0, NULL);
+    agent_log("exec: wrote %s (%llu bytes)", path, (unsigned long long)req->data_len);
+done:
+    free(chunk);
+}
+
+static void exec_read_file(int fd, const asx_request_t *req, const char *path)
+{
+    char *chunk = malloc(EXEC_FILE_CHUNK);
+    struct stat st;
+    asx_response_t r;
+    uint64_t left;
+    int file = -1;
+
+    if (path[0] != '/' || !chunk) {
+        exec_respond(fd, ASX_STATUS_BAD_REQUEST, 0,
+                     "the guest path must be a full path such as /var/log/kern.log");
+        goto done;
+    }
+    file = open(path, O_RDONLY | O_CLOEXEC);
+    if (file < 0 || fstat(file, &st) < 0) {
+        exec_respond_errno(fd, "opening the file in the guest failed", errno);
+        goto done;
+    }
+    if (!S_ISREG(st.st_mode)) {
+        exec_respond(fd, ASX_STATUS_BAD_REQUEST, 0, "the guest path is not a regular file");
+        goto done;
+    }
+    memset(&r, 0, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.total = (uint64_t)st.st_size;
+    if (r.total > req->data_len) {
+        r.status = ASX_STATUS_TOO_LARGE;
+        exec_send_all(fd, &r, sizeof(r));
+        goto done;
+    }
+    if (exec_send_all(fd, &r, sizeof(r)) < 0) goto done;
+    /* The size is already promised: a short read is padded with zeros so
+     * the stream stays in step (the file shrank while it was read). */
+    for (left = r.total; left > 0; ) {
+        size_t n = left > EXEC_FILE_CHUNK ? EXEC_FILE_CHUNK : (size_t)left, got = 0;
+        while (got < n) {
+            size_t want = n - got;
+            ssize_t k;
+            if (want > EXEC_FILE_CHUNK) break;
+            k = read(file, chunk + got, want);
+            if (k < 0 && errno == EINTR) continue;
+            if (k <= 0) break;
+            got += (size_t)k;
+        }
+        if (got < n) memset(chunk + got, 0, n - got);
+        if (exec_send_all(fd, chunk, n) < 0) break;
+        left -= n;
+    }
+    agent_log("exec: read %s (%llu bytes)", path, (unsigned long long)r.total);
+done:
+    if (file >= 0) close(file);
+    free(chunk);
+}
+
+static void *exec_conn_proc(void *arg)
+{
+    int fd = (int)(intptr_t)arg;
+    struct timeval tv = { EXEC_IO_TIMEOUT_SEC, 0 };
+    asx_request_t req;
+    char *a = NULL, *b = NULL;
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    if (exec_recv_all(fd, &req, sizeof(req)) < 0 || req.magic != ASX_REQUEST_MAGIC) goto done;
+    if (req.version != ASX_VERSION || req.a_len > ASX_MAX_STRING || req.b_len > ASX_MAX_STRING) {
+        exec_respond(fd, ASX_STATUS_UNSUPPORTED, 0, "this guest agent does not support that request version");
+        goto done;
+    }
+    a = malloc((size_t)req.a_len + 1);
+    b = malloc((size_t)req.b_len + 1);
+    if (!a || !b || (req.a_len && exec_recv_all(fd, a, req.a_len) < 0) ||
+        (req.b_len && exec_recv_all(fd, b, req.b_len) < 0))
+        goto done;
+    a[req.a_len] = '\0'; b[req.b_len] = '\0';
+    if (strlen(a) != req.a_len || strlen(b) != req.b_len) {
+        exec_respond(fd, ASX_STATUS_BAD_REQUEST, 0, "the request holds a NUL byte");
+        goto done;
+    }
+
+    switch (req.op) {
+    case ASX_OP_PING:       exec_respond(fd, ASX_STATUS_OK, 0, "linux"); break;
+    case ASX_OP_EXEC:       exec_run(fd, &req, a, b); break;
+    case ASX_OP_WRITE_FILE: exec_write_file(fd, &req, a); break;
+    case ASX_OP_READ_FILE:  exec_read_file(fd, &req, a); break;
+    default:
+        exec_respond(fd, ASX_STATUS_UNSUPPORTED, 0,
+                     "this guest agent does not know that operation; update the guest components");
+        break;
+    }
+done:
+    free(a); free(b);
+    close(fd);
+    pthread_mutex_lock(&g_exec_lock);
+    g_exec_connections--;
+    pthread_mutex_unlock(&g_exec_lock);
+    return NULL;
+}
+
+static void *exec_listener_proc(void *arg)
+{
+    struct sockaddr_vm sa = {0};
+    int s = socket(AF_VSOCK, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    (void)arg;
+
+    if (s < 0) {
+        agent_log("command channel: socket(AF_VSOCK) failed: %s", strerror(errno));
+        return NULL;
+    }
+    sa.svm_family = AF_VSOCK;
+    sa.svm_cid    = VMADDR_CID_ANY;
+    sa.svm_port   = EXEC_VSOCK_PORT;
+    if (bind(s, (struct sockaddr *)&sa, sizeof(sa)) < 0 || listen(s, 8) < 0) {
+        agent_log("command channel: bind/listen vsock :%u failed: %s", EXEC_VSOCK_PORT, strerror(errno));
+        close(s);
+        return NULL;
+    }
+    agent_log("command channel: listening on AF_VSOCK :%u", EXEC_VSOCK_PORT);
+
+    while (!g_stop) {
+        struct pollfd pfd = { .fd = s, .events = POLLIN };
+        pthread_attr_t attr;
+        pthread_t t;
+        int c, busy;
+
+        if (poll(&pfd, 1, 1000) <= 0) continue;
+        c = accept4(s, NULL, NULL, SOCK_CLOEXEC);
+        if (c < 0) continue;
+
+        pthread_mutex_lock(&g_exec_lock);
+        busy = g_exec_connections >= EXEC_MAX_CONNECTIONS;
+        if (!busy) g_exec_connections++;
+        pthread_mutex_unlock(&g_exec_lock);
+        if (busy) {
+            exec_respond(c, ASX_STATUS_OS_ERROR, EBUSY,
+                         "too many commands are running in this VM; wait for one to finish");
+            close(c);
+            continue;
+        }
+        pthread_attr_init(&attr);
+        pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+        if (pthread_create(&t, &attr, exec_conn_proc, (void *)(intptr_t)c) != 0) {
+            close(c);
+            pthread_mutex_lock(&g_exec_lock);
+            g_exec_connections--;
+            pthread_mutex_unlock(&g_exec_lock);
+        }
+        pthread_attr_destroy(&attr);
+    }
+    close(s);
+    return NULL;
+}
+
+static void start_exec_listener(void)
+{
+    pthread_attr_t attr;
+    pthread_t t;
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    if (pthread_create(&t, &attr, exec_listener_proc, NULL) != 0)
+        agent_log("command channel: pthread_create failed: %s", strerror(errno));
+    pthread_attr_destroy(&attr);
+}
+
 /* ---- Main ---- */
 
 int main(int argc, char **argv)
@@ -1228,6 +1686,9 @@ int main(int argc, char **argv)
      * clients. It'll spawn the helper as soon as the user session is
      * ready, independent of host-driven idd_connect. */
     start_clipboard_monitor();
+
+    /* Guest command channel (run_command and file copy for the host's MCP tools) */
+    start_exec_listener();
 
     while (!g_stop) {
         int c = accept(ls, NULL, NULL);

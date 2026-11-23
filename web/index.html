@@ -272,6 +272,49 @@
             </div>
         </div>
     </div>
+    <h2 class="group-title win-only">AI agents (MCP)</h2>
+    <div class="card rows win-only collapsed" id="set-mcp">
+        <div class="row mcp-head">
+            <button type="button" class="mcp-toggle" id="mcp-expand" aria-expanded="false" aria-controls="mcp-body" onclick="toggleMcpDetails()">
+                <span class="collapse-arrow" aria-hidden="true">
+                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M6 9l6 6 6-6"></path></svg>
+                </span>
+                <span class="row-text"><span class="row-label">Let AI agents use App Sandbox</span><span class="muted small" id="mcp-status">Off</span></span>
+            </button>
+            <button type="button" class="switch" id="set-mcp-enabled" role="switch" aria-checked="false" aria-label="Let AI agents use App Sandbox" onclick="toggleMcp()"><span></span></button>
+        </div>
+        <div id="mcp-body" class="mcp-body" hidden>
+            <div class="row">
+                <div class="row-text"><span class="row-label">Connect an agent</span><span class="muted small">Copies a message to paste into the agent&rsquo;s chat (Claude Code, Codex, Claude Desktop&hellip;). It tells the agent what App Sandbox is and how to connect by itself.</span></div>
+                <button type="button" class="primary" onclick="copyMcp('prompt', this)">Copy prompt</button>
+            </div>
+            <div class="row">
+                <div class="row-text"><span class="row-label">Address</span><span class="muted small">Only programs on this PC can reach it. No token is needed.</span><span class="path-value" id="mcp-url"></span></div>
+                <button type="button" onclick="copyMcp('url', this)">Copy</button>
+            </div>
+            <div class="row mcp-setup">
+                <div class="row-text"><span class="row-label">Manual setup</span><span class="muted small" id="mcp-client-help"></span></div>
+                <div class="segmented" role="group" aria-label="Client" id="mcp-clients">
+                    <button type="button" data-mcp-client="claudeCode" onclick="setMcpClient('claudeCode')">Claude Code</button>
+                    <button type="button" data-mcp-client="codex" onclick="setMcpClient('codex')">Codex</button>
+                    <button type="button" data-mcp-client="claudeDesktop" onclick="setMcpClient('claudeDesktop')">Claude Desktop</button>
+                    <button type="button" data-mcp-client="other" onclick="setMcpClient('other')">Other</button>
+                </div>
+                <div class="mcp-snippet">
+                    <pre id="mcp-snippet" tabindex="0"></pre>
+                    <button type="button" onclick="copyMcp('snippet', this)">Copy</button>
+                </div>
+            </div>
+            <div class="row">
+                <div class="row-text"><span class="row-label">Read-only</span><span class="muted small">Agents can look (list VMs, status, logs, screenshots, crash info) but cannot create, start, stop or delete VMs, change snapshots, run commands or copy files.</span></div>
+                <button type="button" class="switch" id="set-mcp-readonly" role="switch" aria-checked="false" aria-label="Read-only" onclick="toggleMcpReadOnly()"><span></span></button>
+            </div>
+            <div class="row mcp-activity">
+                <div class="row-text"><span class="row-label">Recent activity</span><span class="muted small" id="mcp-last-client"></span></div>
+                <div class="mcp-calls" id="mcp-calls" role="log" aria-label="Recent MCP calls"></div>
+            </div>
+        </div>
+    </div>
     <h2 class="group-title">This computer</h2>
     <div class="card rows" id="set-host"></div>
     <h2 class="group-title win-only">Folders and logs</h2>

@@ -45,7 +45,16 @@ static const GUID INPUT_SERVICE_GUID =
 #define DEFAULT_WIDTH       1920
 #define DEFAULT_HEIGHT      1080
 #define MAX_DIRTY_RECTS     64
-#define MAX_FRAME_DATA_SIZE (DEFAULT_WIDTH * DEFAULT_HEIGHT * 4)
+/* Largest frame accepted (7680x4320 BGRA); the receive buffer grows to the
+   frames that actually arrive. */
+#define MAX_FRAME_DATA_SIZE (7680u * 4320u * 4u)
+
+/* Messages of newer display drivers that this reader only skips (see
+   src/core/asb_display_protocol.h). It never asks for them, but a driver may
+   still send its status. */
+#define HELLO_MAGIC         0x48565341  /* "ASVH": 16 bytes */
+#define PERF_STATUS_MAGIC   0x53505341  /* "ASPS": 16 bytes */
+#define VIDEO_MAGIC         0x45565341  /* "ASVE": 32-byte header + size bytes */
 
 /* ---- Input protocol ---- */
 
@@ -110,6 +119,7 @@ struct AsbDisplay {
     volatile BOOL    frame_dirty;
     volatile BOOL    has_frame;
     volatile SOCKET  input_socket;
+    volatile SOCKET  frame_socket;   /* so disconnect can unblock a waiting recv */
     HANDLE           recv_thread;
     volatile BOOL    stop;
     volatile BOOL    connected;
@@ -207,11 +217,12 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
     AsbDisplay *d = (AsbDisplay *)param;
     WSADATA wsa;
     BYTE *recv_buf = NULL;
+    UINT32 recv_cap = DEFAULT_WIDTH * DEFAULT_HEIGHT * 4;
     SOCKET input_s = INVALID_SOCKET;
 
     WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, MAX_FRAME_DATA_SIZE);
+    recv_buf = (BYTE *)HeapAlloc(GetProcessHeap(), 0, recv_cap);
     if (!recv_buf) return 1;
 
     while (!d->stop) {
@@ -250,6 +261,7 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
             continue;
         }
 
+        d->frame_socket = s;
         d->connected = TRUE;
 
         /* Receive loop */
@@ -283,6 +295,25 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                 continue;
             }
 
+            if (magic == HELLO_MAGIC || magic == PERF_STATUS_MAGIC) {
+                UINT32 rest[3];
+                if (!recv_exact(s, rest, sizeof(rest))) break;
+                continue;
+            }
+            if (magic == VIDEO_MAGIC) {
+                /* Encoded video is not decoded here; drop the access unit. */
+                UINT32 rest[7], left;
+                if (!recv_exact(s, rest, sizeof(rest))) break;
+                if (rest[4] > 64u * 1024 * 1024) break;   /* no access unit is that large */
+                for (left = rest[4]; left > 0; ) {
+                    UINT32 n = left > recv_cap ? recv_cap : left;
+                    if (!recv_exact(s, recv_buf, (int)n)) break;
+                    left -= n;
+                }
+                if (left) break;
+                continue;
+            }
+
             if (magic != FRAME_MAGIC) break;
 
             hdr.magic = magic;
@@ -307,6 +338,13 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
                 break;
 
             if (data_size > MAX_FRAME_DATA_SIZE) break;
+            if (data_size > recv_cap) {
+                BYTE *grown = (BYTE *)HeapAlloc(GetProcessHeap(), 0, data_size);
+                if (!grown) break;
+                HeapFree(GetProcessHeap(), 0, recv_buf);
+                recv_buf = grown;
+                recv_cap = data_size;
+            }
 
             if (data_size > 0) {
                 if (!recv_exact(s, recv_buf, (int)data_size))
@@ -409,6 +447,8 @@ static DWORD WINAPI display_recv_thread(LPVOID param)
             }
         }
 
+        /* Claim the socket first: asb_display_disconnect may be shutting it down. */
+        InterlockedExchangePointer((PVOID volatile *)&d->frame_socket, (PVOID)INVALID_SOCKET);
         closesocket(s);
         d->connected = FALSE;
     }
@@ -445,6 +485,7 @@ ASB_API AsbDisplay *asb_display_connect(AsbVm vm)
     d->runtime_id = inst->runtime_id;
     wcsncpy_s(d->os_type, 32, inst->os_type, _TRUNCATE);
     d->input_socket = INVALID_SOCKET;
+    d->frame_socket = INVALID_SOCKET;
     InitializeCriticalSection(&d->frame_cs);
 
     d->recv_thread = CreateThread(NULL, 0, display_recv_thread, d, 0, NULL);
@@ -463,7 +504,13 @@ ASB_API void asb_display_disconnect(AsbDisplay *disp)
 
     disp->stop = TRUE;
     if (disp->recv_thread) {
-        WaitForSingleObject(disp->recv_thread, 5000);
+        /* Wake a recv that is waiting for the next frame; the thread closes
+           the socket itself. It is never left running: the handle is freed
+           below. (Its longest waits are the 3 s connect and the 5 s receive
+           timeout.) */
+        SOCKET s = disp->frame_socket;
+        if (s != INVALID_SOCKET) shutdown(s, SD_BOTH);
+        WaitForSingleObject(disp->recv_thread, INFINITE);
         CloseHandle(disp->recv_thread);
     }
 
@@ -524,8 +571,8 @@ ASB_API void asb_display_mouse_click(AsbDisplay *disp, UINT x, UINT y, int butto
     if (!disp) return;
     /* Move to position, then press + release */
     send_input(disp, INPUT_MOUSE_MOVE, x, y, 0);
-    send_input(disp, INPUT_MOUSE_BUTTON, x, y, (UINT32)((button & 0xFF) | (1 << 8)));  /* down */
-    send_input(disp, INPUT_MOUSE_BUTTON, x, y, (UINT32)(button & 0xFF));                /* up */
+    send_input(disp, INPUT_MOUSE_BUTTON, (UINT32)button, 1, 0);   /* down */
+    send_input(disp, INPUT_MOUSE_BUTTON, (UINT32)button, 0, 0);   /* up */
 }
 
 ASB_API void asb_display_mouse_wheel(AsbDisplay *disp, int delta)
@@ -538,16 +585,33 @@ ASB_API void asb_display_mouse_button(AsbDisplay *disp, UINT x, UINT y,
                                        int button, BOOL down)
 {
     if (!disp) return;
-    send_input(disp, INPUT_MOUSE_BUTTON, x, y,
-               (UINT32)((button & 0xFF) | (down ? (1 << 8) : 0)));
+    /* The button packet has no position: param1 = button, param2 = down. */
+    send_input(disp, INPUT_MOUSE_MOVE, x, y, 0);
+    send_input(disp, INPUT_MOUSE_BUTTON, (UINT32)button, down ? 1 : 0, 0);
 }
 
 /* ---- Keyboard input ---- */
 
+/* INPUT_KEY: param1 = virtual key, param2 = scan code, param3 = flags
+   (1 = extended key, 2 = key up); see src/core/protocol.h. */
+static void send_key(AsbDisplay *disp, UINT vk, BOOL down)
+{
+    UINT scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC);
+    UINT flags = down ? 0 : 2;
+    switch (vk) {
+    case VK_LEFT: case VK_RIGHT: case VK_UP: case VK_DOWN: case VK_HOME: case VK_END:
+    case VK_PRIOR: case VK_NEXT: case VK_INSERT: case VK_DELETE: case VK_LWIN: case VK_RWIN:
+    case VK_APPS: case VK_RCONTROL: case VK_RMENU: case VK_DIVIDE: case VK_NUMLOCK: case VK_SNAPSHOT:
+        flags |= 1;
+        break;
+    }
+    send_input(disp, INPUT_KEY, vk, scan, flags);
+}
+
 ASB_API void asb_display_key(AsbDisplay *disp, UINT vk, BOOL down)
 {
     if (!disp) return;
-    send_input(disp, INPUT_KEY, vk, down ? 1 : 0, 0);
+    send_key(disp, vk, down);
 }
 
 ASB_API void asb_display_type_text(AsbDisplay *disp, const wchar_t *text)
@@ -562,10 +626,10 @@ ASB_API void asb_display_type_text(AsbDisplay *disp, const wchar_t *text)
 
         if (vk_info == -1) continue; /* no mapping for this character */
 
-        if (shift) send_input(disp, INPUT_KEY, VK_SHIFT, 1, 0);
-        send_input(disp, INPUT_KEY, vk, 1, 0);
-        send_input(disp, INPUT_KEY, vk, 0, 0);
-        if (shift) send_input(disp, INPUT_KEY, VK_SHIFT, 0, 0);
+        if (shift) send_key(disp, VK_SHIFT, TRUE);
+        send_key(disp, vk, TRUE);
+        send_key(disp, vk, FALSE);
+        if (shift) send_key(disp, VK_SHIFT, FALSE);
 
         Sleep(10); /* small delay between keystrokes */
     }

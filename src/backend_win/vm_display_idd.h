@@ -61,6 +61,17 @@ BOOL vm_display_idd_set_bitrate(VmDisplayIdd *display, const wchar_t *vhdx_path,
 BOOL vm_display_idd_hevc_supported(void);
 /* Codec being received (L"H.264"/L"HEVC"), NULL when not in video mode. */
 const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display);
+/* A copy of the picture the open window is showing, as BGRA rows (free it
+   with free()). NULL when there is none: *why is 1 while the guest sends
+   GPU video (the window then holds no CPU copy of the picture), 0 when the
+   window is closed or has no frame yet. Any thread. */
+BYTE *vm_display_idd_copy_frame(VmDisplayIdd *display, UINT *width, UINT *height,
+                                UINT *stride, int *why);
+/* Send `count` input packets (InputPacket, src/core/protocol.h) to the guest
+   over the open window's input connection, without waiting. Returns how
+   many were sent (fewer when the connection's buffer is full: send the rest
+   a moment later), -1 when the window has no input connection. Any thread. */
+int vm_display_idd_send_packets(VmDisplayIdd *display, const void *packets, int count);
 /* Settings > VM windows changed: refresh title and toolbar. */
 void vm_display_idd_prefs_changed(VmDisplayIdd *display);
 /* The VM's custom icon (icon.ico beside its disk) changed. */

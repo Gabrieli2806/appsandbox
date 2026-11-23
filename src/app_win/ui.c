@@ -9,6 +9,7 @@
 #include "asb_core.h"
 #include "asb_events.h"
 #include "headless.h"
+#include "mcp.h"
 #include "resource.h"
 #include "hcs_vm.h"
 #include "hcn_network.h"
@@ -1629,6 +1630,23 @@ BOOL ui_display_is_open(UINT64 id)
             return vm_display_idd_is_open(g_idd_displays[i]);
     return FALSE;
 }
+int ui_display_send_packets(UINT64 id, const void *packets, int count)
+{
+    int i;
+    for (i = 0; i < ASB_MAX_VMS; ++i)
+        if (g_display_vm_ids[i] == id && g_idd_displays[i])
+            return vm_display_idd_send_packets(g_idd_displays[i], packets, count);
+    return -1;
+}
+BYTE *ui_display_copy_frame(UINT64 id, UINT *width, UINT *height, UINT *stride, int *why)
+{
+    int i;
+    *why = 0;
+    for (i = 0; i < ASB_MAX_VMS; ++i)
+        if (g_display_vm_ids[i] == id && g_idd_displays[i])
+            return vm_display_idd_copy_frame(g_idd_displays[i], width, height, stride, why);
+    return NULL;
+}
 BOOL ui_display_open(UINT64 id)
 {
     VmInstance *vm;
@@ -2680,7 +2698,7 @@ static BOOL action_is_passive(const wchar_t *action)
     static const wchar_t *const passive[] = {
         L"uiReady", L"getState", L"setMinSize", L"selectVm", L"getVmIcon", L"getDiskSpace",
         L"openFolder", L"openVmFolder", L"copyVmPath", L"copyDiagnostics", L"openLink",
-        L"showDocument", L"dismissVmError", L"cancelExit"
+        L"showDocument", L"dismissVmError", L"cancelExit", L"getMcpStatus"
     };
     int i;
     for (i = 0; i < (int)ARRAYSIZE(passive); i++)
@@ -2740,6 +2758,22 @@ static void start_vm_op(BgOpKind kind, UINT64 id)
 {
     if (!bg_op_start_one(kind, id))
         ui_notice(L"info", L"Another VM operation is still running. Try again in a moment.");
+}
+
+/* Settings > AI agents (MCP): {"type":"mcpStatus","mcp":{...}} (mcp_status_json). */
+static void send_mcp_status(void)
+{
+    char *status = mcp_status_json();
+    int chars = status ? MultiByteToWideChar(CP_UTF8, 0, status, -1, NULL, 0) : 0;
+    wchar_t *message = chars > 0 ? malloc(((size_t)chars + 40) * sizeof(wchar_t)) : NULL;
+    if (message) {
+        wcscpy_s(message, (size_t)chars + 40, L"{\"type\":\"mcpStatus\",\"mcp\":");
+        MultiByteToWideChar(CP_UTF8, 0, status, -1, message + wcslen(message), chars);
+        wcscat_s(message, (size_t)chars + 40, L"}");
+        webview2_post(message);
+    }
+    free(message);
+    free(status);
 }
 
 static void handle_webview2_message(const wchar_t *json)
@@ -3248,6 +3282,19 @@ static void handle_webview2_message(const wchar_t *json)
         asb_set_auto_update_guest_tools(enabled);
         asb_save();
         send_host_info();
+    } else if (wcscmp(action, L"getMcpStatus") == 0) {
+        send_mcp_status();
+    } else if (wcscmp(action, L"setMcpEnabled") == 0 || wcscmp(action, L"setMcpReadOnly") == 0) {
+        /* {enabled} / {readOnly} from Settings > AI agents (MCP); applies at once. */
+        BOOL value = FALSE;
+        if (g_prereq_ok) {
+            if (action[6] == L'E') {
+                if (json_get_bool(json, L"enabled", &value)) mcp_set_enabled(value, TRUE);
+            } else if (json_get_bool(json, L"readOnly", &value)) {
+                mcp_set_read_only(value, TRUE);
+            }
+        }
+        send_mcp_status();
     } else if (wcscmp(action, L"setCloseBehavior") == 0) {
         /* {toTray: true} = hide to the tray without asking; false = ask. */
         BOOL to_tray = FALSE;

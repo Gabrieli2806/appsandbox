@@ -409,6 +409,33 @@ body {
 .switch[aria-checked="true"] { background: var(--accent); justify-content: flex-end; }
 .switch[aria-checked="true"] span { background: var(--on-accent); }
 
+/* Settings > AI agents (MCP): one row that unfolds */
+.mcp-toggle {
+    flex: 1; min-width: 0; height: auto; padding: 0; gap: 10px; justify-content: flex-start;
+    background: transparent; border: none; color: inherit; text-align: left; font-weight: 400;
+    white-space: normal;
+}
+#mcp-status.error-text { color: var(--danger-text); }
+.mcp-toggle:hover:not(:disabled) { background: transparent; }
+.mcp-toggle .collapse-arrow { color: var(--text-dim); flex: none; }
+.mcp-toggle .row-text { margin-right: 0; }
+.mcp-head { border-bottom: none; }
+.mcp-body { border-top: 1px solid var(--border); padding-left: 24px; }
+.mcp-body .row > .row-text { flex: 1 1 300px; }
+.mcp-setup .segmented { align-self: auto; }
+.mcp-snippet { flex-basis: 100%; display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.mcp-snippet pre {
+    flex: 1; min-width: 0; margin: 0; font-family: var(--mono); font-size: 12px; line-height: 1.5;
+    white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; color: var(--text);
+    background: var(--field); border: 1px solid var(--border); border-radius: var(--radius); padding: 9px 12px;
+}
+.mcp-calls {
+    flex-basis: 100%; max-height: 190px; overflow-y: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.7; color: var(--text-dim); user-select: text;
+}
+.mcp-calls:empty { display: none; }
+.mcp-calls .failed { color: var(--danger-text); }
+
 .swatches { display: flex; gap: 10px; }
 .swatch {
     width: 34px; height: 34px; padding: 0; border-radius: 50%;

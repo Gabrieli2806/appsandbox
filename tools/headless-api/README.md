@@ -361,6 +361,74 @@ subprocess.run(["ssh", "-i", asb.key_path(), "-p", str(i["port"]),
 
 ---
 
+## MCP server for AI agents
+
+The Windows host also serves a [Model Context Protocol](https://modelcontextprotocol.io)
+endpoint, so an AI agent can use App Sandbox directly — no SDK, no token:
+
+| | |
+|---|---|
+| Server name | `appsandbox` |
+| Address | `http://127.0.0.1:47841/mcp` (Streamable HTTP; only reachable from this PC) |
+| Turn it on | App: **Settings → AI agents (MCP)**. Daemon: `AppSandbox.exe --headless --mcp` (or `--mcp-read-only`). Off by default. |
+| Claude Code | `claude mcp add --transport http --scope user appsandbox http://127.0.0.1:47841/mcp` |
+| Codex | `codex mcp add appsandbox --url http://127.0.0.1:47841/mcp` |
+| Claude Desktop | `{"mcpServers":{"appsandbox":{"command":"npx","args":["-y","mcp-remote","http://127.0.0.1:47841/mcp"]}}}` |
+| Other clients | `{"mcpServers":{"appsandbox":{"type":"http","url":"http://127.0.0.1:47841/mcp"}}}` |
+
+The lifecycle tools are the REST routes above, called in-process. Every VM
+argument is `vm`: the VM's name or id.
+
+| Tool | What it does |
+|---|---|
+| `list_vms` | Every VM with its state. Call it first. |
+| `get_vm` | One VM: state, install progress, agent online, IP, GPU, test mode, outdated guest components, last guest crash. |
+| `get_host` | Cores, RAM, free disk, GPUs, templates, app version. |
+| `create_vm` | New VM from an ISO or a template (`test_mode` for test-signed drivers). |
+| `start_vm`, `shutdown_vm`, `stop_vm`, `delete_vm` | Boot, clean shutdown, power off, delete. |
+| `wait_for_vm` | Blocks up to 100 s until `online`, `stopped` or `restart` (offline and back online). |
+| `restart_vm` | Reboots the guest OS and waits until its agent is back. |
+| `run_command` | Runs a command in the guest as SYSTEM (cmd, PowerShell or direct) or root (sh); exit code, stdout, stderr. Through the guest agent: no network or SSH needed. `desktop` runs it as the signed-in user in their desktop session (so it can show windows; `elevated` for their administrator rights). |
+| `copy_to_guest` | Writes a guest file from a host file (up to 4 GB) or inline content. |
+| `copy_from_guest` | Copies a guest file to `Downloads\App Sandbox\<vm>` on the host and returns the path. |
+| `install_driver` | One call: copies a driver package (.inf folder, or a legacy .sys) from the host, checks test signing / Secure Boot / signatures, trusts the test certificate, runs `pnputil /add-driver /install` (or `sc create`), returns the published name and the devices with their problem codes. Warns when the VM has no snapshot. |
+| `uninstall_driver` | `pnputil /delete-driver oemNN.inf /uninstall /force`, or stops and deletes a legacy driver service. |
+| `get_devices` | Devices with their problem codes (by default only the failing ones) and the third-party driver packages. |
+| `get_debug_output` | A driver's DbgPrint / KdPrint text without a kernel debugger: `start`, `read` (lines since the last read), `stop`. Captures what passes the debug print filter (`DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL, …)` always does; plain DbgPrint needs `enable_filter` and a restart). `providers` traces ETW / WPP providers into an .etl. |
+| `set_verifier` | Driver Verifier for named drivers (`standard`, `custom` flags, `reset`, `query`), optionally restarting the guest. |
+| `get_guest_crash` | Windows: recorded bugchecks (code and parameters), unexpected shutdowns, dump files, last boot. Linux: kernel errors and `/var/crash`. |
+| `analyze_dump` | `!analyze -v` on a guest dump (default: the newest minidump): bugcheck code and arguments, faulting module / symbol, stack. Runs cdb.exe / kd.exe on the host, non-elevated; needs the Debugging Tools for Windows (or uses a debugger in the guest). `symbol_path` adds your .pdb folder. |
+| `screenshot` | The guest's screen as a PNG, with the VM's window open or closed (falls back to a copy made inside the guest). |
+| `send_input` | Types text, presses keys or chords, clicks or moves the mouse at x,y, scrolls. |
+| `list_snapshots`, `take_snapshot`, `restore_snapshot`, `delete_snapshot` | Snapshot tree; take (VM stopped); start from a snapshot on a new branch; delete. |
+| `ssh_info` | Host, port and user of the SSH proxy. |
+| `open_display`, `close_display` | The VM's window on the host desktop. |
+| `get_log` | Recent lines of App Sandbox's activity log, optionally for one VM. |
+
+**Read-only** (Settings, or `--mcp-read-only`) leaves only `list_vms`, `get_vm`,
+`get_host`, `wait_for_vm`, `get_devices`, `get_guest_crash`, `screenshot`,
+`list_snapshots`, `ssh_info` and `get_log`.
+
+Two prompts (slash commands in Claude Code): `test_driver` (vm, driver) and
+`new_test_vm` (vm).
+
+Testing a driver with an agent: create the VM with `test_mode`, shut it down,
+`take_snapshot`, start it; then loop `get_debug_output` start →
+`install_driver` → `run_command` (exercise it) and `get_debug_output` read →
+`set_verifier` / `restart_vm` → `get_guest_crash` and `analyze_dump` when the
+guest crashed → `stop_vm`, `restore_snapshot`. No tool snapshots a running VM:
+snapshots need it stopped.
+
+Security: the server has no token and listens on 127.0.0.1 only, so every
+program of every user signed in on this PC can use it while it is on. Host
+files are read and written, and the debugger is run, with the app user's
+non-elevated rights; files from a guest go only to `Downloads\App Sandbox`.
+
+The guest tools need a guest agent with the command channel. Windows VMs get
+it with the guest-components update before their next start; Linux VMs need
+to be created with this version. Tool calls that change something are written
+to the activity log (`MCP: …`).
+
 ## Examples
 
 Runnable scripts in [`examples/`](examples):

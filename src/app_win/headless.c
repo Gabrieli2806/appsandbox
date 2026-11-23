@@ -20,6 +20,7 @@
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
 #include "asb_paths.h"         /* data folder, single-instance lock */
+#include "mcp.h"               /* MCP endpoint for AI agents, served from the same request queue */
 
 #pragma comment(lib, "httpapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -325,10 +326,20 @@ typedef struct {
     char *response;
     int stop;
     HANDLE done;
+    void (*fn)(void *);      /* asb_api_run: call this instead of handling a request */
+    void *fn_arg;
 } ApiCall;
+/* The call whose answer is being captured instead of sent (send_response),
+   and the thread that handles it: the window thread in the app, the calling
+   thread in the headless daemon. */
 static ApiCall *g_gui_call;
+static DWORD g_call_thread;
+/* Headless daemon: one request is handled at a time (handle_request's buffer
+   and the core calls it makes are not re-entrant). The app uses its window
+   thread for that instead. */
+static CRITICAL_SECTION g_direct_cs;
 
-BOOL asb_api_busy(void) { return GetCurrentThreadId() == g_gui_thread && g_gui_call != NULL; }
+BOOL asb_api_busy(void) { return g_gui_call != NULL && GetCurrentThreadId() == g_call_thread; }
 
 static void send_response(HTTP_REQUEST_ID reqId, USHORT status, const char *reason,
                           const char *ctype, const char *body)
@@ -1382,14 +1393,172 @@ LRESULT asb_api_dispatch(void *opaque)
         call->status = g_stop_all ? 503 : 409;
         strcpy_s(call->reason, sizeof(call->reason), g_stop_all ? "Service Unavailable" : "Conflict");
         call->response = _strdup("{\"error\":{\"code\":\"busy\",\"message\":\"Application is busy; retry the request.\"}}");
+    } else if (call->fn) {
+        call->fn(call->fn_arg);
+        call->status = 200;
     } else {
         g_gui_call = call;
+        g_call_thread = GetCurrentThreadId();
         call->stop = handle_request(call->request);
         g_gui_call = NULL;
         ui_refresh_from_core();
     }
     SetEvent(call->done);
     return 0;
+}
+
+/* ---- In-process calls for the MCP layer (mcp.c) ----
+ * MCP tools are thin calls over the REST routes above, so each operation has
+ * one implementation: the request goes through handle_request with its answer
+ * captured, on the thread that handles REST requests. */
+
+/* Hand a call to the request context and wait for it. FALSE when it could
+   not be delivered (the app is closing). */
+static BOOL dispatch_call(ApiCall *call)
+{
+    if (g_gui_hwnd) {
+        call->done = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!call->done) return FALSE;
+        if (!PostMessageW(g_gui_hwnd, WM_ASB_API_REQUEST, 0, (LPARAM)call)) {
+            CloseHandle(call->done);
+            return FALSE;
+        }
+        WaitForSingleObject(call->done, INFINITE);
+        CloseHandle(call->done);
+        return TRUE;
+    }
+    EnterCriticalSection(&g_direct_cs);
+    if (g_stop_all) {
+        call->status = 503;
+    } else if (call->fn) {
+        call->fn(call->fn_arg);
+        call->status = 200;
+    } else {
+        g_gui_call = call;
+        g_call_thread = GetCurrentThreadId();
+        call->stop = handle_request(call->request);
+        g_gui_call = NULL;
+        g_call_thread = 0;
+    }
+    LeaveCriticalSection(&g_direct_cs);
+    return TRUE;
+}
+
+/* The app answers 409 "busy" while one of its own commands runs; those are
+   short, so wait for them instead of failing the tool call. */
+static BOOL call_was_busy(const ApiCall *call)
+{
+    return call->status == 409 && call->response && strstr(call->response, "\"code\":\"busy\"") != NULL;
+}
+
+BOOL asb_api_call(int method, const wchar_t *path, const wchar_t *body, int *status, char **response)
+{
+    static const HTTP_VERB verbs[] = { HttpVerbGET, HttpVerbPOST, HttpVerbPUT, HttpVerbDELETE };
+    char auth[64];
+    int attempt;
+
+    *status = 0; *response = NULL;
+    if (method < 0 || method >= (int)ARRAYSIZE(verbs) || (body && wcslen(body) >= 8192)) return FALSE;
+    sprintf_s(auth, sizeof(auth), "Bearer %s", g_token);
+    for (attempt = 0; attempt < 100 && !g_stop_all; attempt++) {
+        ApiCall *call = calloc(1, sizeof(*call));
+        HTTP_REQUEST *request = calloc(1, sizeof(*request));
+        BOOL delivered = FALSE;
+        if (call && request) {
+            request->Verb = verbs[method];
+            request->CookedUrl.pAbsPath = path;
+            request->Headers.KnownHeaders[HttpHeaderAuthorization].pRawValue = auth;
+            request->Headers.KnownHeaders[HttpHeaderAuthorization].RawValueLength = (USHORT)strlen(auth);
+            call->request = request;
+            call->valid_body = TRUE;
+            if (body) wcscpy_s(call->body, ARRAYSIZE(call->body), body);
+            delivered = dispatch_call(call);
+        }
+        if (delivered && !call_was_busy(call)) {
+            *status = call->status;
+            *response = call->response;
+            free(request); free(call);
+            return *status != 0;
+        }
+        if (call) free(call->response);
+        free(request); free(call);
+        if (!delivered) return FALSE;
+        Sleep(100);
+    }
+    return FALSE;
+}
+
+BOOL asb_api_run(void (*fn)(void *), void *arg)
+{
+    int attempt;
+    for (attempt = 0; attempt < 100 && !g_stop_all; attempt++) {
+        ApiCall *call = calloc(1, sizeof(*call));
+        BOOL delivered, ran;
+        if (!call) return FALSE;
+        call->fn = fn; call->fn_arg = arg;
+        delivered = dispatch_call(call);
+        ran = delivered && call->status == 200;
+        free(call->response);
+        free(call);
+        if (ran) return TRUE;
+        if (!delivered) return FALSE;
+        Sleep(100);
+    }
+    return FALSE;
+}
+
+void *asb_api_queue(void) { return g_req_queue; }
+BOOL asb_api_stopping(void) { return g_stop_all != 0; }
+const char *asb_api_product_version(void) { return ASB_PRODUCT_VER; }
+
+/* Serve (or stop serving) the MCP address on the request queue. Returns a
+   Win32 error; ERROR_SHARING_VIOLATION / ERROR_ALREADY_EXISTS mean another
+   program has the port. */
+DWORD asb_api_mcp_listen(BOOL on)
+{
+    static const wchar_t *const urls[] = {
+        L"http://127.0.0.1:" MCP_PORT_W L"/mcp/", L"http://localhost:" MCP_PORT_W L"/mcp/"
+    };
+    ULONG r;
+    if (!g_url_group) return ERROR_NOT_READY;
+    if (!on) {
+        HttpRemoveUrlFromUrlGroup(g_url_group, urls[0], 0);
+        HttpRemoveUrlFromUrlGroup(g_url_group, urls[1], 0);
+        hlog(L"MCP: stopped listening");
+        return NO_ERROR;
+    }
+    r = HttpAddUrlToUrlGroup(g_url_group, urls[0], 0, 0);
+    if (r != NO_ERROR) {
+        hlog(L"MCP: HttpAddUrlToUrlGroup %s failed (%lu)", urls[0], r);
+        return r;
+    }
+    /* So "Host: localhost" reaches this queue too; the address clients are
+       given is the 127.0.0.1 one. */
+    r = HttpAddUrlToUrlGroup(g_url_group, urls[1], 0, 0);
+    if (r != NO_ERROR) hlog(L"MCP: HttpAddUrlToUrlGroup %s failed (%lu); continuing", urls[1], r);
+    hlog(L"MCP: listening on %s", urls[0]);
+    return NO_ERROR;
+}
+
+/* Input packets through the VM's open display window (see
+   vm_display_idd_send_packets); -1 when it has none. Call inside asb_api_run. */
+int asb_api_display_send_packets(UINT64 vm_id, const void *packets, int count)
+{
+    DisplayEntry *e;
+    if (g_gui_hwnd) return ui_display_send_packets(vm_id, packets, count);
+    e = display_find(vm_id);
+    return e && e->disp ? vm_display_idd_send_packets(e->disp, packets, count) : -1;
+}
+
+/* The picture in the VM's open display window, if it has one (see
+   vm_display_idd_copy_frame). Call inside asb_api_run. */
+BYTE *asb_api_display_copy_frame(UINT64 vm_id, UINT *width, UINT *height, UINT *stride, int *why)
+{
+    DisplayEntry *e;
+    *why = 0;
+    if (g_gui_hwnd) return ui_display_copy_frame(vm_id, width, height, stride, why);
+    e = display_find(vm_id);
+    return e && e->disp ? vm_display_idd_copy_frame(e->disp, width, height, stride, why) : NULL;
 }
 
 static DWORD WINAPI api_thread(LPVOID unused)
@@ -1417,7 +1586,17 @@ static DWORD WINAPI api_thread(LPVOID unused)
             continue;
         if (rc != NO_ERROR) break;
         const wchar_t *path = req->CookedUrl.pAbsPath;
-        if (!g_gui_hwnd || !auth_ok(req) ||
+        /* The MCP address has its own port and rules (no token; Origin and
+           Host checks) and answers on worker threads. */
+        if (mcp_owns_request(req)) {
+            mcp_handle_http(req);
+            continue;
+        }
+        if (!g_gui_hwnd) {
+            EnterCriticalSection(&g_direct_cs);
+            stop = handle_request(req);
+            LeaveCriticalSection(&g_direct_cs);
+        } else if (!auth_ok(req) ||
             (req->Verb == HttpVerbGET && path &&
              (!wcscmp(path, L"/v1/version") || !wcscmp(path, L"/v1/events")))) {
             stop = handle_request(req);
@@ -1451,6 +1630,7 @@ BOOL asb_api_start(HINSTANCE instance, HWND owner)
         open_log();
         InitializeCriticalSection(&g_ev_cs);
         InitializeConditionVariable(&g_ev_cv);
+        InitializeCriticalSection(&g_direct_cs);
         g_api_initialized = TRUE;
     }
     g_stop_all = 0;
@@ -1464,6 +1644,7 @@ BOOL asb_api_start(HINSTANCE instance, HWND owner)
     g_server_thread = CreateThread(NULL, 0, api_thread, NULL, 0, NULL);
     if (!g_server_thread) { asb_api_stop(); return FALSE; }
     if (!write_discovery(port)) { asb_api_stop(); return FALSE; }
+    mcp_start();   /* listens only when the user turned it on in Settings */
     return TRUE;
 }
 
@@ -1478,6 +1659,13 @@ void asb_api_stop(void)
     LeaveCriticalSection(&g_ev_cs);
     delete_discovery();
     if (g_req_queue) HttpShutdownRequestQueue(g_req_queue);
+    /* MCP calls in flight end with "busy" once their next step reaches the
+       window thread, which the wait below keeps serving. */
+    while (!mcp_stop(10)) {
+        MSG msg;
+        while (g_gui_hwnd && PeekMessageW(&msg, g_gui_hwnd, WM_ASB_API_REQUEST, WM_ASB_API_REQUEST, PM_REMOVE))
+            DispatchMessageW(&msg);
+    }
     if (g_server_thread) {
         while (WaitForSingleObject(g_server_thread, 10) == WAIT_TIMEOUT) {
             MSG msg;
@@ -1502,10 +1690,10 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
 {
     HANDLE bt;
 
-    (void)cmdline;
     open_log();
     InitializeCriticalSection(&g_ev_cs);
     InitializeConditionVariable(&g_ev_cv);
+    InitializeCriticalSection(&g_direct_cs);
     g_api_initialized = TRUE;
     hlog(L"=== appsandbox --headless starting (pid %lu) ===", GetCurrentProcessId());
 
@@ -1551,6 +1739,15 @@ int run_headless(HINSTANCE hInst, const wchar_t *cmdline)
     if (!bt) { hlog(L"FATAL: bootstrap thread failed."); return 1; }
     while (!g_init_done) Sleep(25);
     hlog(L"core initialized + reconnected (%d VMs).", asb_vm_count());
+
+    /* --mcp turns the MCP server for AI agents on, --mcp-read-only on with
+       only the tools that change nothing; both are saved, like the switches
+       in the app's Settings. Without them the saved setting applies. */
+    if (cmdline && wcsstr(cmdline, L"--mcp")) {
+        asb_set_mcp_enabled(TRUE);
+        asb_set_mcp_read_only(wcsstr(cmdline, L"--mcp-read-only") != NULL);
+        asb_save();
+    }
 
     if (!asb_api_start(hInst, NULL)) { asb_cleanup(); return 1; }
     WaitForSingleObject(g_server_thread, INFINITE);

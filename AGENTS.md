@@ -20,9 +20,9 @@ everything else is C (C++ only where an API needs it).
 | `AppSandbox.sln` | Windows solution (Debug/Release × x64/ARM64) |
 | `AppSandbox.vcxproj` | `AppSandbox.exe`: GUI + `--headless` daemon. C (`CompileAsC`); `vm_video_decode.cpp` is per-file C++ |
 | `AppSandboxCore.vcxproj` | `appsandbox_core.dll`: VM orchestration (C, `ASB_BUILDING_DLL`) |
-| `src/app_win/` | `main.c` (entry, single instance, `--vm` shortcuts), `ui.c` (window, tray, WebView2 commands), `webview2_bridge.c`, `headless.c` (HTTP API) |
-| `src/backend_win/` | `asb_core.c` (orchestrator, `vms.cfg`), `hcs_vm.c` (HCS JSON, GPU-PV, Plan9 shares, hvsocket service table), `hcn_network.c`, `gpu_enum.c`, `disk_util.c` (new-VM staging), `guest_tools.c` (offline guest update), `snapshot.c`, `vm_agent.c` (agent channel), `vm_display_idd.c` (viewer window), `vm_video_decode.cpp` (H.264/HEVC decode), `vm_clipboard.c`, `vm_ssh_proxy.c`, `prereq.c` |
-| `src/core/` | Platform-neutral: `protocol.h` (input packets), `asb_events.*`, `asb_types.h`, `asb_vm_id.h` |
+| `src/app_win/` | `main.c` (entry, single instance, `--vm` shortcuts), `ui.c` (window, tray, WebView2 commands), `webview2_bridge.c`, `headless.c` (HTTP API), `mcp.c` (MCP server for AI agents, section 9) |
+| `src/backend_win/` | `asb_core.c` (orchestrator, `vms.cfg`), `hcs_vm.c` (HCS JSON, GPU-PV, Plan9 shares, hvsocket service table), `hcn_network.c`, `gpu_enum.c`, `disk_util.c` (new-VM staging), `guest_tools.c` (offline guest update), `snapshot.c`, `vm_agent.c` (agent channel), `vm_exec.c` (guest command channel: run a command, copy files), `asb_display.c` (frame reader without a window, used by the MCP screenshot), `vm_display_idd.c` (viewer window), `vm_video_decode.cpp` (H.264/HEVC decode), `vm_clipboard.c`, `vm_ssh_proxy.c`, `prereq.c` |
+| `src/core/` | Platform-neutral: `protocol.h` (input packets), `asb_display_protocol.h`, `asb_exec_protocol.h` (guest command channel), `asb_events.*`, `asb_types.h`, `asb_vm_id.h` |
 | `src/app_mac/`, `src/backend_mac/` | macOS app (Objective-C), `AppSandbox.xcodeproj` |
 | `web/` | `index.html`, `app.js`, `style.css` (one UI for both hosts) |
 | `tools/agent/` | Windows guest: `agent.c` (service `AppSandboxAgent`), `appsandbox-input.c` (SendInput + ViGEm gamepads), `appsandbox-displays.c`, clipboard, audio, `p9copy.c` |
@@ -72,16 +72,18 @@ Stale, ignore: `tools/agent/build.cmd`, `tools/agent/deploy.bat`, the
 ## 4. Host ↔ guest channels
 
 Hyper-V socket services `a5b0cafe-000N-4000-8000-000000000001` (Windows
-guests) / vsock port N (Linux guests), registered in `hcs_vm.c` (ports 1–6):
+guests) / vsock port N (Linux guests), registered in `hcs_vm.c` (ports 1–6;
+7 and 8 are not in the service table and work with HCS's defaults):
 
 | N | Channel | Format |
 |---|---|---|
-| 1 | Agent | newline text, optional `tag:` prefix. Guest→host: `hello`, `heartbeat`, `gpu_query`, `gpu_copy_*`, `idd_status:`, `hyperv_video:`, `displays:`, `log:<text>` (shown in the host log), `ssh_*`. Host→guest: `ping`, `shutdown`, `restart`, `gpu_query_response:`, `set_ip:`, `ssh_enable`, `idd_connect`, … |
+| 1 | Agent | newline text, optional `tag:` prefix. Guest→host: `hello`, `caps:<words>` (what the agent can do; `exec` = channel 8), `heartbeat`, `gpu_query`, `gpu_copy_*`, `idd_status:`, `hyperv_video:`, `displays:`, `log:<text>` (shown in the host log), `ssh_*`. Host→guest: `ping`, `shutdown`, `restart`, `gpu_query_response:`, `set_ip:`, `ssh_enable`, `idd_connect`, … |
 | 2 | Display (VDD) | binary, `tools/vdd/vdd.h` (mirrored in `vm_display_idd.c`) |
 | 3 | Input | 20-byte `InputPacket` (`src/core/protocol.h`) after an `IRDY` greeting |
 | 4 | Audio | `ASA1` header then length-prefixed PCM |
 | 5/6 | Clipboard host→guest / guest→host | `vm_clipboard.c` |
 | 7 | SSH | proxied TCP |
+| 8 | Command (exec) | `src/core/asb_exec_protocol.h`: one `ASXQ` request and one `ASXR` response per connection (ping, run a command, write a file, read a file). Guest agent listens (`tools/agent/agent.c`, `tools/linux/agent/appsandbox-agent.c`); host side is `vm_exec.c` |
 
 Display protocol (`VDD_PROTOCOL_VERSION`, currently 4), defined once in
 `src/core/asb_display_protocol.h` for the driver and the viewer:
@@ -104,9 +106,14 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
    host must gate on the version from `ASVH` (old drivers never answer
    `ASHQ`; after `HELLO_FRAME_GRACE` frames the host treats them as old).
    Unknown input types are ignored by older helpers — keep it that way.
+   The command channel (8) has a version in every message; a guest agent
+   older than the channel simply does not listen, and the host tells the
+   user to update the guest components.
 2. **Mirrored definitions are kept in sync by hand** (except the display
    protocol, which is one shared header): audio header (`appsandbox-audio.c` ↔ viewer);
-   clipboard (Windows host, Mac host, guests); `protocol.h` (shared).
+   clipboard (Windows host, Mac host, guests); `protocol.h` (shared);
+   `asb_exec_protocol.h` (shared by the host and the Windows agent, repeated
+   in the Linux agent, which builds from one file).
 3. **Guest-side changes need delivery.** New VMs get files from
    `disk_util.c`. Existing Windows VMs get the 6 helper exes and the VDD
    package from `guest_tools.c` (offline, VM stopped, signature in
@@ -127,7 +134,10 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
    `extern "C"` header and a per-file `<CompileAs>CompileAsCpp</CompileAs>`.
 7. **Elevation**: the app requires admin (HCS, http.sys). Do not add features
    that read or write host files on behalf of the guest without an explicit,
-   narrow user choice — the VM is untrusted.
+   narrow user choice — the VM is untrusted. The MCP file tools act for the
+   MCP client (a program of the user), never for the guest, and open host
+   files with the user's non-elevated rights (`impersonate_plain_user` in
+   `mcp.c`).
 8. **Fail soft.** Features like GPU video, HEVC, controllers fall back
    (raw frames, H.264, ignored packets) and say why in the log.
 
@@ -210,32 +220,179 @@ HCS waits made on it keep pumping messages.
 `vm-ids/{id}`. SDK: `tools/headless-api/asb.py`; full reference:
 `tools/headless-api/README.md`.
 
-## 9. Roadmap: MCP server (how to do it right)
+## 9. MCP server for AI agents
 
-Goal: let AI agents use App Sandbox as a disposable, GPU-capable sandbox.
+Lets an AI agent (Claude Code, Codex, Claude Desktop…) use App Sandbox as a
+disposable, GPU-capable sandbox — in particular to test drivers and other
+low-level things in a VM: copy a driver in, load it, see whether the guest
+bugchecked, read the result, go back to a snapshot, try again. It follows
+the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
+`python ..\tools\mcp-check.py appsandbox` checks it against the running app.
 
-- **Build it on the headless API**, not inside the GUI. Either a small
-  stdio MCP server (Python, reusing `asb.py`, shipped under
-  `tools/mcp/`) or a `--mcp` mode of `AppSandbox.exe` that speaks MCP over
-  stdio and calls the same core functions as `headless.c`. Prefer the Python
-  wrapper first: no new attack surface in the elevated process.
-- **Tools** (thin over existing routes): `list_vms`, `vm_status`,
-  `start_vm`, `shutdown_vm`, `stop_vm`, `take_snapshot`, `restore_snapshot`
-  (start from snapshot), `list_snapshots`, `ssh_info`, `wait_online`.
-- **New capabilities that need guest work** (add routes to `headless.c` and
-  agent commands first, then expose them):
-  - `run_command`: agent command on ch1 that runs a process in the guest and
-    returns exit code + output (size-capped, time-limited).
-  - `screenshot`: one frame from the viewer path (`asb_display.c` already
-    receives frames headless) encoded as PNG.
-  - `send_input` (keys, text, click at x,y) on ch3 via `asb_display.c`.
-  - `copy_file_in` / `copy_file_out`: restricted to one per-VM exchange
-    folder; never arbitrary host paths.
-- **Safety**: off by default (setting + explicit opt-in), loopback only,
-  token from `host.json`, per-tool permissions (read-only vs. control vs.
-  destructive), automatic snapshot before destructive actions, no host
-  file access outside the exchange folder, audit lines in the host log.
-- Document every tool in `tools/headless-api/README.md` and add an example.
+- **Endpoint**: `POST http://127.0.0.1:47841/mcp`, server name `appsandbox`.
+  Streamable HTTP, one JSON-RPC message per request, `application/json`
+  answers, no SSE, no sessions, no stdio. Legacy protocol versions
+  (`initialize`) and the stateless `2026-07-28` (`server/discover`,
+  `resultType`, `ttlMs`, `cacheScope`) on the same address.
+- **Off by default.** Settings → AI agents (MCP) turns it on (saved as
+  `McpEnabled` / `McpReadOnly` under `[Settings]` in `vms.cfg`); the daemon
+  takes `--headless --mcp` or `--headless --mcp-read-only`. The switch takes
+  effect at once: `mcp_set_enabled` adds or removes the address
+  (`http://127.0.0.1:47841/mcp/` and the `localhost` form) on the local
+  API's http.sys URL group. The port is fixed; if another program has it,
+  Settings says so.
+- **No token** (anything running as the user could read `host.json`
+  anyway). Web pages are kept out instead: `Host` must be `127.0.0.1`,
+  `localhost` or `[::1]` (403; http.sys itself does not check it), an
+  `Origin` that is not loopback is 403, a `Content-Type` other than
+  `application/json` is 415, `GET`/`DELETE` are 405. Never 401.
+- **Code**: `src/app_win/mcp.c` (HTTP checks, a small JSON reader — the flat
+  `json_get_*` scanners cannot read nested `params.arguments` —, JSON-RPC,
+  the tool table `g_tools`, `g_instructions`, recent activity for Settings).
+  `headless.c` only routes: `api_thread` hands requests that arrived on port
+  47841 to `mcp_handle_http`, which reads the body and answers on a worker
+  thread per request, so `wait_for_vm` or a ten-minute `run_command` never
+  blocks the window thread or other requests.
+- **One implementation per operation**: lifecycle tools call the REST routes
+  in-process with `asb_api_call` (same `handle_request`, same validation; the
+  answer is captured like the app's own API calls, on the window thread in
+  the app and under `g_direct_cs` in the daemon). `asb_api_run` runs a
+  function in that same context for the few things without a route.
+- **Tools** (`vm` is always the VM's name or id): `list_vms`, `get_vm`,
+  `get_host`, `create_vm`, `start_vm`, `shutdown_vm`, `stop_vm`, `delete_vm`,
+  `wait_for_vm` (until `online` / `stopped` / `restart`, at most 100 s per
+  call), `restart_vm`, `run_command`, `copy_to_guest`, `copy_from_guest`,
+  `install_driver`, `uninstall_driver`, `get_devices`, `get_debug_output`,
+  `set_verifier`, `get_guest_crash`, `analyze_dump`, `screenshot`,
+  `send_input`, `list_snapshots`, `take_snapshot`, `restore_snapshot` (start
+  from a snapshot on a new branch), `delete_snapshot`, `ssh_info`,
+  `open_display`, `close_display`, `get_log`. Read-only mode hides and
+  refuses every tool whose `changes` flag is set: it leaves `list_vms`,
+  `get_vm`, `get_host`, `wait_for_vm`, `get_devices`, `get_guest_crash`,
+  `screenshot`, `list_snapshots`, `ssh_info` and `get_log`.
+- **Prompts** (`prompts/list`, `prompts/get`; slash commands in Claude Code):
+  `test_driver` (vm, driver) and `new_test_vm` (vm), in `g_prompts`. They are
+  text for the agent to follow with the tools and run nothing themselves.
+- **Driver tools** run PowerShell scripts in the guest: sources in
+  `src/app_win/mcp_scripts/*.ps1`, turned into C strings in `mcp_scripts.h`
+  by `python tools/gen-mcp-scripts.py` (run it after editing a script;
+  `--check` tells whether the header is current). `guest_script` writes the
+  script and a JSON parameter file into `C:\Windows\Temp\AppSandbox` and
+  runs `powershell -File`; arguments never reach a command line. Each script
+  prints one JSON object.
+  - `install_driver`: copies the .inf's folder (or one .sys) to
+    `C:\Drivers\<name>`, reports test signing / Secure Boot / signatures,
+    trusts the signer in the guest (Root + TrustedPublisher), runs `pnputil
+    /add-driver /install` or `sc create` + `sc start`, returns the published
+    name and the devices with their problem codes. It warns when the VM has
+    no snapshot; it cannot take one, because snapshots need a stopped VM.
+  - `get_debug_output`: DbgPrint text through the NT Kernel Logger session
+    with `EVENT_TRACE_FLAG_DBGPRINT` (0x40000), written to an .etl; `read`
+    stops the session, decodes the file with `tracerpt` (XML) and starts it
+    again, so lines printed in that second are lost. Only output that passes
+    the Debug Print Filter is traced; `enable_filter` sets the registry
+    values (reboot needed). `providers` adds a second session for ETW / WPP
+    providers whose .etl `stop` returns. Linux: the end of `dmesg`.
+  - `set_verifier`: `verifier.exe /standard | /flags | /reset`, optional
+    restart. `restart_vm`: `shutdown /r` (or `systemctl reboot`) and a wait
+    for the agent to go offline and come back.
+  - `analyze_dump`: finds `cdb.exe` / `kd.exe` on the host (Windows Kits
+    Debuggers, PATH, the WinDbg app's folder), copies the dump out with the
+    `copy_from_guest` code and runs `-z <dump> -c "!analyze -v; q"` as the
+    non-elevated user (`run_plain_process`, symbol path in
+    `_NT_SYMBOL_PATH`, cache in `%LOCALAPPDATA%\AppSandbox\symbols`), then
+    picks the fields out of the text. Without a host debugger it uses one in
+    the guest; with none anywhere it says how to install one.
+- **send_input**: `InputPacket`s on channel 3. With the VM's window open
+  they go through the window's own input connection
+  (`vm_display_idd_send_packets`, a few at a time from the request context);
+  otherwise `asb_guest_send_input` (`vm_exec.c`) connects, waits for `IRDY`
+  and sends. Text becomes key presses with the host's keyboard layout
+  (`VkKeyScanW`): the guest helper has no Unicode packet. The result names
+  the window that had the focus (`foreground.ps1`, best effort).
+- **Guest tools** use the command channel (section 4, channel 8), not SSH and
+  not the control channel: `vm_exec.c` opens one Hyper-V socket connection
+  per call to the guest agent, which runs the command as SYSTEM (Windows:
+  `cmd.exe /c`, PowerShell through `-EncodedCommand`, or directly; in a job
+  object so the time limit ends the whole process tree) or root (Linux:
+  `/bin/sh -c` in its own process group), with stdout and stderr captured
+  separately and capped. File copies stream in 256 KiB chunks; the guest
+  writes to `<name>.asbpart` and renames. `copy_from_guest` saves only into
+  the user's `Downloads\App Sandbox\<vm>`; `copy_to_guest` reads a host path
+  with the user's non-elevated rights (rule 5.7). `get_guest_crash` runs a
+  fixed read-only script in the guest (bugcheck events 1001, Kernel-Power 41,
+  the dump files) and adds the agent's crash lines from the host log.
+- **Readiness of the command channel**: the agent's listener retries every
+  3 s for as long as the service runs (early in a warm restart the bind can
+  fail) and listens again when accept keeps failing. The agent announces
+  `caps:exec` on channel 1 after `hello` (`VmInstance.agent_caps`), so the
+  host can tell "not listening yet" (it retries for 12 s, then says so) from
+  "agent too old". `wait_for_vm`, `restart_vm` and `set_verifier`'s restart
+  report online only once a PING on the channel answers
+  (`command_channel_ready`).
+- **run_command with `desktop`**: `ASX_EXEC_AS_USER` runs the command with
+  the signed-in user's token (`WTSQueryUserToken`; `elevated` takes its
+  linked administrator token) and environment, outside the kill-on-close
+  job, so a program it starts stays open. The agent announces `user` in its
+  PING answer. `ASX_EXEC_DESKTOP` (SYSTEM in the user's session) is what the
+  screenshot and focused-window scripts use.
+- **Delivery of the guest side** (rule 5.3): the agent with the channel
+  reaches an existing Windows VM through the normal guest-components update
+  (before its next start when automatic updates are on); a VM whose agent is
+  older answers the tools with "update the guest components". Linux guests
+  build `appsandbox-agent.c` at install time from `ASB_SOURCE_REPO@REF`, so
+  only VMs created after the change is in that ref have the channel.
+- **screenshot**: with the VM's window open, a copy of the window's picture
+  (`vm_display_idd_copy_frame`; not available in performance mode, where the
+  window holds no CPU copy); otherwise `asb_display.c` connects to the frame
+  channel for a few seconds (a new frame connection starts in raw mode and
+  replaces any other reader, which is why the open window is never
+  bypassed). The driver only sends when the screen changes or when it still
+  holds a raw frame, so after a performance-mode window on a still desktop
+  nothing arrives. In both cases the fallback copies the screen inside the
+  guest: `screenshot.ps1` runs in the signed-in user's desktop session
+  (`ASX_EXEC_DESKTOP`; the agent announces it as `desktop` in its PING
+  answer) and the PNG is read back over the command channel. It cannot see
+  the sign-in or lock screen.
+- **Audit**: every call is kept in memory for Settings (last 50: time, tool,
+  VM, failed or not, and the last client's name); every call of a tool that
+  changes something also writes an `MCP: tool (vm) -> ok/failed` line to the
+  host log.
+- **Adding a tool**: write `tool_xxx(ToolCall *, const JVal *args)` in
+  `mcp.c` (answer with `result_json`, `result_text` or `result_error`; an
+  error text says what to do next), add its row to `g_tools` (title,
+  description for the model, flat input schema, the four annotations,
+  `changes`), mention it in `g_instructions` if it is part of a flow, list
+  it in `tools/headless-api/README.md`, and run `mcp-check.py`. If it needs
+  the guest, add an operation to `asb_exec_protocol.h` (old agents answer
+  `ASX_STATUS_UNSUPPORTED`) in both agents.
+- **Security** (the app is elevated, the endpoint has no token, the guest
+  is not trusted):
+  - Host files are opened, and the debugger is started, with a de-elevated
+    token (`plain_user_token`: Safer "normal user", medium integrity). There
+    is no fallback: when it cannot be made the operation is refused.
+  - Files from a guest land only in `Downloads\App Sandbox\<vm>`: the name
+    is reduced to a plain file name (no separators, `:`, device names), the
+    file is created with the user's rights and a reparse point in the way is
+    refused.
+  - Every length the guest sends on the command channel is checked before
+    use (`vm_exec.c`); the frame reader caps frame and access-unit sizes.
+  - Requests: Host / Origin / Content-Type are checked before the body is
+    read; body at most 8 MB; JSON depth 64 and 200 000 values; at most 32
+    requests in flight. The guest calls work on a copy of the VM's record
+    (`AsbGuestTarget`, filled in the request context), never on the core's
+    table.
+  - Text from the caller that reaches the host log (the VM name) has its
+    control characters removed.
+  - Accepted: any program of any user signed in on this PC can reach
+    127.0.0.1:47841 (the contract has no token), so with the server on they
+    can drive VMs and, through `copy_to_guest` + `run_command`, read files
+    the app's user can read. Turn the server off on a shared PC.
+- **Not done**: automatic snapshots (they need a stopped VM); Unicode text
+  in `send_input`; Ctrl+Alt+Del; export/import and VM edits; the macOS host
+  (`src/app_mac/headless.m` has no MCP endpoint, and the ivshmem transport
+  has no region for channel 8, so the Windows agent's command listener does
+  not start there).
 
 ## 10. Other roadmap items
 
@@ -321,6 +478,26 @@ agent. Keep it short and current.
   teardown; `Install-AppSandbox.ps1` installs its exact package. The host
   projects build locally with Build Tools 2026: add
   `/p:PlatformToolset=v145` (drivers still need the WDK, CI only).
+- **MCP server** (section 9): the lifecycle tools, `run_command`, the file
+  copies, `get_guest_crash` and the de-elevated host file access were
+  verified in the real app on a Windows 11 VM. Added after that and only
+  checked against a test harness (real `mcp.c` on http.sys, app and guest
+  stubbed; `vm_exec.c` against the agent's channel code over TCP): the
+  driver tools (`install_driver`, `uninstall_driver`, `get_devices`,
+  `set_verifier`, `get_debug_output`), `restart_vm`, `analyze_dump` (no
+  debugger was installed on the build PC), `send_input`, the prompts, and
+  the screenshot fallback inside the guest (needs the updated agent). The
+  PowerShell scripts ran on the host where they need no administrator.
+  A second round on the VM confirmed the in-guest screenshot, `send_input`
+  through the window, `get_devices`, `restart_vm` and the capture mechanics
+  of `get_debug_output`. Still unproven: decoding of real DbgPrint output
+  (no test-signed driver could be loaded; the result lists
+  `otherTraceEvents` when no DbgPrint line was found and `undecodedSample`
+  when one was found but not read), `analyze_dump` with a real debugger,
+  `run_command` with `desktop` as the signed-in user, and the command
+  channel coming back after a guest restart (the listener's retry).
+  The host log line `Monitor: props query failed 0x8037010D` every 5 s is
+  the HCS monitor thread in `hcs_vm.c`, not the MCP server.
 - **Open / to verify**:
   - From the stability pass, not changed: `gpu_crash_build_status` never
     returns "fixed" for build 26100 (section 6 says UBR ≥ 9818 for all three

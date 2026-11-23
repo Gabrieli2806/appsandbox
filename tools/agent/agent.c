@@ -32,6 +32,7 @@
 #include "p9copy.h"
 #include "gl_vk_provision.h"
 #include "../transport/asb_transport.h"
+#include "../../src/core/asb_exec_protocol.h"
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -3210,6 +3211,10 @@ static void handle_client(AsbConn *client)
         return;
     }
 
+    /* What this agent can do, for the host (older hosts ignore the line):
+       exec = the command channel, desktop / user = see asb_exec_protocol.h. */
+    send_line(client, "caps:exec desktop user");
+
     report_previous_session(client);
 
     /* The host clears its display readiness on every connection and opens no
@@ -3811,6 +3816,570 @@ static void handle_ssh_enable(AsbConn *client, const char *tag)
     }
 }
 
+/* ---- Guest command channel (channel 8): run a command, write / read a file ----
+ * The host's MCP tools (run_command, copy_to_guest, copy_from_guest) connect
+ * here; see src/core/asb_exec_protocol.h. One request per connection, each on
+ * its own thread, so a long command never holds up the control channel.
+ * Commands run as this service (SYSTEM), which is what installing and
+ * loading a driver needs. Only the host can connect: the listener is bound
+ * to the Hyper-V socket service, which is reachable from the parent
+ * partition alone. */
+
+#define EXEC_MAX_CONNECTIONS  16
+#define EXEC_DEFAULT_TIMEOUT  60000u
+#define EXEC_IO_TIMEOUT_MS    60000
+#define EXEC_FILE_CHUNK       (256 * 1024)
+
+static volatile LONG g_exec_connections;
+
+static BOOL exec_recv_all(AsbConn *c, void *buf, size_t len)
+{
+    char *p = (char *)buf;
+    while (len > 0) {
+        int n = asb_recv(c, p, len > 65536 ? 65536 : (int)len);
+        if (n <= 0) return FALSE;
+        p += n; len -= (size_t)n;
+    }
+    return TRUE;
+}
+
+static BOOL exec_send_all(AsbConn *c, const void *buf, size_t len)
+{
+    const char *p = (const char *)buf;
+    while (len > 0) {
+        int n = asb_send(c, p, len > 65536 ? 65536 : (int)len);
+        if (n <= 0) return FALSE;
+        p += n; len -= (size_t)n;
+    }
+    return TRUE;
+}
+
+/* Read and drop len bytes the host is still sending. */
+static void exec_discard(AsbConn *c, UINT64 len)
+{
+    char scratch[4096];
+    while (len > 0) {
+        int want = len > sizeof(scratch) ? (int)sizeof(scratch) : (int)len;
+        int n = asb_recv(c, scratch, want);
+        if (n <= 0) return;
+        len -= (UINT64)n;
+    }
+}
+
+/* Send a response without EXEC output or file data. */
+static BOOL exec_respond(AsbConn *c, UINT32 status, UINT32 os_error, const char *text)
+{
+    AsxResponse r;
+    ZeroMemory(&r, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.status = status; r.os_error = os_error;
+    r.text_len = text ? (UINT32)strlen(text) : 0;
+    return exec_send_all(c, &r, sizeof(r)) && (!r.text_len || exec_send_all(c, text, r.text_len));
+}
+
+static BOOL exec_respond_os_error(AsbConn *c, const char *what, DWORD err)
+{
+    char text[600], sys[300] = "";
+    DWORD n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err,
+                             MAKELANGID(LANG_ENGLISH, SUBLANG_ENGLISH_US), sys, sizeof(sys), NULL);
+    if (!n) n = FormatMessageA(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, NULL, err,
+                               0, sys, sizeof(sys), NULL);
+    while (n > 0 && (sys[n - 1] == '\r' || sys[n - 1] == '\n' || sys[n - 1] == ' ')) sys[--n] = '\0';
+    _snprintf_s(text, sizeof(text), _TRUNCATE, "%s: error %lu%s%s", what, err, sys[0] ? " - " : "", sys);
+    return exec_respond(c, ASX_STATUS_OS_ERROR, err, text);
+}
+
+/* UTF-8 (len bytes, no terminator) -> wide string from malloc; NULL when it
+   is not valid UTF-8 or holds a NUL. */
+static wchar_t *exec_wide(const char *utf8, UINT32 len)
+{
+    wchar_t *w;
+    int n;
+    if (!len) return (wchar_t *)calloc(1, sizeof(wchar_t));
+    if (memchr(utf8, 0, len)) return NULL;
+    n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, (int)len, NULL, 0);
+    if (n <= 0) return NULL;
+    w = (wchar_t *)malloc(((size_t)n + 1) * sizeof(wchar_t));
+    if (!w) return NULL;
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8, (int)len, w, n);
+    w[n] = L'\0';
+    return w;
+}
+
+/* Console programs write in the OEM code page; the host wants UTF-8. Output
+   that already is valid UTF-8 is kept. Returns the buffer to send and its
+   length: a new one (the input is freed), or the input when it needs no
+   conversion or the conversion fails. */
+static char *exec_to_utf8(char *bytes, DWORD len, DWORD *out_len)
+{
+    wchar_t *w;
+    char *u;
+    int wn, un;
+    *out_len = len;
+    if (!len || MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, bytes, (int)len, NULL, 0) > 0)
+        return bytes;
+    wn = MultiByteToWideChar(CP_OEMCP, 0, bytes, (int)len, NULL, 0);
+    if (wn <= 0) return bytes;
+    w = (wchar_t *)malloc((size_t)wn * sizeof(wchar_t));
+    if (!w) return bytes;
+    MultiByteToWideChar(CP_OEMCP, 0, bytes, (int)len, w, wn);
+    un = WideCharToMultiByte(CP_UTF8, 0, w, wn, NULL, 0, NULL, NULL);
+    u = un > 0 ? (char *)malloc((size_t)un) : NULL;
+    if (u) {
+        WideCharToMultiByte(CP_UTF8, 0, w, wn, u, un, NULL, NULL);
+        free(bytes);
+        *out_len = (DWORD)un;
+    }
+    free(w);
+    return u ? u : bytes;
+}
+
+typedef struct {
+    HANDLE pipe;
+    char  *data;
+    DWORD  len, cap;
+    BOOL   truncated;
+} ExecCapture;
+
+/* Move what is waiting in the pipe into the capture, without blocking; bytes
+   past the limit are read and dropped so the child never stalls. */
+static void exec_drain(ExecCapture *cap)
+{
+    char scratch[4096];
+    DWORD avail, got;
+    while (PeekNamedPipe(cap->pipe, NULL, 0, NULL, &avail, NULL) && avail > 0) {
+        DWORD room = cap->cap - cap->len;
+        if (room > 0) {
+            if (avail > room) avail = room;
+            if (!ReadFile(cap->pipe, cap->data + cap->len, avail, &got, NULL) || got == 0) break;
+            cap->len += got;
+        } else {
+            if (avail > sizeof(scratch)) avail = sizeof(scratch);
+            if (!ReadFile(cap->pipe, scratch, avail, &got, NULL) || got == 0) break;
+            cap->truncated = TRUE;
+        }
+    }
+}
+
+static void exec_run(AsbConn *c, const AsxRequest *req, const char *a, const char *b)
+{
+    wchar_t *command = exec_wide(a, req->a_len), *cwd = exec_wide(b, req->b_len);
+    wchar_t *line = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    HANDLE out_r = NULL, out_w = NULL, err_r = NULL, err_w = NULL, nul = INVALID_HANDLE_VALUE, job = NULL;
+    HANDLE desktop_token = NULL;
+    STARTUPINFOEXW six;
+    PROCESS_INFORMATION pi;
+    LPPROC_THREAD_ATTRIBUTE_LIST attrs = NULL;
+    BOOL attrs_ready = FALSE;
+    SIZE_T attr_size = 0;
+    HANDLE inherit[3];
+    ExecCapture out, err;
+    DWORD limit = req->limit ? req->limit : 65536, timeout = req->timeout_ms ? req->timeout_ms : EXEC_DEFAULT_TIMEOUT;
+    DWORD exit_code = 0, started, flags = 0;
+    BOOL timed_out = FALSE;
+    AsxResponse r;
+    size_t chars;
+
+    ZeroMemory(&pi, sizeof(pi));
+    ZeroMemory(&out, sizeof(out));
+    ZeroMemory(&err, sizeof(err));
+    if (limit > ASX_MAX_OUTPUT) limit = ASX_MAX_OUTPUT;
+    if (!command || !cwd || !command[0]) {
+        exec_respond(c, ASX_STATUS_BAD_REQUEST, 0,
+                     "the command and the working directory must be valid UTF-8 and the command must not be empty");
+        goto done;
+    }
+    out.data = (char *)malloc(limit); err.data = (char *)malloc(limit);
+    out.cap = err.cap = limit;
+    chars = wcslen(command) + 64;
+    line = (wchar_t *)malloc(chars * sizeof(wchar_t));
+    if (!out.data || !err.data || !line) {
+        exec_respond(c, ASX_STATUS_OS_ERROR, ERROR_OUTOFMEMORY, "out of memory in the guest agent");
+        goto done;
+    }
+    /* cmd.exe /s /c "<command>": with /s the outer quotes are removed and the
+       rest is run as typed, so quotes inside the command keep their meaning. */
+    if (req->flags & ASX_EXEC_SHELL) swprintf_s(line, chars, L"cmd.exe /d /s /c \"%s\"", command);
+    else wcscpy_s(line, chars, command);
+    if (wcslen(line) > 32766) {
+        exec_respond(c, ASX_STATUS_BAD_REQUEST, 0, "the command line is longer than 32766 characters");
+        goto done;
+    }
+
+    if (!CreatePipe(&out_r, &out_w, &sa, 1 << 16) || !CreatePipe(&err_r, &err_w, &sa, 1 << 16)) {
+        exec_respond_os_error(c, "creating the output pipes failed", GetLastError());
+        goto done;
+    }
+    SetHandleInformation(out_r, HANDLE_FLAG_INHERIT, 0);
+    SetHandleInformation(err_r, HANDLE_FLAG_INHERIT, 0);
+    nul = CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+    out.pipe = out_r; err.pipe = err_r;
+
+    /* The job ends the whole process tree when the time limit passes or this
+       request is done (grandchildren would otherwise keep running). Not for
+       a command run as the signed-in user: what it starts (a program with a
+       window) is meant to stay. */
+    job = (req->flags & ASX_EXEC_AS_USER) ? NULL : CreateJobObjectW(NULL, NULL);
+    if (job) {
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION info;
+        ZeroMemory(&info, sizeof(info));
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, sizeof(info));
+    }
+
+    ZeroMemory(&six, sizeof(six));
+    six.StartupInfo.cb = sizeof(six);
+    six.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    six.StartupInfo.hStdInput = nul != INVALID_HANDLE_VALUE ? nul : NULL;
+    six.StartupInfo.hStdOutput = out_w;
+    six.StartupInfo.hStdError = err_w;
+    inherit[0] = out_w; inherit[1] = err_w; inherit[2] = nul;
+    /* Only these handles are inherited: not the agent's sockets, pipes or
+       process handles. */
+    InitializeProcThreadAttributeList(NULL, 1, 0, &attr_size);
+    attrs = attr_size ? (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(attr_size) : NULL;
+    if (attrs) attrs_ready = InitializeProcThreadAttributeList(attrs, 1, 0, &attr_size);
+    if (!attrs_ready ||
+        !UpdateProcThreadAttribute(attrs, 0, PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherit,
+                                   (nul != INVALID_HANDLE_VALUE ? 3 : 2) * sizeof(HANDLE), NULL, NULL)) {
+        exec_respond_os_error(c, "preparing the process failed", GetLastError());
+        goto done;
+    }
+    six.lpAttributeList = attrs;
+    if (req->flags & (ASX_EXEC_DESKTOP | ASX_EXEC_AS_USER)) {
+        /* In the signed-in user's session and on its desktop: as that user
+           (ASX_EXEC_AS_USER; elevated when asked and possible), or still as
+           SYSTEM (the same way the input helper is started). */
+        DWORD session = WTSGetActiveConsoleSessionId(), desk_err = 0;
+        HANDLE own = NULL;
+        LPVOID user_env = NULL;
+        BOOL desk_ok = FALSE, as_user = (req->flags & ASX_EXEC_AS_USER) != 0;
+        if (session == 0xFFFFFFFF) {
+            exec_respond(c, ASX_STATUS_OS_ERROR, ERROR_NO_SUCH_LOGON_SESSION,
+                         "there is no desktop session in the guest yet (nobody is signed in)");
+            goto done;
+        }
+        if (as_user) {
+            if (!WTSQueryUserToken(session, &desktop_token)) {
+                desk_err = GetLastError();
+                desktop_token = NULL;
+            } else if (req->flags & ASX_EXEC_ELEVATED) {
+                /* An administrator's session token is the filtered one; its
+                   linked token is the full one. */
+                TOKEN_LINKED_TOKEN linked;
+                DWORD size = 0;
+                ZeroMemory(&linked, sizeof(linked));
+                if (GetTokenInformation(desktop_token, TokenLinkedToken, &linked, sizeof(linked), &size) &&
+                    linked.LinkedToken) {
+                    HANDLE full = NULL;
+                    if (DuplicateTokenEx(linked.LinkedToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation,
+                                         TokenPrimary, &full)) {
+                        CloseHandle(desktop_token);
+                        desktop_token = full;
+                    }
+                    CloseHandle(linked.LinkedToken);
+                }
+            }
+            if (desktop_token && !CreateEnvironmentBlock(&user_env, desktop_token, FALSE)) user_env = NULL;
+        } else if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ALL_ACCESS, &own) ||
+                   !DuplicateTokenEx(own, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &desktop_token) ||
+                   !SetTokenInformation(desktop_token, TokenSessionId, &session, sizeof(session))) {
+            desk_err = GetLastError();
+        }
+        if (!desk_err && desktop_token) {
+            six.StartupInfo.lpDesktop = L"WinSta0\\Default";
+            desk_ok = CreateProcessAsUserW(desktop_token, NULL, line, NULL, NULL, TRUE,
+                                           CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
+                                           (user_env ? CREATE_UNICODE_ENVIRONMENT : 0),
+                                           user_env, cwd[0] ? cwd : NULL, &six.StartupInfo, &pi);
+            if (!desk_ok) desk_err = GetLastError();
+        }
+        if (user_env) DestroyEnvironmentBlock(user_env);
+        if (own) CloseHandle(own);
+        if (!desk_ok) {
+            if (as_user && (desk_err == ERROR_NO_TOKEN || desk_err == ERROR_FILE_NOT_FOUND))
+                exec_respond(c, ASX_STATUS_OS_ERROR, desk_err,
+                             "nobody is signed in to the guest's desktop yet, so there is no user to run it as");
+            else
+                exec_respond_os_error(c, as_user ? "starting the command as the signed-in user failed"
+                                                 : "starting the command in the desktop session failed", desk_err);
+            goto done;
+        }
+    } else if (!CreateProcessW(NULL, line, NULL, NULL, TRUE,
+                        CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+                        NULL, cwd[0] ? cwd : NULL, &six.StartupInfo, &pi)) {
+        exec_respond_os_error(c, cwd[0] ? "starting the command failed (check the command and the working directory)"
+                                        : "starting the command failed", GetLastError());
+        goto done;
+    }
+    if (job) AssignProcessToJobObject(job, pi.hProcess);
+    ResumeThread(pi.hThread);
+    CloseHandle(out_w); out_w = NULL;
+    CloseHandle(err_w); err_w = NULL;
+
+    started = GetTickCount();
+    for (;;) {
+        DWORD wait;
+        exec_drain(&out); exec_drain(&err);
+        wait = WaitForSingleObject(pi.hProcess, 20);
+        if (wait != WAIT_TIMEOUT) break;
+        if (GetTickCount() - started >= timeout || WaitForSingleObject(g_stop_event, 0) == WAIT_OBJECT_0) {
+            timed_out = TRUE;
+            if (job) TerminateJobObject(job, 1); else TerminateProcess(pi.hProcess, 1);
+            WaitForSingleObject(pi.hProcess, 5000);
+            break;
+        }
+    }
+    exec_drain(&out); exec_drain(&err);
+    if (!GetExitCodeProcess(pi.hProcess, &exit_code)) exit_code = (DWORD)-1;
+    if (timed_out) flags |= ASX_FLAG_TIMED_OUT;
+    if (out.truncated) flags |= ASX_FLAG_OUT_TRUNCATED;
+    if (err.truncated) flags |= ASX_FLAG_ERR_TRUNCATED;
+    out.data = exec_to_utf8(out.data, out.len, &out.len);
+    err.data = exec_to_utf8(err.data, err.len, &err.len);
+
+    ZeroMemory(&r, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.exit_code = exit_code; r.flags = flags;
+    r.out_len = out.len; r.err_len = err.len;
+    if (exec_send_all(c, &r, sizeof(r)) && (!out.len || exec_send_all(c, out.data, out.len)) && err.len)
+        exec_send_all(c, err.data, err.len);
+    agent_log("exec: exit %lu%s, %lu + %lu bytes of output.", exit_code, timed_out ? " (time limit)" : "",
+              out.len, err.len);
+
+done:
+    if (attrs_ready) DeleteProcThreadAttributeList(attrs);
+    free(attrs);
+    if (pi.hThread) CloseHandle(pi.hThread);
+    if (pi.hProcess) CloseHandle(pi.hProcess);
+    if (job) CloseHandle(job);
+    if (desktop_token) CloseHandle(desktop_token);
+    if (out_r) CloseHandle(out_r);
+    if (out_w) CloseHandle(out_w);
+    if (err_r) CloseHandle(err_r);
+    if (err_w) CloseHandle(err_w);
+    if (nul != INVALID_HANDLE_VALUE) CloseHandle(nul);
+    free(out.data); free(err.data); free(line); free(command); free(cwd);
+}
+
+/* Create every missing folder on the way to path (a full path to a file). */
+static void exec_make_parent_dirs(const wchar_t *path)
+{
+    wchar_t dir[MAX_PATH * 2];
+    wchar_t *p;
+    if (wcslen(path) >= ARRAYSIZE(dir)) return;
+    wcscpy_s(dir, ARRAYSIZE(dir), path);
+    for (p = dir + 3; *p; p++) {
+        if (*p == L'\\' || *p == L'/') {
+            wchar_t keep = *p;
+            *p = L'\0';
+            CreateDirectoryW(dir, NULL);
+            *p = keep;
+        }
+    }
+}
+
+/* A full path with a drive letter or a UNC prefix. */
+static BOOL exec_path_ok(const wchar_t *path)
+{
+    size_t n = path ? wcslen(path) : 0;
+    if (n < 4 || n >= MAX_PATH * 2 - 16) return FALSE;
+    if (path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) return TRUE;
+    return path[0] == L'\\' && path[1] == L'\\';
+}
+
+static void exec_write_file(AsbConn *c, const AsxRequest *req, const char *a)
+{
+    wchar_t *path = exec_wide(a, req->a_len), temp[MAX_PATH * 2];
+    HANDLE file = INVALID_HANDLE_VALUE;
+    char *chunk = (char *)malloc(EXEC_FILE_CHUNK);
+    UINT64 left = req->data_len;
+    DWORD err = 0, wrote;
+
+    /* A refusal is sent after the content has been read and dropped, so it
+       reaches the host as an answer and not as a broken connection. */
+    if (!exec_path_ok(path) || !chunk) {
+        exec_discard(c, left);
+        exec_respond(c, ASX_STATUS_BAD_REQUEST, 0,
+                     "the guest path must be a full path such as C:\\Drivers\\my.sys (valid UTF-8, at most 500 characters)");
+        goto done;
+    }
+    exec_make_parent_dirs(path);
+    swprintf_s(temp, ARRAYSIZE(temp), L"%s.asbpart", path);
+    file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        err = GetLastError();
+        exec_discard(c, left);
+        exec_respond_os_error(c, "creating the file in the guest failed", err);
+        goto done;
+    }
+    while (left > 0) {
+        DWORD n = left > EXEC_FILE_CHUNK ? EXEC_FILE_CHUNK : (DWORD)left;
+        if (!exec_recv_all(c, chunk, n)) { err = ERROR_NETNAME_DELETED; break; }
+        left -= n;
+        if (!WriteFile(file, chunk, n, &wrote, NULL) || wrote != n) {
+            err = GetLastError();
+            if (!err) err = ERROR_DISK_FULL;
+            exec_discard(c, left);
+            break;
+        }
+    }
+    CloseHandle(file); file = INVALID_HANDLE_VALUE;
+    if (!err && !MoveFileExW(temp, path, MOVEFILE_REPLACE_EXISTING)) err = GetLastError();
+    if (err) {
+        DeleteFileW(temp);
+        if (err != ERROR_NETNAME_DELETED)
+            exec_respond_os_error(c, "writing the file in the guest failed", err);
+        agent_log("exec: writing %ls failed (%lu).", path, err);
+        goto done;
+    }
+    exec_respond(c, ASX_STATUS_OK, 0, NULL);
+    agent_log("exec: wrote %ls (%llu bytes).", path, (unsigned long long)req->data_len);
+done:
+    free(chunk); free(path);
+}
+
+static void exec_read_file(AsbConn *c, const AsxRequest *req, const char *a)
+{
+    wchar_t *path = exec_wide(a, req->a_len);
+    HANDLE file = INVALID_HANDLE_VALUE;
+    char *chunk = (char *)malloc(EXEC_FILE_CHUNK);
+    LARGE_INTEGER size;
+    AsxResponse r;
+    UINT64 left;
+
+    if (!exec_path_ok(path) || !chunk) {
+        exec_respond(c, ASX_STATUS_BAD_REQUEST, 0,
+                     "the guest path must be a full path such as C:\\Windows\\Minidump\\file.dmp (valid UTF-8, at most 500 characters)");
+        goto done;
+    }
+    file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL,
+                       OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, NULL);
+    if (file == INVALID_HANDLE_VALUE || !GetFileSizeEx(file, &size)) {
+        exec_respond_os_error(c, "opening the file in the guest failed", GetLastError());
+        goto done;
+    }
+    ZeroMemory(&r, sizeof(r));
+    r.magic = ASX_RESPONSE_MAGIC; r.version = ASX_VERSION;
+    r.total = (UINT64)size.QuadPart;
+    if (r.total > req->data_len) {
+        r.status = ASX_STATUS_TOO_LARGE;
+        exec_send_all(c, &r, sizeof(r));
+        goto done;
+    }
+    if (!exec_send_all(c, &r, sizeof(r))) goto done;
+    /* The size is already promised: a short read is padded with zeros so the
+       stream stays in step (the file shrank while it was read). */
+    for (left = r.total; left > 0; ) {
+        DWORD n = left > EXEC_FILE_CHUNK ? EXEC_FILE_CHUNK : (DWORD)left, got = 0;
+        if (!ReadFile(file, chunk, n, &got, NULL)) got = 0;
+        if (got < n) ZeroMemory(chunk + got, n - got);
+        if (!exec_send_all(c, chunk, n)) break;
+        left -= n;
+    }
+    agent_log("exec: read %ls (%llu bytes).", path, (unsigned long long)r.total);
+done:
+    if (file != INVALID_HANDLE_VALUE) CloseHandle(file);
+    free(chunk); free(path);
+}
+
+static DWORD WINAPI exec_conn_thread(LPVOID param)
+{
+    AsbConn *c = (AsbConn *)param;
+    AsxRequest req;
+    char *a = NULL, *b = NULL;
+
+    asb_set_timeout(c, EXEC_IO_TIMEOUT_MS, EXEC_IO_TIMEOUT_MS);
+    if (!exec_recv_all(c, &req, sizeof(req)) || req.magic != ASX_REQUEST_MAGIC) goto done;
+    if (req.version != ASX_VERSION || req.a_len > ASX_MAX_STRING || req.b_len > ASX_MAX_STRING) {
+        exec_respond(c, ASX_STATUS_UNSUPPORTED, 0, "this guest agent does not support that request version");
+        goto done;
+    }
+    a = (char *)malloc((size_t)req.a_len + 1);
+    b = (char *)malloc((size_t)req.b_len + 1);
+    if (!a || !b || (req.a_len && !exec_recv_all(c, a, req.a_len)) ||
+        (req.b_len && !exec_recv_all(c, b, req.b_len)))
+        goto done;
+    a[req.a_len] = '\0'; b[req.b_len] = '\0';
+
+    switch (req.op) {
+    case ASX_OP_PING:       exec_respond(c, ASX_STATUS_OK, 0, "windows desktop user"); break;
+    case ASX_OP_EXEC:       exec_run(c, &req, a, b); break;
+    case ASX_OP_WRITE_FILE: exec_write_file(c, &req, a); break;
+    case ASX_OP_READ_FILE:  exec_read_file(c, &req, a); break;
+    default:
+        exec_respond(c, ASX_STATUS_UNSUPPORTED, 0,
+                     "this guest agent does not know that operation; update the guest components");
+        break;
+    }
+done:
+    free(a); free(b);
+    asb_close(c);
+    InterlockedDecrement(&g_exec_connections);
+    return 0;
+}
+
+static DWORD WINAPI exec_listener_thread(LPVOID param)
+{
+    BOOL said_waiting = FALSE;
+    (void)param;
+
+    if (asb_transport_init() != 0) return 1;
+    if (asb_transport_is_ivshmem()) {
+        agent_log("Command channel: not available on a Mac host (no region for channel %d).", ASB_EXEC_CHANNEL);
+        return 1;
+    }
+    /* Keep trying for as long as the service runs: early in a boot (a warm
+       restart above all) the socket provider may not take the bind yet. */
+    while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
+        AsbListener *l = asb_listen(ASB_EXEC_CHANNEL);
+        int failures = 0;
+        if (!l) {
+            if (!said_waiting) {
+                agent_log("Command channel: cannot listen yet (asb_listen(%d) failed); retrying every 3 s.", ASB_EXEC_CHANNEL);
+                said_waiting = TRUE;
+            }
+            if (WaitForSingleObject(g_stop_event, 3000) == WAIT_OBJECT_0) break;
+            continue;
+        }
+        agent_log("Command channel: listening.");
+        said_waiting = FALSE;
+        while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
+            DWORD before = GetTickCount();
+            AsbConn *client = asb_accept(l, 1000);
+            HANDLE t;
+            if (!client) {
+                /* A timeout takes its second; an answer at once is an error.
+                   After a few of those in a row, listen again. */
+                if (GetTickCount() - before < 200) {
+                    if (++failures >= 5) {
+                        agent_log("Command channel: accept keeps failing; listening again.");
+                        break;
+                    }
+                    Sleep(200);
+                } else {
+                    failures = 0;
+                }
+                continue;
+            }
+            failures = 0;
+            if (InterlockedIncrement(&g_exec_connections) > EXEC_MAX_CONNECTIONS) {
+                InterlockedDecrement(&g_exec_connections);
+                exec_respond(client, ASX_STATUS_OS_ERROR, ERROR_BUSY,
+                             "too many commands are running in this VM; wait for one to finish");
+                asb_close(client);
+                continue;
+            }
+            t = CreateThread(NULL, 0, exec_conn_thread, client, 0, NULL);
+            if (t) CloseHandle(t);
+            else { InterlockedDecrement(&g_exec_connections); asb_close(client); }
+        }
+        asb_close_listener(l);
+    }
+    return 0;
+}
+
 /* ---- Windows service plumbing ---- */
 
 static void set_service_status(DWORD state, DWORD exit_code)
@@ -3911,6 +4480,12 @@ static void WINAPI service_main(DWORD argc, LPSTR *argv)
 
     /* Start listener on a worker thread */
     thread = CreateThread(NULL, 0, listener_thread, NULL, 0, NULL);
+
+    /* Guest command channel (run_command and file copy for the host's MCP tools) */
+    {
+        HANDLE exec_thread = CreateThread(NULL, 0, exec_listener_thread, NULL, 0, NULL);
+        if (exec_thread) CloseHandle(exec_thread);
+    }
 
     /* Start input helper monitor (spawns/respawns in console session as SYSTEM) */
     start_input_monitor();

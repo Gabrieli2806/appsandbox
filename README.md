@@ -21,6 +21,7 @@ Windows features:
 - Floating toolbar, FPS/resolution in the title bar (both optional), borderless fullscreen
 - Direct3D 11 or Direct3D 12 renderer for the VM window (Settings → VM windows)
 - Custom icon per VM; **manual install** of any OS from its ISO ("Other")
+- **AI agents (MCP)**: turn it on in Settings and an agent such as Claude Code or Codex can create and run VMs, run commands in them as SYSTEM, copy files in and out, take screenshots, read crash (bugcheck) information and go back to a snapshot — for example to test a driver it just built. Off by default, only reachable from this PC, with a read-only mode. See [tools/headless-api/README.md](tools/headless-api/README.md#mcp-server-for-ai-agents).
 - Settings → **Folders and logs** (open the VM, data, log and app folders; copy diagnostic info) and **About**
 - Stability: the guest agent works around the Windows GPU-PV crash (bugcheck 0x3B with Edge/Discord/Steam) and reports guest crashes to the host log; the viewer recovers from GPU driver resets (see Troubleshooting)
 - Desktop and Start-menu shortcuts that start a VM straight into its window

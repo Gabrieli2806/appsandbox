@@ -21,6 +21,9 @@
     <ClCompile Include="src\app_win\ui.c">
       <Filter>App</Filter>
     </ClCompile>
+    <ClCompile Include="src\app_win\mcp.c">
+      <Filter>App</Filter>
+    </ClCompile>
     <ClCompile Include="src\app_win\webview2_bridge.c">
       <Filter>App</Filter>
     </ClCompile>
@@ -37,6 +40,9 @@
     </ClInclude>
     <ClInclude Include="src\app_win\ui.h">
       <Filter>Headers</Filter>
+    </ClInclude>
+    <ClInclude Include="src\app_win\mcp.h">
+      <Filter>App</Filter>
     </ClInclude>
     <ClInclude Include="src\app_win\webview2_bridge.h">
       <Filter>App</Filter>

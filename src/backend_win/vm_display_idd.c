@@ -1279,6 +1279,41 @@ BOOL vm_display_idd_hevc_supported(void)
     return vm_video_hevc_supported();
 }
 
+/* See vm_display_idd.h. */
+int vm_display_idd_send_packets(VmDisplayIdd *display, const void *packets, int count)
+{
+    const InputPacket *p = (const InputPacket *)packets;
+    int i;
+    if (!display || !display->open || display->input_socket == INVALID_SOCKET) return -1;
+    for (i = 0; i < count; i++)
+        if (!send_input_locked_safe(display, p[i].type, p[i].param1, p[i].param2, p[i].param3)) break;
+    return i;
+}
+
+/* See vm_display_idd.h. */
+BYTE *vm_display_idd_copy_frame(VmDisplayIdd *display, UINT *width, UINT *height,
+                                UINT *stride, int *why)
+{
+    BYTE *copy = NULL;
+
+    *why = 0;
+    if (!display || !display->open || !display->frame_connected) return NULL;
+    if (display->video_active) { *why = 1; return NULL; }
+    EnterCriticalSection(&display->frame_cs);
+    if (display->frame_buf && display->recv_count && display->frame_width && display->frame_height) {
+        SIZE_T size = (SIZE_T)display->frame_stride * display->frame_height;
+        copy = (BYTE *)malloc(size);
+        if (copy) {
+            memcpy(copy, display->frame_buf, size);
+            *width = display->frame_width;
+            *height = display->frame_height;
+            *stride = display->frame_stride;
+        }
+    }
+    LeaveCriticalSection(&display->frame_cs);
+    return copy;
+}
+
 /* Codec the guest is sending: L"H.264", L"HEVC" or NULL when not video. */
 const wchar_t *vm_display_idd_video_codec(VmDisplayIdd *display)
 {

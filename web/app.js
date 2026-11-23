@@ -177,7 +177,8 @@ window.onHostMessage = function(msg) {
         case 'prereqResult':   onPrereqResult(msg); break;
         case 'vmIcon':         onVmIcon(msg); break;
         case 'coreLoading':    setPrereqState(null); setCoreStarting(true); break;
-        case 'coreReady':      setPrereqState(null); setCoreStarting(false); break;
+        case 'coreReady':      setPrereqState(null); setCoreStarting(false); requestMcpStatus(); break;
+        case 'mcpStatus':      onMcpStatus(msg.mcp); break;
     }
 };
 
@@ -1580,7 +1581,8 @@ function showView(name) {
         n.classList.toggle('active', on);
         if (on) n.setAttribute('aria-current', 'page'); else n.removeAttribute('aria-current');
     });
-    if (name === 'settings') renderSettingsView();
+    if (name === 'settings') { renderSettingsView(); requestMcpStatus(); }
+    syncMcpPolling();
 }
 
 function openVmDetail(id) {
@@ -2037,6 +2039,7 @@ function renderSettingsView() {
         if (lastHostInfo.freeGb >= 0) rows.push(['Free space in the default VM folder', lastHostInfo.freeGb + ' GB']);
     }
     fillRows(document.getElementById('set-host'), rows);
+    if (!hostBridge.isMac) renderMcp();
     if (!hostBridge.isMac) renderFoldersAndAbout(lastHostInfo);
 }
 
@@ -2051,6 +2054,149 @@ function formatVersion(v) {
 function setText(id, text) {
     var e = document.getElementById(id);
     if (e) e.textContent = text;
+}
+
+/* ---- Settings > AI agents (MCP) ----
+ * One row that unfolds. The switch works while folded. The native side
+ * answers getMcpStatus / setMcpEnabled / setMcpReadOnly with mcpStatus:
+ * {enabled, readOnly, listening, name, url, error, lastClient, activity}. */
+
+var MCP_NAME = 'appsandbox';
+var MCP_URL = 'http://127.0.0.1:47841/mcp';
+var mcpState = null;
+var mcpClient = 'claudeCode';
+var mcpPollTimer = null;
+
+var MCP_CLIENT_HELP = {
+    claudeCode: 'Run this once in a terminal. The server is added for your user, in every project.',
+    codex: 'Run this once in a terminal.',
+    claudeDesktop: 'Add this to claude_desktop_config.json (Settings > Developer > Edit Config) and restart Claude Desktop. It needs Node.js.',
+    other: 'For clients that take a JSON configuration with a Streamable HTTP server.'
+};
+
+function mcpUrl() { return (mcpState && mcpState.url) || MCP_URL; }
+function mcpName() { return (mcpState && mcpState.name) || MCP_NAME; }
+
+function mcpSnippet(kind) {
+    var name = mcpName(), url = mcpUrl(), servers = {};
+    switch (kind) {
+        case 'claudeCode': return 'claude mcp add --transport http --scope user ' + name + ' ' + url;
+        case 'codex': return 'codex mcp add ' + name + ' --url ' + url;
+        case 'claudeDesktop':
+            servers[name] = { command: 'npx', args: ['-y', 'mcp-remote', url] };
+            return JSON.stringify({ mcpServers: servers });
+        default:
+            servers[name] = { type: 'http', url: url };
+            return JSON.stringify({ mcpServers: servers });
+    }
+}
+
+/* Pasted into the agent's chat: it connects by itself. */
+function mcpConnectPrompt() {
+    return [
+        'Connect to my App Sandbox app over MCP. App Sandbox runs on this PC: it creates and runs disposable, GPU-capable Windows and Linux virtual machines, where you can run commands, copy files in and out, take snapshots and test risky or low-level things (drivers, installers) instead of on the real machine.',
+        '',
+        'Add an MCP server named "' + mcpName() + '" with the Streamable HTTP transport at ' + mcpUrl() + '. It needs no token and no headers; it only answers programs on this PC.',
+        '',
+        '- Claude Code: run `' + mcpSnippet('claudeCode') + '`',
+        '- Codex: run `' + mcpSnippet('codex') + '`',
+        '- Any other client: add this to its MCP configuration: ' + mcpSnippet('other'),
+        '',
+        'If your client needs a reload to see new MCP servers, tell me. Once connected, call list_vms and get_host and tell me what you can see.'
+    ].join('\n');
+}
+
+function requestMcpStatus() {
+    if (!hostBridge.isMac) sendCmd('getMcpStatus');
+}
+
+function onMcpStatus(state) {
+    if (!state || typeof state !== 'object') return;
+    mcpState = state;
+    renderMcp();
+}
+
+function mcpExpanded() {
+    return !document.getElementById('set-mcp').classList.contains('collapsed');
+}
+
+/* While the row is unfolded and visible, keep the recent activity current. */
+function syncMcpPolling() {
+    var wanted = mcpExpanded() && !document.getElementById('view-settings').hidden;
+    if (wanted && !mcpPollTimer) mcpPollTimer = setInterval(requestMcpStatus, 3000);
+    if (!wanted && mcpPollTimer) { clearInterval(mcpPollTimer); mcpPollTimer = null; }
+}
+
+function renderMcp() {
+    var s = mcpState || {}, on = !!s.enabled;
+    var status = !on ? 'Off'
+        : s.listening ? 'On · ' + mcpUrl()
+        : (s.error || 'Starting…');
+    var statusEl = document.getElementById('mcp-status');
+    statusEl.textContent = status;
+    statusEl.classList.toggle('error-text', on && !s.listening && !!s.error);
+    document.getElementById('set-mcp-enabled').setAttribute('aria-checked', on ? 'true' : 'false');
+    document.getElementById('set-mcp-readonly').setAttribute('aria-checked', s.readOnly ? 'true' : 'false');
+    setText('mcp-url', mcpUrl());
+    setText('mcp-snippet', mcpSnippet(mcpClient));
+    setText('mcp-client-help', MCP_CLIENT_HELP[mcpClient]);
+    document.querySelectorAll('#mcp-clients [data-mcp-client]').forEach(function(b) {
+        var active = b.getAttribute('data-mcp-client') === mcpClient;
+        b.classList.toggle('active', active);
+        b.setAttribute('aria-pressed', active ? 'true' : 'false');
+    });
+    setText('mcp-last-client', !on ? 'Turn the switch on to let an agent connect.'
+        : s.lastClient ? 'Last client: ' + s.lastClient
+        : 'No agent has connected yet.');
+    var calls = document.getElementById('mcp-calls');
+    var sig = JSON.stringify(s.activity || []);
+    if (calls.getAttribute('data-sig') !== sig) {
+        calls.setAttribute('data-sig', sig);
+        calls.textContent = '';
+        (s.activity || []).forEach(function(a) {
+            var line = el('div', a.ok ? '' : 'failed',
+                a.time + '  ' + a.tool + (a.vm ? '  ' + a.vm : '') + (a.ok ? '' : '  failed'));
+            calls.appendChild(line);
+        });
+    }
+}
+
+function toggleMcp() {
+    var on = !(mcpState && mcpState.enabled);
+    sendCmd('setMcpEnabled', { enabled: on });
+    if (mcpState) { mcpState.enabled = on; mcpState.listening = false; mcpState.error = ''; renderMcp(); }
+}
+
+function toggleMcpReadOnly() {
+    var on = !(mcpState && mcpState.readOnly);
+    sendCmd('setMcpReadOnly', { readOnly: on });
+    if (mcpState) { mcpState.readOnly = on; renderMcp(); }
+}
+
+function toggleMcpDetails() {
+    var card = document.getElementById('set-mcp');
+    var collapsed = card.classList.toggle('collapsed');
+    document.getElementById('mcp-body').hidden = collapsed;
+    document.getElementById('mcp-expand').setAttribute('aria-expanded', collapsed ? 'false' : 'true');
+    if (!collapsed) { renderMcp(); requestMcpStatus(); }
+    syncMcpPolling();
+}
+
+function setMcpClient(kind) {
+    mcpClient = kind;
+    renderMcp();
+}
+
+function copyMcp(what, button) {
+    var text = what === 'prompt' ? mcpConnectPrompt() : what === 'url' ? mcpUrl() : mcpSnippet(mcpClient);
+    var label = button.getAttribute('data-label') || button.textContent;
+    button.setAttribute('data-label', label);
+    copyText(text).then(function() {
+        button.textContent = 'Copied';
+        setTimeout(function() { button.textContent = label; }, 1600);
+    }, function() {
+        showToast('error', 'Could not copy to the clipboard.');
+    });
 }
 
 /* Settings > Folders and logs, and About (Windows host). */

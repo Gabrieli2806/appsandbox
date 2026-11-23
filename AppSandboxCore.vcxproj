@@ -180,6 +180,7 @@
     <ClCompile Include="src\backend_win\guest_tools.c" />
     <ClCompile Include="src\backend_win\vmms_cert.c" />
     <ClCompile Include="src\backend_win\vm_agent.c" />
+    <ClCompile Include="src\backend_win\vm_exec.c" />
     <ClCompile Include="src\backend_win\prereq.c" />
     <ClCompile Include="src\backend_win\vm_ssh_proxy.c" />
     <ClCompile Include="src\backend_win\vm_clipboard.c" />
@@ -190,6 +191,7 @@
     <ClInclude Include="src\core\protocol.h" />
     <ClInclude Include="src\core\asb_vm_id.h" />
     <ClInclude Include="src\core\asb_display_protocol.h" />
+    <ClInclude Include="src\core\asb_exec_protocol.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
     <ClInclude Include="src\ui.h" />
@@ -203,6 +205,7 @@
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vmms_cert.h" />
     <ClInclude Include="src\backend_win\vm_agent.h" />
+    <ClInclude Include="src\backend_win\vm_exec.h" />
     <ClInclude Include="src\backend_win\prereq.h" />
     <ClInclude Include="src\backend_win\vm_ssh_proxy.h" />
     <ClInclude Include="src\backend_win\vm_clipboard.h" />

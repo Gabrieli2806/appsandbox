@@ -436,6 +436,12 @@ static int process_async_message(VmInstance *vm, SOCKET s, const char *buf)
             PostMessageW(g_agent_hwnd, WM_VM_HYPERV_VIDEO_OFF, 0, (LPARAM)vm->unique_id);
     } else if (strncmp(buf, "displays:", 9) == 0) {
         ui_log(L"[%s] Displays: %S", vm->name, buf + 9);
+    } else if (strncmp(buf, "caps:", 5) == 0) {
+        /* What the agent can do; "exec" = it has the command channel. */
+        const char *exec = strstr(buf + 5, "exec");
+        InterlockedExchange(&vm->agent_caps,
+                            exec && (exec == buf + 5 || exec[-1] == ' ') && (exec[4] == ' ' || exec[4] == '\0')
+                                ? VM_AGENT_CAP_EXEC : 0);
     } else if (strncmp(buf, "log:", 4) == 0) {
         ui_log(L"[%s] %S", vm->name, buf + 4);
     } else if (strcmp(buf, "gpu_query") == 0) {
@@ -606,6 +612,7 @@ static DWORD WINAPI agent_thread_proc(LPVOID param)
             continue;
         }
 
+        InterlockedExchange(&vm->agent_caps, 0);   /* the agent says them again, right after hello */
         vm->agent_online = TRUE;
         vm->idd_ready = FALSE;   /* re-evaluated by the agent's idd_status, sent right after hello */
         /* A shutdown/restart kept across the reconnect is still on its way:

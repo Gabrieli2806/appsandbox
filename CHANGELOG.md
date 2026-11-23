@@ -2,6 +2,26 @@
 
 ## Unreleased — shared core, GUI and API
 
+### MCP server for AI agents (Windows host)
+
+- Settings → AI agents (MCP) turns on a Model Context Protocol server at
+  `http://127.0.0.1:47841/mcp` (Streamable HTTP, no token, this PC only; off by
+  default; `--headless --mcp` for the daemon). It offers the VM lifecycle,
+  snapshots, the activity log and screenshots as tools, with a read-only mode.
+- New guest command channel (Hyper-V socket service 8): the guest agent runs
+  commands as SYSTEM (root on Linux) and reads and writes guest files for the
+  `run_command`, `copy_to_guest`, `copy_from_guest` and `get_guest_crash`
+  tools. Existing Windows VMs get it with the next guest-components update;
+  a VM with an older agent answers those tools with a message to update.
+- Driver testing: `install_driver`, `uninstall_driver`, `get_devices`,
+  `get_debug_output` (DbgPrint text through a kernel trace, no debugger),
+  `set_verifier`, `restart_vm`, `analyze_dump` (`!analyze -v` with the host's
+  cdb.exe, run without elevation), `send_input`, and the prompts `test_driver`
+  and `new_test_vm`.
+- `screenshot` works with the VM's window open in performance mode and on a
+  still desktop: it falls back to a copy made inside the guest (the agent can
+  now start a program in the signed-in user's desktop session).
+
 ### Shared control and lifecycle
 
 - The GUI hosts the local API automatically. GUI, API, and tray/menu-bar actions

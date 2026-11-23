@@ -48,5 +48,9 @@ void ui_refresh_from_core(void);
 BOOL ui_display_is_open(UINT64 id);
 BOOL ui_display_open(UINT64 id);
 void ui_display_close(UINT64 id);
+/* The picture in the VM's open window (vm_display_idd_copy_frame). UI thread. */
+BYTE *ui_display_copy_frame(UINT64 id, UINT *width, UINT *height, UINT *stride, int *why);
+/* Input packets through the VM's open window (vm_display_idd_send_packets). UI thread. */
+int ui_display_send_packets(UINT64 id, const void *packets, int count);
 
 #endif /* UI_H */
