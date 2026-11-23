@@ -16,7 +16,7 @@
 #include "ui.h"
 #include "asb_events.h"
 #include "asb_core.h"          /* full API incl. internal VmInstance */
-#include "webview2_bridge.h"   /* json_get_string/int/bool for request bodies */
+#include "ui_bridge.h"   /* json_get_string/int/bool for request bodies */
 #include "prereq.h"            /* prereq_check_all -> VirtualMachinePlatform check */
 #include "vm_display_idd.h"    /* IDD display window, opened on demand via the API */
 #include "asb_paths.h"         /* data folder, single-instance lock */
@@ -89,7 +89,7 @@ static BOOL display_is_open(UINT64 vm_id)
     return e && e->disp && vm_display_idd_is_open(e->disp);
 }
 /* If the user closed the window (X), vm_display_idd has already stopped its threads
-   and freed the vsock frame connection (WM_CLOSE handler); drop our now-dead handle
+   and freed the frame connection (WM_CLOSE handler); drop our now-dead handle
    so the slot frees. Called before acting on any display request. */
 static void display_reap_stale(UINT64 vm_id)
 {
@@ -564,11 +564,13 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
                                    BOOL is_template, int ram_mb, int hdd_gb,
                                    int cpu_cores, int gpu_mode, int net_mode)
 {
-    int i, len; BOOL is_linux, is_win, all_digits, from_template;
+    int i, len; BOOL is_win, all_digits, from_template;
 
-    is_linux = (_wcsicmp(os, L"Linux") == 0);
     is_win   = (_wcsicmp(os, L"Windows") == 0);
     from_template = (tpl && tpl[0] != L'\0');
+    if (_wcsicmp(os, L"Linux") == 0)
+        return "Linux guests are no longer supported; osType must be \"Windows\".";
+    if (!from_template && !os[0]) return "osType is required (\"Windows\").";
 
     /* name / hostname */
     if (!name || !name[0]) return "VM name is required.";
@@ -581,7 +583,6 @@ static const char *validate_create(const wchar_t *name, const wchar_t *os,
         if (!((ch>=L'a'&&ch<=L'z')||(ch>=L'A'&&ch<=L'Z')||(ch>=L'0'&&ch<=L'9')||ch==L'-'))
             return "VM name can only contain letters, digits, and hyphens.";
         if (!(ch>=L'0'&&ch<=L'9')) all_digits = FALSE;
-        if (is_linux && ch>=L'A' && ch<=L'Z') return "Linux hostname must be lowercase.";
     }
     if (all_digits) return "VM name cannot be only digits.";
     if (name[0]==L'-' || name[len-1]==L'-') return "VM name cannot start or end with a hyphen.";
@@ -737,9 +738,7 @@ static int handle_request(PHTTP_REQUEST req)
                 const char *error = !json_has_key(body, L"adminUser")
                     ? "Username is required."
                     : user[0]
-                        ? (_wcsicmp(os, L"Linux") == 0 && !tpl[0]
-                            ? "Username cannot exceed 32 characters (Linux limit)."
-                            : "Username cannot exceed 20 characters.")
+                        ? "Username cannot exceed 20 characters."
                         : "adminUser must be a valid JSON string without NUL characters.";
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg", error);
                 return 0;
@@ -748,9 +747,7 @@ static int handle_request(PHTTP_REQUEST req)
                 const char *error = !json_has_key(body, L"adminPass")
                     ? "Password is required."
                     : pass[0]
-                        ? (_wcsicmp(os, L"Linux") == 0 && !tpl[0]
-                            ? "Password is too long (max 255 bytes)."
-                            : "Password is too long (max 127 characters for Windows).")
+                        ? "Password is too long (max 127 characters for Windows)."
                         : "adminPass must be a valid JSON string without NUL characters.";
                 SecureZeroMemory(pass, sizeof(pass));
                 send_err(req->RequestId, 400, "Bad Request", "invalid_arg", error);

@@ -22,30 +22,33 @@
     <VCProjectVersion>17.0</VCProjectVersion>
     <ProjectGuid>{8A7B6C5D-4E3F-2A1B-9C8D-7E6F5A4B3C2D}</ProjectGuid>
     <RootNamespace>AppSandbox</RootNamespace>
+    <!-- The native host of the app: UI thread logic, VM windows, local API,
+         MCP server. The WinUI shell (app\AppSandbox) loads it. -->
+    <TargetName>appsandbox_host</TargetName>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|ARM64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>true</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
     <WholeProgramOptimization>true</WholeProgramOptimization>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
-    <ConfigurationType>Application</ConfigurationType>
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
     <UseDebugLibraries>false</UseDebugLibraries>
     <PlatformToolset>v143</PlatformToolset>
     <CharacterSet>Unicode</CharacterSet>
@@ -86,60 +89,48 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>_DEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_WINDOWS;ASB_HOST_BUILDING;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
-           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
-      <StackReserveSize>4194304</StackReserveSize>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
+      <Message>Copying guest resources to output directory...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <Optimization>Disabled</Optimization>
-      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;_DEBUG;_WINDOWS;ASB_HOST_BUILDING;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
-           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
-      <StackReserveSize>4194304</StackReserveSize>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
+      <Message>Copying guest resources to output directory...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|ARM64'">
@@ -148,32 +139,26 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_WINDOWS;ASB_HOST_BUILDING;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
-           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
-      <StackReserveSize>4194304</StackReserveSize>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
-xcopy /Y "$(SolutionDir)vendor\webview2\arm64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
+      <Message>Copying guest resources to output directory...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -182,36 +167,30 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\arm64\*.dll" "$(OutDir)res
       <Optimization>MaxSpeed</Optimization>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>WIN32;NDEBUG;_WINDOWS;ASB_HOST_BUILDING;UNICODE;_UNICODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <CompileAs>CompileAsC</CompileAs>
-      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win;$(ProjectDir)vendor\webview2</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)src;$(ProjectDir)src\core;$(ProjectDir)src\app_win;$(ProjectDir)src\backend_win</AdditionalIncludeDirectories>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
     </ClCompile>
     <Link>
       <SubSystem>Windows</SubSystem>
-      <!-- VmConfig/VmInstance are about 600 KB (GPU share table) and live on
-           the stack of the UI and VM-creation threads: 1 MB is too tight. -->
-      <StackReserveSize>4194304</StackReserveSize>
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <UACExecutionLevel>RequireAdministrator</UACExecutionLevel>
       <AdditionalLibraryDirectories>$(OutDir)</AdditionalLibraryDirectories>
       <AdditionalDependencies>appsandbox_core.lib;comdlg32.lib;d3d11.lib;dxgi.lib;d3dcompiler.lib;dxguid.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
     <PostBuildEvent>
       <Command>xcopy /Y /I /E "$(SolutionDir)release\resources" "$(OutDir)resources"
-xcopy /Y /I /E "$(SolutionDir)web" "$(OutDir)web"
-xcopy /Y "$(SolutionDir)vendor\webview2\x64\WebView2Loader.dll" "$(OutDir)."
 xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resources\win-mesa-gl\"
 </Command>
-      <Message>Copying resources, web UI, and WebView2Loader to output directory...</Message>
+      <Message>Copying guest resources to output directory...</Message>
     </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="src\app_win\main.c" />
+    <ClCompile Include="src\app_win\host.c" />
     <ClCompile Include="src\app_win\ui.c" />
     <ClCompile Include="src\backend_win\vm_display.c" />
     <ClCompile Include="src\backend_win\vm_display_idd.c" />
@@ -221,7 +200,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\backend_win\vm_video_decode.cpp">
       <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
-    <ClCompile Include="src\app_win\webview2_bridge.c" />
+    <ClCompile Include="src\app_win\ui_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
     <ClCompile Include="src\app_win\mcp.c" />
   </ItemGroup>
@@ -230,7 +209,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\app_win\ui.h" />
     <ClInclude Include="src\backend_win\asb_core.h" />
     <ClInclude Include="src\backend_win\asb_display.h" />
-    <ClInclude Include="src\app_win\webview2_bridge.h" />
+    <ClInclude Include="src\app_win\ui_bridge.h" />
     <ClInclude Include="src\app_win\headless.h" />
     <ClInclude Include="src\app_win\mcp.h" />
     <ClInclude Include="src\app_win\mcp_scripts.h" />

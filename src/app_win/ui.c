@@ -1,8 +1,9 @@
 /*
- * ui.c - Main window + WebView2 UI bridge.
- *
- * Thin UI shell: WebView2 hosting, JSON message dispatch, display windows,
- * tray icon. All VM orchestration is in asb_core.c (the core library).
+ * ui.c - The host's UI thread: JSON message dispatch with the app shell
+ * (the WinUI window, through ui_bridge), display windows, VM operations
+ * that wait, the exit sequence. Its own window is never shown: it receives
+ * the messages of the backend, the local API and a second launch. All VM
+ * orchestration is in asb_core.c (the core library).
  */
 
 #include "ui.h"
@@ -17,7 +18,7 @@
 #include "vm_display.h"
 #include "vm_display_idd.h"
 #include "vm_agent.h"
-#include "webview2_bridge.h"
+#include "ui_bridge.h"
 #include "prereq.h"
 #include "asb_paths.h"
 #include <dwmapi.h>
@@ -67,20 +68,8 @@ static HWND g_hwnd_main = NULL;
 static UINT g_show_main_msg;
 static HINSTANCE g_hInstance = NULL;
 
-/* Minimum client size in CSS pixels (DIPs), reported by the page; converted
-   to physical pixels with the window's current DPI when Windows asks. */
-static int g_min_css_width = 0;
-static int g_min_css_height = 0;
-
-/* Window size at 100% scaling; scaled by the monitor's DPI and limited to
-   90% of its work area. */
-#define UI_DEFAULT_WIDTH  1575
-#define UI_DEFAULT_HEIGHT 900
-
-/* Borderless fullscreen state. */
-static BOOL g_borderless_fullscreen = FALSE;
-static LONG_PTR g_windowed_style = 0;
-static WINDOWPLACEMENT g_windowed_placement = { sizeof(WINDOWPLACEMENT) };
+/* The app shell's window: owner of the dialogs opened here. */
+static HWND g_hwnd_shell = NULL;
 
 /* Display windows (indexed parallel to the library's VM array) */
 static VmDisplay *g_displays[ASB_MAX_VMS];
@@ -106,8 +95,8 @@ static int g_pump_depth;
 #define WM_VM_IDD_READY        (WM_APP + 7)
 #define WM_VM_HYPERV_VIDEO_OFF (WM_APP + 12)
 #define WM_VM_REMOVED          (WM_APP + 16)
-#define WM_WEBVIEW2_LOG        (WM_APP + 10)
-#define WM_TRAYICON            (WM_APP + 11)
+#define WM_UI_LOG              (WM_APP + 10)
+#define WM_SHELL_COMMAND       (WM_APP + 11)  /* lp: malloc'ed JSON from the shell */
 #define WM_SHOW_ALERT          (WM_APP + 15)
 #define WM_VM_SHUTDOWN_TIMEOUT (WM_APP + 9)
 #define WM_PREREQ_DONE        (WM_APP + 17)
@@ -133,15 +122,6 @@ static int       g_exit_refused_count;
    WMI, certificates, loading and re-attaching VMs) takes seconds, so it runs
    on a worker thread and the window stays responsive meanwhile. */
 static volatile LONG g_core_starting;
-
-/* Tray */
-#define TRAY_CMD_SHOW          1
-#define TRAY_CMD_EXIT          2
-#define TRAY_CMD_CONNECT_BASE  100
-#define TRAY_CMD_SHUTDOWN_BASE 200
-#define TRAY_CMD_STOP_BASE     300
-
-static NOTIFYICONDATAW g_nid;
 
 /* UI thread ID for thread-safe log dispatch */
 static DWORD g_ui_thread_id;
@@ -234,8 +214,6 @@ static int vm_icon_version(const VmInstance *v);
 static void send_full_state(void);
 static void send_adapters(void);
 static void send_templates(void);
-static void toggle_borderless_fullscreen(HWND hwnd);
-static void on_webview2_accelerator(UINT virtual_key);
 static void ui_show_alert(const wchar_t *message);
 static void ui_alert(const wchar_t *kind, const wchar_t *title, const wchar_t *message);
 static void ui_notice(const wchar_t *kind, const wchar_t *message);
@@ -245,38 +223,24 @@ static void safe_destroy_rdp(int idx);
 static void safe_destroy_idd(int idx);
 static void reconcile_displays(void);
 
-static void toggle_borderless_fullscreen(HWND hwnd)
+/* ---- The app shell's window ---- */
+
+static BOOL shell_visible(void)
 {
-    if (!g_borderless_fullscreen) {
-        MONITORINFO monitor = { sizeof(monitor) };
-        HMONITOR hmonitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
-
-        if (!GetWindowPlacement(hwnd, &g_windowed_placement) ||
-            !GetMonitorInfoW(hmonitor, &monitor))
-            return;
-
-        g_windowed_style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        SetWindowLongPtrW(hwnd, GWL_STYLE,
-                          (g_windowed_style & ~WS_OVERLAPPEDWINDOW) | WS_POPUP);
-        SetWindowPos(hwnd, HWND_TOP, monitor.rcMonitor.left, monitor.rcMonitor.top,
-                     monitor.rcMonitor.right - monitor.rcMonitor.left,
-                     monitor.rcMonitor.bottom - monitor.rcMonitor.top,
-                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
-        g_borderless_fullscreen = TRUE;
-    } else {
-        SetWindowLongPtrW(hwnd, GWL_STYLE, g_windowed_style);
-        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
-                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER |
-                     SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        SetWindowPlacement(hwnd, &g_windowed_placement);
-        g_borderless_fullscreen = FALSE;
-    }
+    return g_hwnd_shell && IsWindowVisible(g_hwnd_shell) && !IsIconic(g_hwnd_shell);
 }
 
-static void on_webview2_accelerator(UINT virtual_key)
+/* Owner for a dialog: the shell's window while it is on screen. */
+static HWND dialog_owner(void)
 {
-    if (virtual_key == VK_F11 && g_hwnd_main)
-        toggle_borderless_fullscreen(g_hwnd_main);
+    return shell_visible() ? g_hwnd_shell : NULL;
+}
+
+/* The shell shows or hides its window (hidden = running in the tray). */
+static void shell_show(BOOL show)
+{
+    ui_bridge_post(show ? L"{\"type\":\"window\",\"show\":true}"
+                        : L"{\"type\":\"window\",\"show\":false}");
 }
 
 /* ---- Safe display teardown ---- */
@@ -427,7 +391,7 @@ static void send_disk_space(const wchar_t *json, BOOL query)
     jb_int(&jb, L"requestId", request_id);
     jb_int(&jb, L"freeGb", free_gb);
     jb_object_end(&jb);
-    /* WebView2 is apartment-bound; deliver the response on the UI thread. */
+    /* The shell is on the UI thread; deliver the response there. */
     if (!PostMessageW(g_hwnd_main, WM_DISK_SPACE, 0, (LPARAM)response))
         HeapFree(GetProcessHeap(), 0, response);
     HeapFree(GetProcessHeap(), 0, path);
@@ -449,7 +413,7 @@ static const wchar_t *app_version(void)
     if (!version[0]) {
         wchar_t exe[MAX_PATH];
         DWORD unused = 0, size;
-        if (GetModuleFileNameW(NULL, exe, MAX_PATH) &&
+        if (GetModuleFileNameW(g_hInstance, exe, MAX_PATH) &&   /* this DLL carries the VERSIONINFO */
             (size = GetFileVersionInfoSizeW(exe, &unused)) != 0) {
             void *data = malloc(size);
             VS_FIXEDFILEINFO *info = NULL;
@@ -694,8 +658,8 @@ static void build_vm_json(JsonBuilder *jb, int i)
         jb_string(jb, L"pendingOp", pending ? pending : L"");
     }
 
-    /* Display mode (Windows and Linux guests; the IDD window owns the settings file). */
-    if (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0) {
+    /* Display mode (Windows guests; the IDD window owns the settings file). */
+    if (_wcsicmp(v->os_type, L"Windows") == 0) {
         wchar_t res[32];
         UINT hz = 60;
         int k, driver = -1;
@@ -729,6 +693,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
     {
         int s, b;
         int cur_snap, cur_branch;
+        int written = 0, nodes_written = 0, branches_written = 0;
         snapshot_find_current(st_, v->vhdx_path, &cur_snap, &cur_branch);
 
         jb_int(jb, L"snapCurrent", cur_snap);
@@ -743,7 +708,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
             for (b = 0; b < st_->base_branch_count; b++) {
                 FILETIME bft;
                 if (!st_->base_branches[b].valid) continue;
-                if (b > 0) jb_append(jb, L",");
+                if (written++ > 0) jb_append(jb, L",");
                 jb_object_begin(jb);
                 jb_string(jb, L"name", st_->base_branches[b].friendly_name);
                 if (snapshot_get_branch_time(st_, -2, b, &bft)) {
@@ -767,11 +732,12 @@ static void build_vm_json(JsonBuilder *jb, int i)
                 SYSTEMTIME sys_t;
                 wchar_t date_buf[64];
                 if (!st_->nodes[s].valid) continue;
+                branches_written = 0;
                 FileTimeToLocalFileTime(&st_->nodes[s].created, &local_ft);
                 FileTimeToSystemTime(&local_ft, &sys_t);
                 swprintf_s(date_buf, 64, L"%04d-%02d-%02d %02d:%02d",
                     sys_t.wYear, sys_t.wMonth, sys_t.wDay, sys_t.wHour, sys_t.wMinute);
-                if (s > 0) jb_append(jb, L",");
+                if (nodes_written++ > 0) jb_append(jb, L",");
                 jb_object_begin(jb);
                 jb_string(jb, L"name", st_->nodes[s].name);
                 jb_string(jb, L"date", date_buf);
@@ -788,7 +754,7 @@ static void build_vm_json(JsonBuilder *jb, int i)
                     for (b = 0; b < st_->nodes[s].branch_count; b++) {
                         FILETIME bft;
                         if (!st_->nodes[s].branches[b].valid) continue;
-                        if (b > 0) jb_append(jb, L",");
+                        if (branches_written++ > 0) jb_append(jb, L",");
                         jb_object_begin(jb);
                         jb_string(jb, L"name", st_->nodes[s].branches[b].friendly_name);
                         if (snapshot_get_branch_time(st_, s, b, &bft)) {
@@ -871,15 +837,40 @@ static void track_vm_transitions(void)
     g_vm_seen_count = n;
 }
 
+/* The VM list with every snapshot tree can be large (32 VMs, 64 snapshots of
+   8 branches each), so it is built in one heap buffer kept for the life of
+   the process. UI thread only. */
+#define STATE_JSON_CHARS (2u * 1024 * 1024)
+static wchar_t *state_json_buffer(void)
+{
+    static wchar_t *buffer;
+    if (!buffer) buffer = (wchar_t *)malloc(STATE_JSON_CHARS * sizeof(wchar_t));
+    return buffer;
+}
+
+/* Post a built message, unless it did not fit: half a message is not JSON. */
+static void post_state_json(const JsonBuilder *jb)
+{
+    static BOOL logged;
+    if (!jb->truncated) {
+        ui_bridge_post(jb->buf);
+    } else if (!logged) {
+        logged = TRUE;
+        ui_log(L"Error: the VM list is too large to show (more than %u characters); the window may be out of date.",
+               (unsigned)STATE_JSON_CHARS);
+    }
+}
+
 static void send_vm_list(void)
 {
-    wchar_t buf[131072];
+    wchar_t *buf = state_json_buffer();
     JsonBuilder jb;
     int i, count;
 
+    if (!buf) return;
     track_vm_transitions();
     count = asb_vm_count();
-    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_init(&jb, buf, STATE_JSON_CHARS);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"vmListChanged");
 
@@ -904,7 +895,7 @@ static void send_vm_list(void)
     }
 
     jb_object_end(&jb);
-    webview2_post(buf);
+    post_state_json(&jb);
 }
 
 static void send_host_info(void)
@@ -916,7 +907,7 @@ static void send_host_info(void)
     jb_string(&jb, L"type", L"hostInfo");
     build_host_info_json(&jb);
     jb_object_end(&jb);
-    webview2_post(buf);
+    post_state_json(&jb);
 }
 
 /* IF_TYPE constants */
@@ -970,7 +961,7 @@ static void send_adapters(void)
     jb_array_end(&jb);
     jb_int(&jb, L"defaultIndex", def_idx);
     jb_object_end(&jb);
-    webview2_post(buf);
+    ui_bridge_post(buf);
 }
 
 static void send_templates(void)
@@ -992,7 +983,7 @@ static void send_templates(void)
     }
     jb_array_end(&jb);
     jb_object_end(&jb);
-    webview2_post(buf);
+    ui_bridge_post(buf);
 }
 
 static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM lp, LPARAM data)
@@ -1005,12 +996,13 @@ static int CALLBACK disk_folder_browse_callback(HWND hwnd, UINT message, LPARAM 
 
 static void send_full_state(void)
 {
-    wchar_t buf[131072];
+    wchar_t *buf = state_json_buffer();
     JsonBuilder jb;
     int i, count;
 
+    if (!buf) return;
     track_vm_transitions();
-    jb_init(&jb, buf, ARRAYSIZE(buf));
+    jb_init(&jb, buf, STATE_JSON_CHARS);
     jb_object_begin(&jb);
     jb_string(&jb, L"type", L"fullState");
 
@@ -1070,7 +1062,7 @@ static void send_full_state(void)
     }
 
     jb_object_end(&jb);
-    webview2_post(buf);
+    ui_bridge_post(buf);
 }
 
 /* ---- UI logging, alerts and notices ---- */
@@ -1097,7 +1089,7 @@ static void ui_log_post(const wchar_t *msg)
     jb_string(&jb, L"type", L"log");
     jb_string(&jb, L"message", msg);
     jb_object_end(&jb);
-    webview2_post(json);
+    ui_bridge_post(json);
 }
 
 /* Append to a JSON string body, escaping quotes, backslashes and every
@@ -1152,7 +1144,7 @@ static void post_text_message(const wchar_t *type, const wchar_t *kind,
     json_raw_append(buf, cap, &len, L"\",\"message\":\"");
     json_escape_append(buf, cap, &len, message);
     json_raw_append(buf, cap, &len, L"\"}");
-    webview2_post(buf);
+    ui_bridge_post(buf);
     free(buf);
 }
 
@@ -1239,7 +1231,8 @@ static void describe_hresult(HRESULT hr, wchar_t *out, size_t cap)
 
 /* ---- Display connections ---- */
 
-/* Linux / legacy display path: connects to vmwp.exe's Basic Session named
+/* The console of manual-install ("Other") VMs, and of a Windows VM before
+   its display driver is up: connects to vmwp.exe's Basic Session named
    pipe (\\.\pipe\<vm-name>.BasicSession) and renders via MsRdpClient10
    ActiveX. Reads the synthetic Hyper-V Video adapter framebuffer — works
    for any guest from BIOS / GRUB onward, no guest cooperation required.
@@ -1300,8 +1293,7 @@ static void do_connect_idd(int idx)
 
 /* User-initiated Connect: open BOTH the IDD display and the RDP
    basic-session display side-by-side.
-     - IDD renders the in-VM agent's captured framebuffer (Windows: VDD,
-       Linux: appsandbox-display via vsock :2). Empty until the agent
+     - IDD renders the in-VM agent's captured framebuffer (the VDD). Empty until the agent
        comes online.
      - RDP renders the Hyper-V Video adapter framebuffer via vmwp.exe's
        BasicSession named pipe. Works from BIOS / GRUB onward, no guest
@@ -1430,7 +1422,7 @@ static void vm_icon_post(const VmInstance *v)
     if (!data) {
         wchar_t none[160];
         swprintf_s(none, ARRAYSIZE(none), L"{\"type\":\"vmIcon\",\"vmId\":\"%s\",\"data\":\"\"}", id);
-        webview2_post(none);
+        ui_bridge_post(none);
         return;
     }
     if (!CryptBinaryToStringW(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, NULL, &b64len)) {
@@ -1443,7 +1435,7 @@ static void vm_icon_post(const VmInstance *v)
     if (b64 && msg && CryptBinaryToStringW(data, len, CRYPT_STRING_BASE64 | CRYPT_STRING_NOCRLF, b64, &b64len)) {
         swprintf_s(msg, cap, L"{\"type\":\"vmIcon\",\"vmId\":\"%s\",\"data\":\"data:%s;base64,%s\"}",
                    id, mime, b64);
-        webview2_post(msg);
+        ui_bridge_post(msg);
     }
     free(b64);
     free(msg);
@@ -1497,7 +1489,7 @@ static void launch_vm_tick(HWND hwnd)
         swprintf_s(msg, ARRAYSIZE(msg), L"There is no VM named \"%s\" anymore. "
                    L"Delete the shortcut or create it again.", g_launch_vm);
         g_launch_vm[0] = 0;
-        ShowWindow(hwnd, SW_RESTORE);
+        shell_show(TRUE);
         ui_alert(L"error", L"VM not found", msg);
         return;
     }
@@ -1505,12 +1497,12 @@ static void launch_vm_tick(HWND hwnd)
     if (v->running) {
         do_connect_vm(idx);
     } else if (v->starting || asb_vm_is_building(asb_vm_get(idx))) {
-        ShowWindow(hwnd, SW_RESTORE);
+        shell_show(TRUE);
         ui_alert(L"info", NULL, L"That VM is busy right now; try again in a moment.");
     } else {
         HRESULT hr = asb_vm_start(asb_vm_get(idx), -1, -1, NULL);
         if (FAILED(hr)) {
-            ShowWindow(hwnd, SW_RESTORE);
+            shell_show(TRUE);
             ui_show_alert(L"The VM could not be started. See the log in App Sandbox.");
         } else if (_wcsicmp(v->os_type, L"Other") == 0) {
             open_console_when_running(v->unique_id);   /* no display driver to auto-open */
@@ -1846,7 +1838,7 @@ static void post_exit_progress(BOOL active, int remaining)
     swprintf_s(buf, ARRAYSIZE(buf),
                L"{\"type\":\"exitProgress\",\"active\":%s,\"remaining\":%d,\"session\":%s}",
                active ? L"true" : L"false", remaining, g_exit_for_session ? L"true" : L"false");
-    webview2_post(buf);
+    ui_bridge_post(buf);
 }
 
 /* The exit sequence starts VM operations, opens dialogs and finally
@@ -1933,7 +1925,7 @@ static void exit_timeout(HWND hwnd, const UINT64 *ids, int n)
     buttons[2].nButtonID = 102; buttons[2].pszButtonText = L"Don't exit";
     ZeroMemory(&tdc, sizeof(tdc));
     tdc.cbSize = sizeof(tdc);
-    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.hwndParent = dialog_owner();
     tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
     tdc.pszWindowTitle = L"App Sandbox";
     tdc.pszMainIcon = TD_WARNING_ICON;
@@ -2023,13 +2015,13 @@ static void confirm_exit(HWND hwnd, BOOL from_close)
     HRESULT hr;
 
     if (g_exit_waiting) {                 /* already exiting: keep going in the tray */
-        ShowWindow(hwnd, SW_HIDE);
+        shell_show(FALSE);
         return;
     }
     count_vm_activity(&running, &busy);
     if (!running && !busy) { DestroyWindow(hwnd); return; }
     if (from_close && running && !busy && asb_get_suppress_tray_warn()) {
-        ShowWindow(hwnd, SW_HIDE);
+        shell_show(FALSE);
         return;
     }
 
@@ -2066,7 +2058,7 @@ static void confirm_exit(HWND hwnd, BOOL from_close)
 
     ZeroMemory(&tdc, sizeof(tdc));
     tdc.cbSize = sizeof(tdc);
-    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.hwndParent = dialog_owner();
     tdc.dwFlags = TDF_USE_COMMAND_LINKS | TDF_ALLOW_DIALOG_CANCELLATION;
     tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
     tdc.pszWindowTitle = L"App Sandbox";
@@ -2090,9 +2082,9 @@ static void confirm_exit(HWND hwnd, BOOL from_close)
             asb_save();
             send_host_info();
         }
-        ShowWindow(hwnd, SW_HIDE);
+        shell_show(FALSE);
     } else if (btn == BTN_SHUTDOWN) {
-        if (!IsWindowVisible(hwnd)) ShowWindow(hwnd, SW_RESTORE);
+        if (!shell_visible()) shell_show(TRUE);
         exit_begin(hwnd, FALSE);
     } else if (btn == BTN_EXIT_NOW) {
         DestroyWindow(hwnd);
@@ -2102,6 +2094,7 @@ static void confirm_exit(HWND hwnd, BOOL from_close)
 /* Tray "Force stop": the same warning the page shows. */
 static BOOL confirm_force_stop(HWND hwnd, const wchar_t *name)
 {
+    (void)hwnd;
     TASKDIALOGCONFIG tdc;
     TASKDIALOG_BUTTON button;
     wchar_t content[600];
@@ -2115,7 +2108,7 @@ static BOOL confirm_force_stop(HWND hwnd, const wchar_t *name)
     button.pszButtonText = L"Force stop";
     ZeroMemory(&tdc, sizeof(tdc));
     tdc.cbSize = sizeof(tdc);
-    tdc.hwndParent = IsWindowVisible(hwnd) ? hwnd : NULL;
+    tdc.hwndParent = dialog_owner();
     tdc.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION;
     tdc.dwCommonButtons = TDCBF_CANCEL_BUTTON;
     tdc.pszWindowTitle = L"App Sandbox";
@@ -2152,7 +2145,7 @@ static BOOL path_is_file(const wchar_t *path)
 static BOOL explorer_open_folder(const wchar_t *folder)
 {
     if (!path_is_directory(folder)) return FALSE;
-    return (INT_PTR)ShellExecuteW(g_hwnd_main, L"open", folder, NULL, NULL, SW_SHOWNORMAL) > 32;
+    return (INT_PTR)ShellExecuteW(NULL, L"open", folder, NULL, NULL, SW_SHOWNORMAL) > 32;
 }
 
 /* Show the folder holding path in File Explorer, with path selected. */
@@ -2178,10 +2171,10 @@ static void open_url(const wchar_t *url)
     if (n && n < MAX_PATH - 16) {
         wcscat_s(explorer, MAX_PATH, L"\\explorer.exe");
         swprintf_s(args, ARRAYSIZE(args), L"\"%s\"", url);
-        if ((INT_PTR)ShellExecuteW(g_hwnd_main, L"open", explorer, args, NULL, SW_SHOWNORMAL) > 32)
+        if ((INT_PTR)ShellExecuteW(NULL, L"open", explorer, args, NULL, SW_SHOWNORMAL) > 32)
             return;
     }
-    ShellExecuteW(g_hwnd_main, L"open", url, NULL, NULL, SW_SHOWNORMAL);
+    ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
 }
 
 /* Links of the About section, by name. */
@@ -2365,259 +2358,6 @@ static void build_diagnostics(wchar_t *buf, size_t cap)
     diag_append(buf, cap, L"App folder: %s\r\n", path);
 }
 
-/* ---- System tray ---- */
-
-static void tray_add(HWND hwnd)
-{
-    ZeroMemory(&g_nid, sizeof(g_nid));
-    g_nid.cbSize = sizeof(g_nid);
-    g_nid.hWnd = hwnd;
-    g_nid.uID = 1;
-    g_nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
-    g_nid.uCallbackMessage = WM_TRAYICON;
-    g_nid.hIcon = LoadIconW(g_hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
-    wcscpy_s(g_nid.szTip, 128, L"App Sandbox");
-    Shell_NotifyIconW(NIM_ADD, &g_nid);
-}
-
-static void tray_remove(void) { Shell_NotifyIconW(NIM_DELETE, &g_nid); }
-
-#ifndef DWMWA_BORDER_COLOR
-#define DWMWA_BORDER_COLOR 34
-#endif
-
-/* ---- Themed tray menu ----
- *
- * HMENU is retained for layout + input handling, but every item is MF_OWNERDRAW
- * so we can paint it in the same palette as the WebView2 front end
- * (see web/style.css). A WH_CALLWNDPROC hook paints the outer frame dark
- * via DWMWA_BORDER_COLOR (no-op on Win10 / pre-22H2). */
-
-#define TRAY_BG_COLOR       RGB(0x1e, 0x1e, 0x1e)  /* --bg */
-#define TRAY_SEL_COLOR      RGB(0x2a, 0x5a, 0x8a)  /* primary btn bg */
-#define TRAY_TEXT_COLOR     RGB(0xe6, 0xe6, 0xe6)  /* --text */
-#define TRAY_TEXT_DIM_COLOR RGB(0x88, 0x88, 0x88)  /* --text-dim */
-#define TRAY_SEP_COLOR      RGB(0x3e, 0x3e, 0x3e)  /* --ctrl-border */
-
-typedef struct {
-    wchar_t label[256];
-    BOOL    is_separator;
-    BOOL    is_header;    /* dim label used as a section heading */
-    BOOL    is_indented;  /* indent under a header */
-} TrayDrawItem;
-
-static TrayDrawItem g_tray_items[64];
-static int          g_tray_item_count;
-static HBRUSH       g_tray_bg_brush;
-
-static HFONT tray_get_font(void)
-{
-    static HFONT font = NULL;
-    if (!font) {
-        NONCLIENTMETRICSW ncm;
-        ZeroMemory(&ncm, sizeof(ncm));
-        ncm.cbSize = sizeof(ncm);
-        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
-            font = CreateFontIndirectW(&ncm.lfMenuFont);
-        if (!font) font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
-    }
-    return font;
-}
-
-static void tray_append(HMENU menu, UINT id, const wchar_t *label,
-                        BOOL is_separator, BOOL is_header, BOOL is_indented)
-{
-    TrayDrawItem *it;
-    UINT flags;
-    if (g_tray_item_count >= 64) return;
-
-    it = &g_tray_items[g_tray_item_count];
-    ZeroMemory(it, sizeof(*it));
-    if (label) wcscpy_s(it->label, 256, label);
-    it->is_separator = is_separator;
-    it->is_header    = is_header;
-    it->is_indented  = is_indented;
-
-    flags = MF_OWNERDRAW | (is_separator ? MF_SEPARATOR : 0);
-    AppendMenuW(menu, flags, id, (LPCWSTR)(UINT_PTR)g_tray_item_count);
-    g_tray_item_count++;
-}
-
-static void tray_handle_measure(MEASUREITEMSTRUCT *mis)
-{
-    TrayDrawItem *it;
-    HDC hdc;
-    HFONT old;
-    SIZE sz;
-
-    if (!mis || mis->CtlType != ODT_MENU) return;
-    if ((int)mis->itemData >= g_tray_item_count) return;
-
-    it = &g_tray_items[mis->itemData];
-    if (it->is_separator) {
-        mis->itemHeight = 7;
-        mis->itemWidth  = 0;
-        return;
-    }
-
-    hdc = GetDC(NULL);
-    old = (HFONT)SelectObject(hdc, tray_get_font());
-    GetTextExtentPoint32W(hdc, it->label, (int)wcslen(it->label), &sz);
-    SelectObject(hdc, old);
-    ReleaseDC(NULL, hdc);
-
-    mis->itemHeight = sz.cy + (it->is_header ? 6 : 10);
-    mis->itemWidth  = sz.cx + (it->is_indented ? 40 : 28);
-}
-
-static void tray_handle_draw(DRAWITEMSTRUCT *dis)
-{
-    TrayDrawItem *it;
-    RECT rc;
-    BOOL selected, grayed;
-    COLORREF bg, fg;
-    HBRUSH bg_brush;
-    HFONT old_font;
-    int indent;
-
-    if (!dis || dis->CtlType != ODT_MENU) return;
-    if ((int)dis->itemData >= g_tray_item_count) return;
-
-    it = &g_tray_items[dis->itemData];
-    rc = dis->rcItem;
-
-    if (it->is_separator) {
-        HPEN pen, old_pen;
-        int y;
-        bg_brush = CreateSolidBrush(TRAY_BG_COLOR);
-        FillRect(dis->hDC, &rc, bg_brush);
-        DeleteObject(bg_brush);
-        pen = CreatePen(PS_SOLID, 1, TRAY_SEP_COLOR);
-        old_pen = (HPEN)SelectObject(dis->hDC, pen);
-        y = (rc.top + rc.bottom) / 2;
-        MoveToEx(dis->hDC, rc.left + 14, y, NULL);
-        LineTo(dis->hDC, rc.right - 14, y);
-        SelectObject(dis->hDC, old_pen);
-        DeleteObject(pen);
-        return;
-    }
-
-    selected = (dis->itemState & ODS_SELECTED) && !(dis->itemState & ODS_GRAYED);
-    grayed   = (dis->itemState & ODS_GRAYED) != 0;
-
-    bg = selected ? TRAY_SEL_COLOR : TRAY_BG_COLOR;
-    fg = (grayed || it->is_header) ? TRAY_TEXT_DIM_COLOR : TRAY_TEXT_COLOR;
-
-    bg_brush = CreateSolidBrush(bg);
-    FillRect(dis->hDC, &rc, bg_brush);
-    DeleteObject(bg_brush);
-
-    SetBkMode(dis->hDC, TRANSPARENT);
-    SetTextColor(dis->hDC, fg);
-    old_font = (HFONT)SelectObject(dis->hDC, tray_get_font());
-
-    indent = it->is_indented ? 28 : 14;
-    rc.left += indent;
-    rc.right -= 14;
-    DrawTextW(dis->hDC, it->label, -1, &rc,
-              DT_SINGLELINE | DT_VCENTER | DT_LEFT | DT_NOPREFIX);
-
-    SelectObject(dis->hDC, old_font);
-}
-
-/* WH_CALLWNDPROC hook: catches messages sent to the popup menu window
-   (class "#32768") as TrackPopupMenu brings it up, and paints its border
-   the same color as the menu background so it visually disappears. */
-static LRESULT CALLBACK tray_menu_hook_proc(int code, WPARAM wp, LPARAM lp)
-{
-    if (code == HC_ACTION) {
-        CWPSTRUCT *cwp = (CWPSTRUCT *)lp;
-        wchar_t cls[16];
-        if (GetClassNameW(cwp->hwnd, cls, 16) > 0 && wcscmp(cls, L"#32768") == 0) {
-            COLORREF border = TRAY_BG_COLOR;
-            DwmSetWindowAttribute(cwp->hwnd, DWMWA_BORDER_COLOR,
-                                  &border, sizeof(border));
-        }
-    }
-    return CallNextHookEx(NULL, code, wp, lp);
-}
-
-static void tray_show_menu(HWND hwnd)
-{
-    HMENU menu = CreatePopupMenu();
-    POINT pt;
-    int i, cmd, count = asb_vm_count();
-    UINT64 vm_ids[ASB_MAX_VMS] = {0};
-    HHOOK hook;
-    MENUINFO mi;
-
-    if (!g_tray_bg_brush) g_tray_bg_brush = CreateSolidBrush(TRAY_BG_COLOR);
-    ZeroMemory(&mi, sizeof(mi));
-    mi.cbSize  = sizeof(mi);
-    mi.fMask   = MIM_BACKGROUND;
-    mi.hbrBack = g_tray_bg_brush;
-    SetMenuInfo(menu, &mi);
-
-    g_tray_item_count = 0;
-
-    tray_append(menu, TRAY_CMD_SHOW, L"Show App Sandbox", FALSE, FALSE, FALSE);
-    tray_append(menu, 0,             NULL,                TRUE,  FALSE, FALSE);
-
-    for (i = 0; i < count; i++) {
-        VmInstance *v = asb_vm_instance(asb_vm_get(i));
-        if (!v || !v->running) continue;
-        vm_ids[i] = v->unique_id;
-        tray_append(menu, 0, v->name, FALSE, TRUE, FALSE);
-        tray_append(menu, TRAY_CMD_CONNECT_BASE + i,  L"\U0001F4FA  Connect",    FALSE, FALSE, TRUE);
-        tray_append(menu, TRAY_CMD_SHUTDOWN_BASE + i, L"\u23FB  Shut down",      FALSE, FALSE, TRUE);
-        tray_append(menu, TRAY_CMD_STOP_BASE + i,     L"\u2715  Force stop\u2026", FALSE, FALSE, TRUE);
-        tray_append(menu, 0, NULL, TRUE, FALSE, FALSE);
-    }
-
-    tray_append(menu, TRAY_CMD_EXIT, L"Exit", FALSE, FALSE, FALSE);
-
-    GetCursorPos(&pt);
-    SetForegroundWindow(hwnd);
-
-    hook = SetWindowsHookExW(WH_CALLWNDPROC, tray_menu_hook_proc,
-                             NULL, GetCurrentThreadId());
-    cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, NULL);
-    if (hook) UnhookWindowsHookEx(hook);
-    DestroyMenu(menu);
-
-    if (cmd == TRAY_CMD_SHOW) {
-        ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
-    } else if (cmd == TRAY_CMD_EXIT) {
-        confirm_exit(hwnd, FALSE);
-    } else if (cmd >= TRAY_CMD_STOP_BASE) {
-        int slot = cmd - TRAY_CMD_STOP_BASE;
-        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
-        wchar_t name[256];
-        int vi;
-        if (!vm) return;
-        wcscpy_s(name, ARRAYSIZE(name), vm->name);
-        if (!confirm_force_stop(hwnd, name)) return;
-        /* Resolve again: the VM may have changed while the question was open. */
-        vm = asb_find_vm_by_id(vm_ids[slot]);
-        vi = vm ? asb_vm_index((AsbVm)vm) : -1;
-        if (vi < 0 || g_bg_op) return;
-        reconcile_displays();
-        safe_destroy_rdp(vi);
-        safe_destroy_idd(vi);
-        bg_op_start_one(BG_STOP, vm->unique_id);
-    } else if (cmd >= TRAY_CMD_SHUTDOWN_BASE) {
-        int slot = cmd - TRAY_CMD_SHUTDOWN_BASE;
-        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
-        if (!vm || g_bg_op) return;
-        bg_op_start_one(BG_SHUTDOWN, vm->unique_id);
-    } else if (cmd >= TRAY_CMD_CONNECT_BASE) {
-        int slot = cmd - TRAY_CMD_CONNECT_BASE;
-        VmInstance *vm = slot < ASB_MAX_VMS ? asb_find_vm_by_id(vm_ids[slot]) : NULL;
-        if (vm) do_connect_vm(asb_vm_index((AsbVm)vm));
-    }
-}
-
 /* ---- Prerequisite feature enable (background thread) ---- */
 
 #define WM_PREREQ_PROGRESS (WM_APP + 18)
@@ -2643,7 +2383,7 @@ static DWORD WINAPI enable_feature_thread(LPVOID param)
     return 0;
 }
 
-/* ---- WebView2 message dispatch ---- */
+/* ---- Shell message dispatch ---- */
 
 static BOOL json_vm_index(const wchar_t *json, int *idx)
 {
@@ -2670,7 +2410,7 @@ static void start_core_async(void)
 {
     HANDLE t;
     if (g_prereq_ok || InterlockedCompareExchange(&g_core_starting, 1, 0) != 0) return;
-    webview2_post(L"{\"type\":\"coreLoading\"}");
+    ui_bridge_post(L"{\"type\":\"coreLoading\"}");
     t = CreateThread(NULL, 0, core_start_thread, NULL, 0, NULL);
     if (t) CloseHandle(t);
     else core_start_thread(NULL);   /* no thread: do it inline */
@@ -2728,31 +2468,6 @@ static void notify_snapshot_failure(const wchar_t *what, HRESULT hr)
     ui_notice(L"error", message);
 }
 
-/* Smallest window size for the page's minimum, at the window's DPI, never
-   larger than the monitor's work area. */
-static SIZE min_window_size(HWND hwnd)
-{
-    SIZE size = { 0, 0 };
-    MONITORINFO mi;
-    RECT rc;
-    UINT dpi;
-    if (!hwnd || g_min_css_width <= 0 || g_min_css_height <= 0) return size;
-    dpi = GetDpiForWindow(hwnd);
-    if (!dpi) dpi = 96;
-    rc.left = rc.top = 0;
-    rc.right = MulDiv(g_min_css_width, (int)dpi, 96);
-    rc.bottom = MulDiv(g_min_css_height, (int)dpi, 96);
-    AdjustWindowRectExForDpi(&rc, WS_OVERLAPPEDWINDOW, FALSE, 0, dpi);
-    size.cx = rc.right - rc.left;
-    size.cy = rc.bottom - rc.top;
-    mi.cbSize = sizeof(mi);
-    if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
-        if (size.cx > mi.rcWork.right - mi.rcWork.left) size.cx = mi.rcWork.right - mi.rcWork.left;
-        if (size.cy > mi.rcWork.bottom - mi.rcWork.top) size.cy = mi.rcWork.bottom - mi.rcWork.top;
-    }
-    return size;
-}
-
 /* Run a VM operation on the worker thread; say so when it cannot start. */
 static void start_vm_op(BgOpKind kind, UINT64 id)
 {
@@ -2770,13 +2485,13 @@ static void send_mcp_status(void)
         wcscpy_s(message, (size_t)chars + 40, L"{\"type\":\"mcpStatus\",\"mcp\":");
         MultiByteToWideChar(CP_UTF8, 0, status, -1, message + wcslen(message), chars);
         wcscat_s(message, (size_t)chars + 40, L"}");
-        webview2_post(message);
+        ui_bridge_post(message);
     }
     free(message);
     free(status);
 }
 
-static void handle_webview2_message(const wchar_t *json)
+static void handle_shell_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
 
@@ -2786,13 +2501,12 @@ static void handle_webview2_message(const wchar_t *json)
     if (wcscmp(action, L"uiReady") == 0) {
         /* JS has loaded and registered its message listener; deliver any
          * messages queued before WebView2 was ready (e.g. early ui_log lines). */
-        webview2_flush_queue();
         if (g_prereq_ok) {            /* page reloaded after start-up */
             send_full_state();   /* an exit in progress reports again with its next tick */
             return;
         }
         if (g_core_starting) {        /* page reloaded while the core starts */
-            webview2_post(L"{\"type\":\"coreLoading\"}");
+            ui_bridge_post(L"{\"type\":\"coreLoading\"}");
             return;
         }
         start_core_async();
@@ -2808,7 +2522,7 @@ static void handle_webview2_message(const wchar_t *json)
         BOOL is_tpl = FALSE, manual_os;
 
         if (!g_prereq_ok) {
-            webview2_post(g_prereq_reboot_pending
+            ui_bridge_post(g_prereq_reboot_pending
                 ? L"{\"type\":\"prereqReboot\"}"
                 : L"{\"type\":\"prereqRequired\"}");
             post_create_result(FALSE, g_prereq_reboot_pending
@@ -2831,17 +2545,13 @@ static void handle_webview2_message(const wchar_t *json)
             error = !json_has_key(json, L"adminUser")
                 ? L"Username is required."
                 : user_buf[0]
-                    ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
-                        ? L"Username cannot exceed 32 characters (Linux limit)."
-                        : L"Username cannot exceed 20 characters.")
+                    ? L"Username cannot exceed 20 characters."
                     : L"adminUser must be a valid JSON string without NUL characters.";
         } else if (!manual_os && !json_get_string(json, L"adminPass", pass_buf, ARRAYSIZE(pass_buf))) {
             error = !json_has_key(json, L"adminPass")
                 ? L"Password is required."
                 : pass_buf[0]
-                    ? (_wcsicmp(os_buf, L"Linux") == 0 && !tpl_buf[0]
-                        ? L"Password is too long (max 255 bytes)."
-                        : L"Password is too long (max 127 characters for Windows).")
+                    ? L"Password is too long (max 127 characters for Windows)."
                     : L"adminPass must be a valid JSON string without NUL characters.";
         } else if (!json_get_string(json, L"gpuId", gpu_id, ARRAYSIZE(gpu_id)) &&
                    json_has_key(json, L"gpuId")) {
@@ -2921,7 +2631,7 @@ static void handle_webview2_message(const wchar_t *json)
         int idx, si = -1, bi = -1;
         wchar_t bname[128] = {0};
         if (!g_prereq_ok) {
-            webview2_post(g_prereq_reboot_pending
+            ui_bridge_post(g_prereq_reboot_pending
                 ? L"{\"type\":\"prereqReboot\"}"
                 : L"{\"type\":\"prereqRequired\"}");
             return;
@@ -3101,7 +2811,7 @@ static void handle_webview2_message(const wchar_t *json)
             json_get_string(json, L"resolution", res, ARRAYSIZE(res)) &&
             json_get_int(json, L"hz", &hz) &&
             (v = asb_vm_instance(asb_vm_get(idx))) != NULL &&
-            (_wcsicmp(v->os_type, L"Windows") == 0 || _wcsicmp(v->os_type, L"Linux") == 0)) {
+            _wcsicmp(v->os_type, L"Windows") == 0) {
             for (i = 0; i < ASB_MAX_VMS; i++)
                 if (g_display_vm_ids[i] == v->unique_id && g_idd_displays[i] &&
                     vm_display_idd_is_open(g_idd_displays[i]))
@@ -3135,7 +2845,7 @@ static void handle_webview2_message(const wchar_t *json)
                 wchar_t file[MAX_PATH] = L"", err[256] = L"";
                 ZeroMemory(&ofn, sizeof(ofn));
                 ofn.lStructSize = sizeof(ofn);
-                ofn.hwndOwner = g_hwnd_main;
+                ofn.hwndOwner = g_hwnd_shell;
                 ofn.lpstrFilter = L"Images (*.png, *.ico)\0*.png;*.ico\0All Files\0*.*\0";
                 ofn.lpstrFile = file;
                 ofn.nMaxFile = MAX_PATH;
@@ -3248,7 +2958,7 @@ static void handle_webview2_message(const wchar_t *json)
             PIDLIST_ABSOLUTE selection;
             wchar_t path[MAX_PATH] = { 0 };
             ZeroMemory(&browse, sizeof(browse));
-            browse.hwndOwner = g_hwnd_main;
+            browse.hwndOwner = g_hwnd_shell;
             browse.lpszTitle = L"Choose where to save the exported VM (a <name>.asbvm folder is created there)";
             browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
             selection = SHBrowseForFolderW(&browse);
@@ -3265,7 +2975,7 @@ static void handle_webview2_message(const wchar_t *json)
         wchar_t file[MAX_PATH] = { 0 };
         ZeroMemory(&ofn, sizeof(ofn));
         ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = g_hwnd_main;
+        ofn.hwndOwner = g_hwnd_shell;
         ofn.lpstrTitle = L"Import a VM: choose its vm.json (App Sandbox export) or a .vhdx disk";
         ofn.lpstrFilter = L"App Sandbox export or disk (vm.json, *.vhdx)\0vm.json;*.vhdx\0All Files\0*.*\0";
         ofn.lpstrFile = file;
@@ -3318,7 +3028,7 @@ static void handle_webview2_message(const wchar_t *json)
         json_get_string(json, L"path", initial, MAX_PATH);
         if (!initial[0]) asb_default_disk_directory(initial, MAX_PATH);
         ZeroMemory(&browse, sizeof(browse));
-        browse.hwndOwner = g_hwnd_main;
+        browse.hwndOwner = g_hwnd_shell;
         browse.lpszTitle = L"Choose a folder for VM disks";
         browse.ulFlags = BIF_RETURNONLYFSDIRS | BIF_NEWDIALOGSTYLE | BIF_EDITBOX;
         browse.lpfn = disk_folder_browse_callback;
@@ -3333,7 +3043,7 @@ static void handle_webview2_message(const wchar_t *json)
                 jb_string(&jb, L"type", L"diskDirectoryBrowseResult");
                 jb_string(&jb, L"path", path);
                 jb_object_end(&jb);
-                webview2_post(json_buf);
+                ui_bridge_post(json_buf);
             }
             CoTaskMemFree(selection);
         }
@@ -3342,7 +3052,7 @@ static void handle_webview2_message(const wchar_t *json)
         wchar_t file[MAX_PATH] = { 0 };
         ZeroMemory(&ofn, sizeof(ofn));
         ofn.lStructSize = sizeof(ofn);
-        ofn.hwndOwner = g_hwnd_main;
+        ofn.hwndOwner = g_hwnd_shell;
         ofn.lpstrFilter = L"ISO Files (*.iso)\0*.iso\0All Files\0*.*\0";
         ofn.lpstrFile = file;
         ofn.nMaxFile = MAX_PATH;
@@ -3356,7 +3066,7 @@ static void handle_webview2_message(const wchar_t *json)
             jb_string(&jb, L"type", L"browseResult");
             jb_string(&jb, L"path", file);
             jb_object_end(&jb);
-            webview2_post(json_buf);
+            ui_bridge_post(json_buf);
         }
     } else if (wcscmp(action, L"snapTake") == 0) {
         int vi;
@@ -3395,26 +3105,16 @@ static void handle_webview2_message(const wchar_t *json)
         prereq_reboot();
     } else if (wcscmp(action, L"getState") == 0) {
         send_full_state();
-    } else if (wcscmp(action, L"setMinSize") == 0) {
-        /* {width, height} in CSS pixels; scaled with the window's DPI. */
-        int cw = 0, ch = 0;
-        json_get_int(json, L"width", &cw);
-        json_get_int(json, L"height", &ch);
-        if (cw > 0 && ch > 0 && cw < 10000 && ch < 10000) {
-            RECT wr;
-            SIZE min;
-            g_min_css_width = cw;
-            g_min_css_height = ch;
-            min = min_window_size(g_hwnd_main);
-            if (!g_borderless_fullscreen && GetWindowRect(g_hwnd_main, &wr)) {
-                int cur_w = wr.right - wr.left;
-                int cur_h = wr.bottom - wr.top;
-                if (cur_w < min.cx || cur_h < min.cy) {
-                    SetWindowPos(g_hwnd_main, NULL, 0, 0,
-                        cur_w < min.cx ? min.cx : cur_w,
-                        cur_h < min.cy ? min.cy : cur_h,
-                        SWP_NOMOVE | SWP_NOZORDER);
-                }
+    } else if (wcscmp(action, L"confirmForceStop") == 0) {
+        /* The tray's Force stop: the warning, then the stop. */
+        int idx;
+        if (json_vm_index(json, &idx)) {
+            VmInstance *v = asb_vm_instance(asb_vm_get(idx));
+            if (v && v->running && confirm_force_stop(g_hwnd_main, v->name)) {
+                safe_destroy_rdp(idx);
+                safe_destroy_idd(idx);
+                vm_note_clear(v->unique_id);
+                start_vm_op(BG_STOP, v->unique_id);
             }
         }
     } else if (wcscmp(action, L"openFolder") == 0) {
@@ -3537,7 +3237,7 @@ static void CALLBACK ui_log_callback(const wchar_t *message, void *user_data)
         wchar_t *copy = (wchar_t *)malloc(len * sizeof(wchar_t));
         if (copy) {
             wcscpy_s(copy, len, message);
-            PostMessageW(g_hwnd_main, WM_WEBVIEW2_LOG, 0, (LPARAM)copy);
+            PostMessageW(g_hwnd_main, WM_UI_LOG, 0, (LPARAM)copy);
         }
     }
 }
@@ -3554,7 +3254,7 @@ static void ui_core_event(const CoreVmEvent *event, void *context)
     } else ui_refresh_from_core();
 }
 
-static void on_webview2_message(const wchar_t *json)
+static void on_shell_message(const wchar_t *json)
 {
     wchar_t action[64] = { 0 };
     json_get_string(json, L"action", action, ARRAYSIZE(action));
@@ -3574,22 +3274,22 @@ static void on_webview2_message(const wchar_t *json)
     }
     ++g_command_depth;
     reconcile_displays();
-    handle_webview2_message(json);
+    handle_shell_message(json);
     --g_command_depth;
     ui_refresh_from_core();
 }
 
 /* ---- Window creation ---- */
 
-HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
+HWND ui_create_main_window(HINSTANCE hInstance, HWND shell)
 {
     WNDCLASSEXW wc;
     HWND hwnd;
-    BOOL dark = TRUE;
 
     g_ui_thread_id = GetCurrentThreadId();
     asb_set_ui_thread(g_ui_thread_id);   /* the core starts on a worker thread */
     g_hInstance = hInstance;
+    g_hwnd_shell = shell;
     g_is_home_edition = detect_home_edition();
     asb_set_hinstance(hInstance);
 
@@ -3598,13 +3298,9 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
-    wc.style         = CS_HREDRAW | CS_VREDRAW;
     wc.lpfnWndProc   = main_wnd_proc;
     wc.hInstance     = hInstance;
-    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
-    wc.hbrBackground = CreateSolidBrush(RGB(30, 30, 30));
     wc.lpszClassName = UI_MAIN_WINDOW_CLASS;
-    wc.hIcon         = LoadIconW(hInstance, MAKEINTRESOURCEW(IDI_APPSANDBOX));
 
     if (!RegisterClassExW(&wc))
         return NULL;
@@ -3613,39 +3309,35 @@ HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow)
        be shut down before the process (and with it every VM) ends. */
     SetProcessShutdownParameters(0x3FF, 0);
 
+    /* A top-level window that is never shown: a second launch finds it by
+       its class, and Windows asks it before the session ends. */
     hwnd = CreateWindowExW(
-        0, UI_MAIN_WINDOW_CLASS, L"App Sandbox",
-        WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
-        CW_USEDEFAULT, CW_USEDEFAULT, UI_DEFAULT_WIDTH, UI_DEFAULT_HEIGHT,
-        NULL, NULL, hInstance, NULL);
-
+        WS_EX_TOOLWINDOW, UI_MAIN_WINDOW_CLASS, L"App Sandbox",
+        WS_POPUP, 0, 0, 0, 0, NULL, NULL, hInstance, NULL);
     if (!hwnd)
         return NULL;
 
-    /* The default size is in 100%-scaling pixels: scale it to the monitor's
-       DPI, keep it inside the work area and center it there. */
-    {
-        MONITORINFO mi;
-        UINT dpi = GetDpiForWindow(hwnd);
-        mi.cbSize = sizeof(mi);
-        if (!dpi) dpi = 96;
-        if (GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY), &mi)) {
-            int work_w = mi.rcWork.right - mi.rcWork.left, work_h = mi.rcWork.bottom - mi.rcWork.top;
-            int w = MulDiv(UI_DEFAULT_WIDTH, (int)dpi, 96), h = MulDiv(UI_DEFAULT_HEIGHT, (int)dpi, 96);
-            if (w > work_w * 9 / 10) w = work_w * 9 / 10;
-            if (h > work_h * 9 / 10) h = work_h * 9 / 10;
-            SetWindowPos(hwnd, NULL, mi.rcWork.left + (work_w - w) / 2, mi.rcWork.top + (work_h - h) / 2,
-                         w, h, SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-    }
-
-    DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
-
     g_hwnd_main = hwnd;
-    ShowWindow(hwnd, nCmdShow);
-    UpdateWindow(hwnd);
-
     return hwnd;
+}
+
+/* The shell sends one message (see ui_bridge.h). It is handled from this
+   window's queue, never inside the shell's own event handler: a command can
+   wait on HCS or open a dialog, and both dispatch messages meanwhile. */
+BOOL ui_shell_command(const wchar_t *json)
+{
+    size_t len;
+    wchar_t *copy;
+    if (!json || !g_hwnd_main) return FALSE;
+    len = wcslen(json) + 1;
+    copy = (wchar_t *)malloc(len * sizeof(wchar_t));
+    if (!copy) return FALSE;
+    memcpy(copy, json, len * sizeof(wchar_t));
+    if (!PostMessageW(g_hwnd_main, WM_SHELL_COMMAND, 0, (LPARAM)copy)) {
+        free(copy);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 /* ---- Window procedure ---- */
@@ -3669,9 +3361,8 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     if (g_show_main_msg && msg == g_show_main_msg) {
         /* Another launch found this instance running (for example after the
            window was closed to the tray while VMs keep running). */
-        if (IsIconic(hwnd) || !IsWindowVisible(hwnd))
-            ShowWindow(hwnd, SW_RESTORE);
-        SetForegroundWindow(hwnd);
+        (void)hwnd;
+        shell_show(TRUE);
         return 1;
     }
 
@@ -3681,22 +3372,11 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         hcs_set_monitor_hwnd(hwnd);
         vm_agent_set_hwnd(hwnd);
         asb_idd_probe_set_hwnd(hwnd);
-        webview2_set_message_callback(on_webview2_message);
-        webview2_set_accelerator_callback(on_webview2_accelerator);
-        if (!webview2_init(hwnd, g_hInstance)) {
-            MessageBoxW(hwnd, L"WebView2 initialization failed.\nPlease install Microsoft Edge WebView2 Runtime.",
-                        L"App Sandbox", MB_ICONERROR);
-        }
-        tray_add(hwnd);
         /* Let a second launch reach this window even when integrity levels
            differ (UIPI would otherwise drop the message). */
         if (g_show_main_msg)
             ChangeWindowMessageFilterEx(hwnd, g_show_main_msg, MSGFLT_ALLOW, NULL);
         ChangeWindowMessageFilterEx(hwnd, WM_COPYDATA, MSGFLT_ALLOW, NULL);
-        return 0;
-
-    case WM_SIZE:
-        webview2_resize(hwnd);
         return 0;
 
     case WM_TIMER:
@@ -3732,46 +3412,6 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         break;
     }
-
-    case WM_KEYDOWN:
-        if (wp == VK_F11 && !(lp & (1L << 30))) {
-            toggle_borderless_fullscreen(hwnd);
-            return 0;
-        }
-        break;
-
-    case WM_MEASUREITEM:
-        if (((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
-            tray_handle_measure((MEASUREITEMSTRUCT *)lp);
-            return TRUE;
-        }
-        break;
-
-    case WM_DRAWITEM:
-        if (((DRAWITEMSTRUCT *)lp)->CtlType == ODT_MENU) {
-            tray_handle_draw((DRAWITEMSTRUCT *)lp);
-            return TRUE;
-        }
-        break;
-
-    case WM_GETMINMAXINFO:
-    {
-        MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        SIZE min = min_window_size(hwnd);
-        if (min.cx > 0) mmi->ptMinTrackSize.x = min.cx;
-        if (min.cy > 0) mmi->ptMinTrackSize.y = min.cy;
-        return 0;
-    }
-
-    case WM_DPICHANGED:
-        /* Moved to a monitor with another scale: take the size Windows suggests. */
-        if (!g_borderless_fullscreen) {
-            const RECT *suggested = (const RECT *)lp;
-            SetWindowPos(hwnd, NULL, suggested->left, suggested->top,
-                         suggested->right - suggested->left, suggested->bottom - suggested->top,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        return 0;
 
     case WM_ASB_API_REQUEST:
         /* A VM operation runs on the worker thread: the request waits for it. */
@@ -3926,7 +3566,7 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
     }
 
-    case WM_WEBVIEW2_LOG:
+    case WM_UI_LOG:
     {
         wchar_t *log_text = (wchar_t *)lp;
         if (log_text) { ui_log_post(log_text); free(log_text); }
@@ -3937,7 +3577,7 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     {
         wchar_t *response = (wchar_t *)lp;
         if (response) {
-            webview2_post(response);
+            ui_bridge_post(response);
             HeapFree(GetProcessHeap(), 0, response);
         }
         return 0;
@@ -3948,7 +3588,7 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         wchar_t buf[128];
         _snwprintf_s(buf, 128, _TRUNCATE,
             L"{\"type\":\"prereqProgress\",\"pct\":%d}", (int)wp);
-        webview2_post(buf);
+        ui_bridge_post(buf);
         return 0;
     }
 
@@ -3958,13 +3598,13 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         BOOL reboot_required = (BOOL)lp;
         if (ok && !reboot_required) {
             /* Feature enabled, no reboot needed - initialize now */
-            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
+            ui_bridge_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":false}");
             start_core_async();
         } else if (ok && reboot_required) {
             g_prereq_reboot_pending = TRUE;
-            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":true}");
+            ui_bridge_post(L"{\"type\":\"prereqResult\",\"ok\":true,\"reboot\":true}");
         } else {
-            webview2_post(L"{\"type\":\"prereqResult\",\"ok\":false,\"reboot\":false}");
+            ui_bridge_post(L"{\"type\":\"prereqResult\",\"ok\":false,\"reboot\":false}");
         }
         return 0;
     }
@@ -3972,14 +3612,14 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_CORE_READY:
         InterlockedExchange(&g_core_starting, 0);
         if (!wp) {
-            webview2_post(L"{\"type\":\"prereqRequired\"}");
+            ui_bridge_post(L"{\"type\":\"prereqRequired\"}");
             return 0;
         }
         g_prereq_ok = TRUE;
         if (!asb_api_start(g_hInstance, g_hwnd_main))
             ui_alert(L"warning", L"Local API not available", L"The local API could not start. See headless.log for details.");
         send_full_state();
-        webview2_post(L"{\"type\":\"coreReady\"}");
+        ui_bridge_post(L"{\"type\":\"coreReady\"}");
         return 0;
 
     case WM_SHOW_ALERT:
@@ -3998,28 +3638,38 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         if (lp && !g_destroying && (BgOp *)lp == g_bg_op) bg_op_finish((BgOp *)lp);
         return 0;
 
-    case WM_TRAYICON:
-        if (g_command_depth || asb_api_busy()) return 0;
-        if (lp == WM_LBUTTONDBLCLK || ((lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) && g_bg_op)) {
-            /* While a VM operation finishes the menu's actions would wait;
-               show the window instead. */
-            ShowWindow(hwnd, SW_RESTORE);
-            SetForegroundWindow(hwnd);
-        } else if (lp == WM_LBUTTONUP || lp == WM_RBUTTONUP) {
-            ++g_command_depth;
-            tray_show_menu(hwnd);
-            --g_command_depth;
-            ui_refresh_from_core();
+    case WM_SHELL_COMMAND:
+    {
+        wchar_t *json = (wchar_t *)lp;
+        wchar_t action[64] = { 0 };
+        if (!json) return 0;
+        json_get_string(json, L"action", action, ARRAYSIZE(action));
+        if (wcscmp(action, L"requestExit") == 0) {
+            /* {fromClose}: the window's close button, or Quit in the tray. */
+            BOOL from_close = FALSE;
+            json_get_bool(json, L"fromClose", &from_close);
+            if (g_command_depth || asb_api_busy()) {
+                /* a dialog or command is open: it is answered first */
+            } else if (g_bg_op) {
+                ui_notice(L"info", from_close
+                    ? L"App Sandbox is finishing a VM operation. Close the window again in a moment."
+                    : L"App Sandbox is finishing a VM operation. Try again in a moment.");
+            } else {
+                confirm_exit(hwnd, from_close);
+            }
+        } else if (!g_destroying) {
+            on_shell_message(json);
         }
+        free(json);
         return 0;
+    }
 
     case WM_CLOSE:
-        if (g_command_depth || asb_api_busy()) return 0;
-        if (g_bg_op) {
-            ui_notice(L"info", L"App Sandbox is finishing a VM operation. Close the window again in a moment.");
-            return 0;
-        }
-        confirm_exit(hwnd, TRUE);
+        /* Asked to close from outside (an updater, a script): the same
+           question as Quit in the tray, never an exit that turns VMs off
+           unasked. */
+        if (g_command_depth || asb_api_busy() || g_bg_op) return 0;
+        confirm_exit(hwnd, FALSE);
         return 0;
 
     case WM_DESTROY:
@@ -4056,15 +3706,15 @@ static LRESULT main_wnd_proc_handle(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         asb_api_stop();
         asb_events_unsubscribe(g_core_subscription);
         g_core_subscription = 0;
-        tray_remove();
-        webview2_cleanup();
         for (i = 0; i < ASB_MAX_VMS; i++) {
             safe_destroy_rdp(i);
             safe_destroy_idd(i);
         }
         if (!worker_stuck) asb_cleanup();
         g_hwnd_main = NULL;
-        PostQuitMessage(0);
+        /* The shell closes its window and ends the process. */
+        ui_bridge_post(L"{\"type\":\"exit\"}");
+        ui_bridge_cleanup();
         return 0;
     }
     }

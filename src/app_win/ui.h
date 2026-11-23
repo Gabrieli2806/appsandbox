@@ -12,11 +12,15 @@
 #endif
 #endif
 
-/* Create and show the main application window.
-   Returns the window handle, or NULL on failure. */
-HWND ui_create_main_window(HINSTANCE hInstance, int nCmdShow);
+/* Create the host's (never shown) window on the calling thread, which
+   becomes the UI thread. shell is the app shell's window: the owner of the
+   dialogs opened here. Returns the window handle, or NULL on failure. */
+HWND ui_create_main_window(HINSTANCE hInstance, HWND shell);
 
-/* Window class of the management window, and the registered message a second
+/* Queue one JSON command from the shell ({"action": ...}); see host.h. */
+BOOL ui_shell_command(const wchar_t *json);
+
+/* Window class of the host's window, and the registered message a second
    launch sends to it so the running instance shows itself instead of the new
    process failing with "already running". */
 #define UI_MAIN_WINDOW_CLASS L"AppSandbox_Main"

@@ -1,0 +1,158 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!--
+    The app: a WinUI 3 shell over the native host (appsandbox_host.dll, built
+    by AppSandbox.vcxproj). Build this project, not the solution:
+
+      dotnet build app\AppSandbox\AppSandbox.csproj -c Release -p:Platform=x64
+
+    produces the MSIX (unsigned; packaging\msix\make-msix.ps1 builds, signs
+    and writes the installer). The native files come from AsbStage, by default
+    bin\Release of the solution: build the solution first.
+  -->
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net10.0-windows10.0.22621.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <UseWinUI>true</UseWinUI>
+    <EnableMsixTooling>true</EnableMsixTooling>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <RootNamespace>AppSandbox</RootNamespace>
+    <!-- AppSandbox.exe: the name shortcuts, the execution alias and the
+         update scripts already use. -->
+    <AssemblyName>AppSandbox</AssemblyName>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseRidGraph>true</UseRidGraph>
+    <!-- .NET and the Windows App SDK travel inside the package. -->
+    <SelfContained>true</SelfContained>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\AppSandbox.ico</ApplicationIcon>
+    <!-- Program.cs starts the UI thread itself, with a larger stack. -->
+    <DefineConstants>$(DefineConstants);DISABLE_XAML_GENERATED_MAIN</DefineConstants>
+    <GenerateAppxPackageOnBuild>true</GenerateAppxPackageOnBuild>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <AppxBundle>Never</AppxBundle>
+    <!-- a.b.c.d, the same four parts as the native binaries (Directory.Build.props). -->
+    <AsbAppVersion Condition="'$(AsbAppVersion)' == ''">0.2.0.0</AsbAppVersion>
+    <Version>$(AsbAppVersion)</Version>
+    <AssemblyVersion>$(AsbAppVersion)</AssemblyVersion>
+    <FileVersion>$(AsbAppVersion)</FileVersion>
+    <Product>App Sandbox</Product>
+    <Company>G2806</Company>
+    <Authors>Gabrieli2806</Authors>
+    <Description>Virtual machines with GPU acceleration for Windows 11</Description>
+    <!-- Where the native build put its output. -->
+    <AsbStage Condition="'$(AsbStage)' == ''">$(MSBuildProjectDirectory)\..\..\bin\Release</AsbStage>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="1.8.260921001" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.28000.2957" />
+    <Manifest Include="$(ApplicationManifest)" />
+    <Content Include="Assets\*.png" />
+    <Content Include="Assets\*.ico" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <!-- The native host, the VM builder, what is copied into guests, and the
+       licence texts: beside the exe, where the host looks for them. -->
+  <ItemGroup>
+    <Content Include="$(AsbStage)\appsandbox_host.dll;$(AsbStage)\appsandbox_core.dll;$(AsbStage)\iso-patch.exe"
+             Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(AsbStage)\resources\**\*" Exclude="$(AsbStage)\resources\**\*.pdb"
+             Link="resources\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="$(AsbStage)\drivers\**\*" Exclude="$(AsbStage)\drivers\**\*.pdb;$(AsbStage)\drivers\**\*.log"
+             Link="drivers\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="..\..\LICENSE;..\..\THIRD-PARTY-NOTICES.md" Link="%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <Target Name="AsbCheckStage" BeforeTargets="BeforeBuild">
+    <Error Condition="!Exists('$(AsbStage)\appsandbox_host.dll')"
+           Text="appsandbox_host.dll is not in $(AsbStage). Build AppSandbox.sln (Release, x64) first, or pass -p:AsbStage=&lt;folder with the native build&gt;." />
+  </Target>
+
+  <ItemGroup>
+    <ProjectCapability Include="Msix" />
+  </ItemGroup>
+
+  <!-- Some SDK layouts ship an app-host template that is Authenticode-signed.
+       Writing the icon and resources into it moves the end of the file, so
+       the exe is left pointing at a certificate table that is no longer at
+       its end. SignTool then refuses the whole MSIX with 0x800700C1
+       (aka.ms/badexeformat). The stale table is dropped here; a valid one,
+       or none, is left alone. -->
+  <UsingTask TaskName="ClearStaleAuthenticodeTable" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Path ParameterType="System.String" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        byte[] bytes = File.ReadAllBytes(Path);
+        if (bytes.Length > 0x40 && bytes[0] == (byte)'M' && bytes[1] == (byte)'Z')
+        {
+            int pe = BitConverter.ToInt32(bytes, 0x3C);
+            if (pe > 0 && pe + 24 + 240 <= bytes.Length && bytes[pe] == (byte)'P' && bytes[pe + 1] == (byte)'E')
+            {
+                ushort magic = BitConverter.ToUInt16(bytes, pe + 24);
+                int directories = pe + 24 + (magic == 0x10B ? 96 : 112);
+                int security = directories + 4 * 8;
+                uint offset = BitConverter.ToUInt32(bytes, security);
+                uint size = BitConverter.ToUInt32(bytes, security + 4);
+
+                if (offset != 0 && (long)offset + size != bytes.Length)
+                {
+                    Array.Clear(bytes, security, 8);
+                    File.WriteAllBytes(Path, bytes);
+                    Log.LogMessage(MessageImportance.High, "Cleared a stale Authenticode table from " + Path);
+                }
+            }
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- The native host keeps VM records of about 600 KB on the stack, on the
+       UI thread and on the threads it starts for long work (those take the
+       size the exe names). 1 MB, the default, is too tight: the exe asks
+       for 8 MB. -->
+  <UsingTask TaskName="SetStackReserve" TaskFactory="RoslynCodeTaskFactory"
+             AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Path ParameterType="System.String" Required="true" />
+      <Bytes ParameterType="System.Int64" Required="true" />
+    </ParameterGroup>
+    <Task>
+      <Using Namespace="System" />
+      <Using Namespace="System.IO" />
+      <Code Type="Fragment" Language="cs"><![CDATA[
+        byte[] bytes = File.ReadAllBytes(Path);
+        int pe = bytes.Length > 0x40 ? BitConverter.ToInt32(bytes, 0x3C) : -1;
+        if (pe <= 0 || pe + 24 + 80 > bytes.Length || bytes[pe] != (byte)'P' || bytes[pe + 1] != (byte)'E' ||
+            BitConverter.ToUInt16(bytes, pe + 24) != 0x20B)
+        {
+            Log.LogError("SetStackReserve: " + Path + " is not a 64-bit PE file");
+            return false;
+        }
+        int field = pe + 24 + 72;   // IMAGE_OPTIONAL_HEADER64.SizeOfStackReserve
+        if (BitConverter.ToInt64(bytes, field) != Bytes)
+        {
+            BitConverter.GetBytes(Bytes).CopyTo(bytes, field);
+            File.WriteAllBytes(Path, bytes);
+            Log.LogMessage(MessageImportance.High, "Stack reserve of " + Path + " set to " + Bytes + " bytes");
+        }
+      ]]></Code>
+    </Task>
+  </UsingTask>
+
+  <Target Name="ClearStaleAppHostSignature" AfterTargets="_CreateAppHost"
+          Condition="'$(AppHostIntermediatePath)' != '' and Exists('$(AppHostIntermediatePath)')">
+    <ClearStaleAuthenticodeTable Path="$(AppHostIntermediatePath)" />
+    <SetStackReserve Path="$(AppHostIntermediatePath)" Bytes="8388608" />
+  </Target>
+</Project>

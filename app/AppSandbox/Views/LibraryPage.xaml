@@ -1,0 +1,77 @@
+﻿<?xml version="1.0" encoding="UTF-8" ?>
+<Page
+    x:Class="AppSandbox.Views.LibraryPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    NavigationCacheMode="Required">
+
+    <ScrollViewer Padding="36,24,36,24">
+        <StackPanel Spacing="12">
+
+            <!-- Header: what this page is, how many VMs run, and the two ways to get one. -->
+            <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="14">
+                <Border Style="{StaticResource PageIconTileStyle}">
+                    <FontIcon Glyph="&#xE7F4;" Style="{StaticResource PageIconGlyphStyle}" />
+                </Border>
+                <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                    <TextBlock Text="Virtual machines" Style="{StaticResource TitleTextBlockStyle}" />
+                    <TextBlock x:Name="SummaryText" Style="{StaticResource BodyTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+                </StackPanel>
+                <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                    <Button x:Name="ImportButton" Click="Import_Click" ToolTipService.ToolTip="Import an exported VM (vm.json) or a .vhdx disk">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon Glyph="&#xE8B5;" FontSize="14" />
+                            <TextBlock Text="Import" />
+                        </StackPanel>
+                    </Button>
+                    <Button x:Name="NewButton" Style="{StaticResource AccentButtonStyle}" Click="New_Click">
+                        <StackPanel Orientation="Horizontal" Spacing="8">
+                            <FontIcon Glyph="&#xE710;" FontSize="14" />
+                            <TextBlock Text="New VM" />
+                        </StackPanel>
+                    </Button>
+                </StackPanel>
+            </Grid>
+
+            <!-- Find one among many. -->
+            <Grid x:Name="FilterRow" ColumnDefinitions="*,Auto" ColumnSpacing="12" Margin="0,8,0,0">
+                <AutoSuggestBox x:Name="SearchBox" PlaceholderText="Search VMs" QueryIcon="Find" Width="320" HorizontalAlignment="Left" VerticalAlignment="Center"
+                                TextChanged="Search_TextChanged" />
+                <SelectorBar x:Name="FilterBar" Grid.Column="1" SelectionChanged="Filter_SelectionChanged">
+                    <SelectorBarItem Text="All" Tag="all" IsSelected="True" />
+                    <SelectorBarItem Text="Running" Tag="running" />
+                    <SelectorBarItem Text="Stopped" Tag="stopped" />
+                </SelectorBar>
+            </Grid>
+
+            <!-- Virtual Machine Platform is off: nothing can run until it is on. -->
+            <Border x:Name="PrereqCard" Style="{StaticResource CardStyle}" Visibility="Collapsed">
+                <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="12">
+                    <FontIcon Glyph="&#xE7BA;" Style="{StaticResource RowGlyphStyle}" Foreground="{ThemeResource SystemFillColorCautionBrush}" />
+                    <StackPanel Grid.Column="1" VerticalAlignment="Center" Spacing="4">
+                        <TextBlock x:Name="PrereqTitle" Style="{StaticResource BodyStrongTextBlockStyle}" />
+                        <TextBlock x:Name="PrereqText" Style="{StaticResource RowDescriptionStyle}" />
+                        <ProgressBar x:Name="PrereqProgress" Maximum="100" Visibility="Collapsed" Margin="0,6,0,0" />
+                    </StackPanel>
+                    <Button x:Name="PrereqButton" Grid.Column="2" VerticalAlignment="Center" Style="{StaticResource AccentButtonStyle}" Click="Prereq_Click" />
+                </Grid>
+            </Border>
+
+            <StackPanel x:Name="Cards" Spacing="8" />
+
+            <!-- Nothing to list: say why, and offer the way on. -->
+            <Border x:Name="EmptyCard" Style="{StaticResource CardStyle}" Padding="32" Visibility="Collapsed">
+                <StackPanel Spacing="8" HorizontalAlignment="Center" MaxWidth="460">
+                    <ProgressRing x:Name="EmptyRing" Width="28" Height="28" IsActive="False" Visibility="Collapsed" HorizontalAlignment="Center" />
+                    <FontIcon x:Name="EmptyGlyph" Glyph="&#xE7F4;" FontSize="32" Foreground="{ThemeResource TextFillColorSecondaryBrush}" HorizontalAlignment="Center" />
+                    <TextBlock x:Name="EmptyTitle" Style="{StaticResource SubtitleTextBlockStyle}" HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" />
+                    <TextBlock x:Name="EmptyText" Style="{StaticResource BodyTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}"
+                               HorizontalAlignment="Center" TextAlignment="Center" TextWrapping="Wrap" />
+                    <Button x:Name="EmptyButton" HorizontalAlignment="Center" Margin="0,8,0,0" Click="Empty_Click" />
+                </StackPanel>
+            </Border>
+
+            <Border Height="32" />
+        </StackPanel>
+    </ScrollViewer>
+</Page>

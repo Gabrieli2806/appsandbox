@@ -1,4 +1,4 @@
-<Project>
+﻿<Project>
   <!--
     SINGLE SOURCE OF TRUTH for the App Sandbox version.
 
@@ -13,8 +13,8 @@
   -->
   <PropertyGroup>
     <AsbVersionMajor>0</AsbVersionMajor>
-    <AsbVersionMinor>1</AsbVersionMinor>
-    <AsbVersionPatch>9</AsbVersionPatch>
+    <AsbVersionMinor>2</AsbVersionMinor>
+    <AsbVersionPatch>0</AsbVersionPatch>
     <AsbVersionRevision>0</AsbVersionRevision>
 
     <!-- Derived forms - do not edit. -->
@@ -24,20 +24,14 @@
   </PropertyGroup>
 
   <!--
-    Where Ubuntu VMs download the Linux guest sources from (they are compiled
-    inside the guest). Unset = upstream jamesstringer90/appsandbox, branch main.
-    A CI build passes its own repository and commit, e.g.
-      msbuild ... /p:AsbSourceRepo=owner/appsandbox /p:AsbSourceRef=<commit sha>
-    so the guest builds exactly the sources this app was built from.
+    The project's repository on GitHub, shown in Settings > About and used for
+    its links (releases, issues, licence). Unset = upstream
+    jamesstringer90/appsandbox. A CI build passes its own:
+      msbuild ... /p:AsbSourceRepo=owner/appsandbox
   -->
   <ItemDefinitionGroup Condition="'$(AsbSourceRepo)' != ''">
     <ClCompile>
       <PreprocessorDefinitions>ASB_SOURCE_REPO=$(AsbSourceRepo);%(PreprocessorDefinitions)</PreprocessorDefinitions>
-    </ClCompile>
-  </ItemDefinitionGroup>
-  <ItemDefinitionGroup Condition="'$(AsbSourceRef)' != ''">
-    <ClCompile>
-      <PreprocessorDefinitions>ASB_SOURCE_REF=$(AsbSourceRef);%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
   </ItemDefinitionGroup>
 

@@ -1,14 +1,15 @@
-<#
+﻿<#
 .SYNOPSIS
-  Builds an MSIX package of App Sandbox from a staged release folder.
+  Builds the App Sandbox MSIX: the WinUI app (app\AppSandbox) with the native
+  build inside it, signed.
 
 .DESCRIPTION
-  -Stage is the folder that also goes into the release zip (AppSandbox.exe,
-  appsandbox_core.dll, web\, resources\, drivers\, ...). The script lays the
-  package out, adds LICENSE and THIRD-PARTY-NOTICES.md when the stage lacks
-  them, renders the tile images (scale-100/125/150/200/400) from
-  src\app_win\appsandbox.ico, fills in AppxManifest.xml, indexes the images
-  into resources.pri with MakePri, runs MakeAppx and signs the package.
+  -Stage is the folder with the native build: appsandbox_host.dll,
+  appsandbox_core.dll, iso-patch.exe, resources\ and drivers\ (bin\Release
+  after building AppSandbox.sln). The script writes the identity and version
+  into app\AppSandbox\Package.appxmanifest for the build (and puts the file
+  back afterwards), builds the project with the .NET SDK, which makes the
+  package, and signs it.
 
   Versions: -Version always has four parts. A test build passes
   Major.Minor.Patch.Build and the package gets exactly that. With -Store the
@@ -33,7 +34,7 @@
   publisher display name reserved in Partner Center.
 
 .EXAMPLE
-  .\packaging\msix\make-msix.ps1 -Stage bin\Release -Version 0.1.9.21 -OutDir out
+  .\packaging\msix\make-msix.ps1 -Stage bin\Release -Version 0.2.0.21 -OutDir out
 
 .EXAMPLE
   .\packaging\msix\make-msix.ps1 -Store -Stage C:\stage -Version 1.0.0.215 -OutDir out `
@@ -48,7 +49,8 @@ param(
     [string] $Publisher = 'CN=App Sandbox Test',
     [string] $DisplayName = 'App Sandbox',
     [string] $PublisherDisplayName = 'App Sandbox',
-    [ValidateSet('x64', 'arm64')] [string] $Arch = 'x64',
+    # The app project is x64 only for now; the native projects also build for ARM64.
+    [ValidateSet('x64')] [string] $Arch = 'x64',
     [switch] $Store,
     [string] $Thumbprint,
     [string] $PfxPath,
@@ -88,18 +90,19 @@ if ($Store) {
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 $OutDir = (Resolve-Path $OutDir).Path
 
-# ---- Tools from the Windows SDK ----
-$kits = Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'
-function Find-SdkTool([string] $exe) {
-    $t = Get-ChildItem -Path $kits -Recurse -Filter $exe -ErrorAction SilentlyContinue |
+# ---- Tools ----
+# signtool from the Windows SDK when it is installed; otherwise the copy the
+# build restores from NuGet (Microsoft.Windows.SDK.BuildTools).
+function Find-SignTool {
+    $roots = @((Join-Path ${env:ProgramFiles(x86)} 'Windows Kits\10\bin'),
+               (Join-Path $env:USERPROFILE '.nuget\packages\microsoft.windows.sdk.buildtools'))
+    $t = $roots | Where-Object { Test-Path -LiteralPath $_ } |
+         ForEach-Object { Get-ChildItem -LiteralPath $_ -Recurse -Filter signtool.exe -ErrorAction SilentlyContinue } |
          Where-Object { $_.FullName -match '\\x64\\' } |
          Sort-Object FullName -Descending | Select-Object -First 1
-    if (-not $t) { throw "$exe not found under $kits (install the Windows SDK)" }
+    if (-not $t) { throw "signtool.exe not found (install the Windows SDK, or build the app once so NuGet restores it)" }
     $t.FullName
 }
-$makeappx = Find-SdkTool 'makeappx.exe'
-$makepri  = Find-SdkTool 'makepri.exe'
-$signtool = Find-SdkTool 'signtool.exe'
 
 # Machine type of a PE file: 0x8664 = x64, 0xAA64 = ARM64.
 function Get-PeMachine([string] $path) {
@@ -112,112 +115,49 @@ function Get-PeMachine([string] $path) {
     } finally { $fs.Dispose() }
 }
 
-$layout = Join-Path ([IO.Path]::GetTempPath()) ("asb-msix-" + [Guid]::NewGuid().ToString('N'))
-$priWork = Join-Path ([IO.Path]::GetTempPath()) ("asb-pri-" + [Guid]::NewGuid().ToString('N'))
+$Stage = (Resolve-Path $Stage).Path
+$project = Join-Path $repo 'app\AppSandbox\AppSandbox.csproj'
+$manifestPath = Join-Path $repo 'app\AppSandbox\Package.appxmanifest'
+$manifestBefore = [IO.File]::ReadAllText($manifestPath)
+$packages = Join-Path ([IO.Path]::GetTempPath()) ("asb-msix-" + [Guid]::NewGuid().ToString('N'))
 $addedCerts = @()          # certificates this script added to Cert:\CurrentUser\My
 try {
-    # ---- Layout ----
-    New-Item -ItemType Directory -Force -Path $layout | Out-Null
-    robocopy $Stage $layout /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log /XD headless-api | Out-Null
-    if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
-    $global:LASTEXITCODE = 0
-    $exePath = Join-Path $layout 'AppSandbox.exe'
-    if (-not (Test-Path $exePath)) { throw "AppSandbox.exe not found in $Stage" }
-    $machine = Get-PeMachine $exePath
-    $expected = if ($Arch -eq 'arm64') { 0xAA64 } else { 0x8664 }
-    if ($machine -ne $expected) {
-        throw ("AppSandbox.exe in {0} is machine 0x{1:X4}, which does not match -Arch {2}" -f $Stage, $machine, $Arch)
+    # ---- The native build ----
+    foreach ($f in 'appsandbox_host.dll', 'appsandbox_core.dll', 'iso-patch.exe',
+                   'resources\appsandbox-agent.exe', 'drivers\AppSandboxVDD.inf') {
+        if (-not (Test-Path (Join-Path $Stage $f))) { throw "$f not found in $Stage (build AppSandbox.sln first)" }
+    }
+    $machine = Get-PeMachine (Join-Path $Stage 'appsandbox_host.dll')
+    if ($machine -ne 0x8664) {
+        throw ("appsandbox_host.dll in {0} is machine 0x{1:X4}, which does not match -Arch {2}" -f $Stage, $machine, $Arch)
     }
 
-    # The licence texts travel with every copy (MIT and the bundled components).
-    foreach ($doc in 'LICENSE', 'THIRD-PARTY-NOTICES.md') {
-        if (-not (Test-Path (Join-Path $layout $doc))) {
-            Copy-Item (Join-Path $repo $doc) (Join-Path $layout $doc) -ErrorAction Stop
-        }
-    }
+    # ---- Manifest: identity, names and version of this build ----
+    [xml] $manifest = $manifestBefore
+    $manifest.Package.Identity.Name = $Name
+    $manifest.Package.Identity.Publisher = $Publisher
+    $manifest.Package.Identity.Version = $Version
+    $manifest.Package.Properties.DisplayName = $DisplayName
+    $manifest.Package.Properties.PublisherDisplayName = $PublisherDisplayName
+    $manifest.Package.Applications.Application.VisualElements.DisplayName = $DisplayName
+    $settings = New-Object System.Xml.XmlWriterSettings
+    $settings.Indent = $true
+    $settings.Encoding = New-Object System.Text.UTF8Encoding($false)
+    $writer = [System.Xml.XmlWriter]::Create($manifestPath, $settings)
+    try { $manifest.Save($writer) } finally { $writer.Dispose() }
 
-    # ---- Tile images from the app icon ----
-    # Only scale- and targetsize-qualified files, as Visual Studio produces:
-    # the manifest names the plain file (Assets\StoreLogo.png) and
-    # resources.pri maps it to the best variant for the display.
-    Add-Type -AssemblyName System.Drawing
-    $assets = Join-Path $layout 'Assets'
-    New-Item -ItemType Directory -Force -Path $assets | Out-Null
-    $icoPath = Join-Path $repo 'src\app_win\appsandbox.ico'
-    $icon = New-Object System.Drawing.Icon($icoPath, 256, 256)
-    $src = $icon.ToBitmap()
-    function Save-Tile([string] $file, [int] $w, [int] $h, [double] $fill) {
-        $bmp = New-Object System.Drawing.Bitmap($w, $h)
-        $g = [System.Drawing.Graphics]::FromImage($bmp)
-        $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
-        $g.Clear([System.Drawing.Color]::Transparent)
-        $side = [int]([Math]::Min($w, $h) * $fill)
-        $g.DrawImage($src, [int](($w - $side) / 2), [int](($h - $side) / 2), $side, $side)
-        $g.Dispose()
-        $bmp.Save((Join-Path $assets $file), [System.Drawing.Imaging.ImageFormat]::Png)
-        $bmp.Dispose()
-    }
-    $tiles = @(
-        @{ Name = 'Square44x44Logo';   W = 44;  H = 44;  Fill = 1.0 },
-        @{ Name = 'Square150x150Logo'; W = 150; H = 150; Fill = 0.7 },
-        @{ Name = 'Wide310x150Logo';   W = 310; H = 150; Fill = 0.7 },
-        @{ Name = 'StoreLogo';         W = 50;  H = 50;  Fill = 1.0 }
-    )
-    foreach ($t in $tiles) {
-        foreach ($scale in 100, 125, 150, 200, 400) {
-            $w = [int][Math]::Round($t.W * $scale / 100.0, [MidpointRounding]::AwayFromZero)
-            $h = [int][Math]::Round($t.H * $scale / 100.0, [MidpointRounding]::AwayFromZero)
-            Save-Tile ("{0}.scale-{1}.png" -f $t.Name, $scale) $w $h $t.Fill
-        }
-    }
-    # Taskbar/Start icon sizes without the coloured plate.
-    foreach ($s in 16, 24, 32, 48, 256) {
-        Save-Tile ("Square44x44Logo.targetsize-{0}_altform-unplated.png" -f $s) $s $s 1.0
-    }
-    $src.Dispose(); $icon.Dispose()
+    # ---- Build: the .NET SDK compiles the app and makes the package ----
+    $dotnet = (Get-Command dotnet -ErrorAction Stop).Source
+    & $dotnet build $project -c Release -p:Platform=x64 -p:RuntimeIdentifier=win-x64 `
+        -p:GenerateAppxPackageOnBuild=true -p:AppxPackageSigningEnabled=false -p:AppxBundle=Never `
+        "-p:AsbStage=$Stage" "-p:AsbAppVersion=$Version" "-p:AppxPackageDir=$packages\" -v:minimal -nologo | Out-Host
+    if ($LASTEXITCODE -ne 0) { throw "dotnet build failed ($LASTEXITCODE)" }
+    $built = Get-ChildItem -LiteralPath $packages -Recurse -Filter '*.msix' | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if (-not $built) { throw "The build made no .msix under $packages" }
 
-    # ---- Manifest ----
-    # Longer placeholders first, so none is replaced inside another.
-    $values = [ordered]@{
-        '__PUBLISHERDISPLAYNAME__' = [Security.SecurityElement]::Escape($PublisherDisplayName)
-        '__DISPLAYNAME__'          = [Security.SecurityElement]::Escape($DisplayName)
-        '__PUBLISHER__'            = [Security.SecurityElement]::Escape($Publisher)
-        '__VERSION__'              = $Version
-        '__NAME__'                 = [Security.SecurityElement]::Escape($Name)
-        '__ARCH__'                 = $Arch
-    }
-    $manifest = Get-Content (Join-Path $here 'AppxManifest.xml') -Raw
-    foreach ($k in $values.Keys) { $manifest = $manifest.Replace($k, $values[$k]) }
-    $manifestPath = Join-Path $layout 'AppxManifest.xml'
-    Set-Content -Path $manifestPath -Value $manifest -Encoding UTF8
-
-    # ---- resources.pri ----
-    # Index a copy of Assets\ only (the rest of the payload is not resources);
-    # the resource names are the same relative paths as in the layout. The
-    # <packaging> section that createconfig writes would split the scales
-    # into extra resource packs (for bundles); one resources.pri is wanted.
-    $priRoot = Join-Path $priWork 'root'
-    New-Item -ItemType Directory -Force -Path $priRoot | Out-Null
-    Copy-Item -Recurse $assets (Join-Path $priRoot 'Assets')
-    $priConfig = Join-Path $priWork 'priconfig.xml'
-    $priFile = Join-Path $priWork 'resources.pri'
-    & $makepri createconfig /cf $priConfig /dq en-US /pv 10.0.0 /o | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "MakePri createconfig failed ($LASTEXITCODE)" }
-    [xml] $cfg = Get-Content $priConfig -Raw
-    foreach ($node in @($cfg.DocumentElement.ChildNodes | Where-Object { $_.LocalName -eq 'packaging' })) {
-        [void] $cfg.DocumentElement.RemoveChild($node)
-    }
-    $cfg.Save($priConfig)
-    & $makepri new /pr $priRoot /cf $priConfig /mn $manifestPath /of $priFile /o | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "MakePri new failed ($LASTEXITCODE)" }
-    if (-not (Test-Path $priFile)) { throw "MakePri did not write $priFile" }
-    Copy-Item $priFile (Join-Path $layout 'resources.pri')
-
-    # ---- Pack ----
     $msix = Join-Path $OutDir ("AppSandbox-{0}-{1}.msix" -f $Version, $Arch)
-    if (Test-Path $msix) { Remove-Item $msix }
-    & $makeappx pack /d $layout /p $msix /o | Out-Host
-    if ($LASTEXITCODE -ne 0) { throw "MakeAppx failed ($LASTEXITCODE)" }
+    Copy-Item -LiteralPath $built.FullName -Destination $msix -Force
+    $signtool = Find-SignTool
 
     # ---- Sign ----
     $cerOut = $null
@@ -308,7 +248,7 @@ Write-Host "App Sandbox installed. Start it from the Start menu."
         }
         Remove-Item $certPath -ErrorAction SilentlyContinue
     }
-    foreach ($dir in $layout, $priWork) {
-        if (Test-Path $dir) { Remove-Item -Recurse -Force $dir -ErrorAction SilentlyContinue }
-    }
+    # The manifest in the repository keeps the test identity and its own version.
+    [IO.File]::WriteAllText($manifestPath, $manifestBefore)
+    if (Test-Path $packages) { Remove-Item -Recurse -Force $packages -ErrorAction SilentlyContinue }
 }

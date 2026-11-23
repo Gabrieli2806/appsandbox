@@ -11,13 +11,6 @@ tools/vdd/certs/
 # Claude
 .claude/
 
-# macOS Finder metadata
-.DS_Store
-
-# Xcode per-user state
-**/xcuserdata/
-*.xcuserstate
-
 python/
 
 # User-specific files
@@ -442,16 +435,3 @@ tools/sign/*.local.*
 # guard the repo root in case a cab is ever built from here)
 /setup.inf
 /setup.rpt
-
-# Per-developer macOS signing overrides (DEVELOPMENT_TEAM, Developer ID identity, etc).
-# Pulled in by Local.xcconfig via #include? when present.
-src/app_mac/xcconfig/LocalUser.xcconfig
-
-# QEMU clone + build tree (build-qemu.sh output) — reproducible scratch, never committed.
-# (vendor/qemu-ivshmem/dist/ and firmware/ ARE committed; only the build tree is ignored.)
-/vendor/qemu-ivshmem/qemu-build/
-
-# The vendored qemu binary lives in a bin/ dir; exempt it from the generic **/[Bb]in/* ignore above.
-!/vendor/qemu-ivshmem/dist/bin/
-!/vendor/qemu-ivshmem/dist/bin/*
-mac-gpu/

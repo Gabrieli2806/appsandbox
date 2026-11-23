@@ -1,11 +1,12 @@
-# Unsigned test build of AppSandbox for Windows x64.
+# Test build of App Sandbox for Windows x64, as an MSIX.
 #
-# Builds the whole solution with Visual Studio 2022 + the WDK (drivers are
-# test-signed by the WDK, exactly like a local dev build; AppSandbox enables
-# test signing inside the guest when it installs them) and packages the same
-# layout as tools/sign/make-release.ps1, keeping the drivers' test .cer files.
+# Builds the native solution with Visual Studio 2022 + the WDK (drivers are
+# test-signed by the WDK, exactly like a local dev build; App Sandbox enables
+# test signing inside the guest when it installs them), then the WinUI app
+# (app\AppSandbox) around it with the .NET SDK, and signs the package with a
+# test certificate (packaging\msix\make-msix.ps1).
 #
-# Pushing to a release/** branch also publishes the zip as a GitHub pre-release.
+# Pushing to a release/** branch also publishes the package as a GitHub pre-release.
 name: Windows test build
 
 on:
@@ -21,22 +22,32 @@ jobs:
   build:
     runs-on: windows-2022
     timeout-minutes: 90
+    env:
+      # tools/sign/AppSandboxPackage.vcxproj runs make-release.ps1 after every
+      # Release build unless $(ASB_SKIP_PACKAGE_PROJECT) is 1 (it needs the
+      # owner's signing key).
+      ASB_SKIP_PACKAGE_PROJECT: '1'
     steps:
       - uses: actions/checkout@v4
 
       - uses: microsoft/setup-msbuild@v2
 
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
       # cmd, not pwsh: the driver packages' post-build steps run Windows
       # PowerShell 5, which cannot load its own modules when it inherits
       # PowerShell 7's PSModulePath.
-      - name: Build Release|x64
+      - name: Build the native solution (Release|x64)
         shell: cmd
-        # AsbSourceRepo/Ref: Ubuntu VMs compile their guest components from
-        # this repository at this exact commit (see Directory.Build.props).
-        run: msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:AsbSourceRepo=%GITHUB_REPOSITORY% /p:AsbSourceRef=%GITHUB_SHA% /p:AsbVersionRevision=%GITHUB_RUN_NUMBER% /m /v:minimal /nologo
+        # AsbSourceRepo: the repository Settings > About links to.
+        # AsbVersionRevision: every build's driver package must be newer than
+        # the last (Windows does not "update" to the same DriverVer).
+        run: msbuild AppSandbox.sln /t:Build /p:Configuration=Release /p:Platform=x64 /p:AsbSourceRepo=%GITHUB_REPOSITORY% /p:AsbVersionRevision=%GITHUB_RUN_NUMBER% /m /v:minimal /nologo
 
-      - name: Package
-        id: package
+      - name: Check the native build
+        id: native
         shell: pwsh
         run: |
           $bin = Join-Path $PWD 'bin\Release'
@@ -45,76 +56,40 @@ jobs:
             if ($props -match "<AsbVersion$k>(\d+)</AsbVersion$k>") { $matches[1] } else { '0' }
           }
           $ver = $parts -join '.'
-          $sha = $env:GITHUB_SHA.Substring(0, 7)
-          $name = "AppSandbox-$ver-test-$sha-win-x64"
-          $stage = Join-Path $env:RUNNER_TEMP $name
-          New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-          foreach ($b in 'AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll') {
-            Copy-Item (Join-Path $bin $b) $stage -ErrorAction Stop
-          }
-          # MIT (ours and the bundled components') requires the notices in every copy.
-          Copy-Item 'LICENSE', 'THIRD-PARTY-NOTICES.md' $stage -ErrorAction Stop
-          foreach ($sub in 'resources', 'drivers', 'web') {
-            robocopy (Join-Path $bin $sub) (Join-Path $stage $sub) /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log | Out-Null
-            if ($LASTEXITCODE -ge 8) { throw "robocopy $sub failed ($LASTEXITCODE)" }
-          }
-          $sdk = Join-Path $stage 'headless-api'
-          New-Item -ItemType Directory -Force -Path $sdk | Out-Null
-          Copy-Item tools\headless-api\asb.py, tools\headless-api\README.md $sdk
-          foreach ($sub in 'examples', 'tests') {
-            robocopy (Join-Path 'tools\headless-api' $sub) (Join-Path $sdk $sub) /E /XD __pycache__ /XF *.pyc | Out-Null
-            if ($LASTEXITCODE -ge 8) { throw "robocopy headless-api\$sub failed ($LASTEXITCODE)" }
-          }
-          $global:LASTEXITCODE = 0
-
-          $required = 'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
-                      'drivers\AppSandboxVDD.cer', 'drivers\devcon.exe', 'LICENSE', 'THIRD-PARTY-NOTICES.md',
+          # What the package needs from the native build. A driver or helper
+          # that was not built must stop the run, not ship a package without it.
+          $required = 'appsandbox_host.dll', 'appsandbox_core.dll', 'iso-patch.exe',
+                      'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
+                      'drivers\AppSandboxVDD.cer', 'drivers\devcon.exe',
                       'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
-                      'resources\appsandbox-agent.exe', 'web\index.html'
-          $missing = @($required | Where-Object { -not (Test-Path (Join-Path $stage $_)) })
-          if ($missing.Count) { throw "Missing artifacts: $($missing -join ', ')" }
+                      'resources\appsandbox-agent.exe', 'resources\appsandbox-input.exe',
+                      'resources\appsandbox-displays.exe', 'resources\appsandbox-clipboard.exe',
+                      'resources\appsandbox-clipboard-reader.exe', 'resources\appsandbox-audio.exe'
+          $missing = @($required | Where-Object { -not (Test-Path (Join-Path $bin $_)) })
+          if ($missing.Count) { throw "Missing from the native build: $($missing -join ', ')" }
 
-          Get-ChildItem $stage -Recurse -File | ForEach-Object { $_.FullName.Substring($stage.Length + 1) }
-          $zip = Join-Path $env:RUNNER_TEMP "$name.zip"
-          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
-          "zip=$zip" >> $env:GITHUB_OUTPUT
-          "name=$name" >> $env:GITHUB_OUTPUT
-          "stage=$stage" >> $env:GITHUB_OUTPUT
+          "bin=$bin" >> $env:GITHUB_OUTPUT
           "ver=$ver" >> $env:GITHUB_OUTPUT
+          "name=AppSandbox-$ver.${{ github.run_number }}-test-$($env:GITHUB_SHA.Substring(0, 7))-win-x64" >> $env:GITHUB_OUTPUT
 
-      # MSIX test package (self-signed; Install-AppSandbox.ps1 trusts the
-      # certificate and installs it). A failure here does not block the zip
-      # and is reported as a warning annotation. Once the MSIX is stable, set
-      # the repository variable MSIX_REQUIRED to true: a failure then fails
-      # the job on release/** branches (other branches keep going).
-      - name: Package MSIX
+      # The app and its MSIX (self-signed test certificate;
+      # Install-AppSandbox.ps1 trusts the certificate and installs).
+      - name: Build the app and package the MSIX
         id: msix
-        continue-on-error: ${{ vars.MSIX_REQUIRED != 'true' || !startsWith(github.ref, 'refs/heads/release/') }}
         shell: pwsh
         run: |
           $out = Join-Path $env:RUNNER_TEMP 'msix'
-          $version = "${{ steps.package.outputs.ver }}.${{ github.run_number }}"
-          ./packaging/msix/make-msix.ps1 -Stage "${{ steps.package.outputs.stage }}" -Version $version -OutDir $out
-          $zip = Join-Path $env:RUNNER_TEMP "${{ steps.package.outputs.name }}-msix.zip"
+          $version = "${{ steps.native.outputs.ver }}.${{ github.run_number }}"
+          ./packaging/msix/make-msix.ps1 -Stage "${{ steps.native.outputs.bin }}" -Version $version -OutDir $out
+          Get-ChildItem $out | Select-Object Name, Length
+          $zip = Join-Path $env:RUNNER_TEMP "${{ steps.native.outputs.name }}-msix.zip"
           Compress-Archive -Path (Join-Path $out '*') -DestinationPath $zip
           "zip=$zip" >> $env:GITHUB_OUTPUT
 
-      - name: Report MSIX failure
-        if: steps.msix.outcome == 'failure'
-        shell: pwsh
-        run: |
-          Write-Output "::warning title=MSIX package failed::The MSIX step failed; this run publishes only the zip. See the 'Package MSIX' step log."
-
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.package.outputs.name }}
-          path: ${{ steps.package.outputs.zip }}
-
-      - uses: actions/upload-artifact@v4
-        if: steps.msix.outcome == 'success'
-        with:
-          name: ${{ steps.package.outputs.name }}-msix
+          name: ${{ steps.native.outputs.name }}-msix
           path: ${{ steps.msix.outputs.zip }}
 
       - name: Publish pre-release
@@ -125,14 +100,11 @@ jobs:
         run: |
           $tag = "test-build-${{ github.run_number }}"
           $notes = @"
-          Unsigned **test build** from ``${{ github.ref_name }}`` (commit ${{ github.sha }}).
+          **Test build** from ``${{ github.ref_name }}`` (commit ${{ github.sha }}).
 
-          - Windows may show a SmartScreen warning: the app is not code-signed. Choose "More info" -> "Run anyway".
-          - Drivers are test-signed; AppSandbox enables test signing inside the VM when it installs them.
-          - Guest drivers are installed when a VM is created: create a **new** Windows VM to test guest-side changes.
-          - ``*-msix.zip``: MSIX test package. Unzip, then in an elevated PowerShell run ``powershell -ExecutionPolicy Bypass -File .\Install-AppSandbox.ps1`` (trusts the included test certificate and installs).
+          - Unzip, then in an elevated PowerShell run ``powershell -ExecutionPolicy Bypass -File .\Install-AppSandbox.ps1``. It trusts the included test certificate and installs or updates the app for the user who runs it. Exit App Sandbox first (tray icon > Quit).
+          - Drivers are test-signed; App Sandbox enables test signing inside the VM when it installs them.
+          - Guest components of existing Windows VMs are updated before their next start; the audio driver only changes in new VMs.
           "@
-          $assets = @("${{ steps.package.outputs.zip }}")
-          if ("${{ steps.msix.outputs.zip }}") { $assets += "${{ steps.msix.outputs.zip }}" }
-          gh release create $tag @assets --prerelease --target "${{ github.sha }}" `
+          gh release create $tag "${{ steps.msix.outputs.zip }}" --prerelease --target "${{ github.sha }}" `
             --title "Test build ${{ github.run_number }} (${{ github.ref_name }})" --notes $notes

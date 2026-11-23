@@ -1123,7 +1123,7 @@ static void tool_create_vm(ToolCall *t, const JVal *args)
     Sb body = { 0 };
 
     if (!name || !os || !user || !pass) {
-        result_error(t, "name, os_type (\"Windows\" or \"Linux\"), admin_user and admin_password are required, "
+        result_error(t, "name, os_type (\"Windows\"), admin_user and admin_password are required, "
                         "plus image_path (an installer ISO on this PC) or template (see get_host).");
         return;
     }
@@ -1402,7 +1402,7 @@ static void fill_target(VmRef *vm)
 
 /* Whether commands can be run in the guest now: an agent that announced the
    command channel must also answer on it. An agent that never announced it
-   (older, or a Linux guest built before it) has nothing to wait for. */
+   (an older one) has nothing to wait for. */
 static BOOL command_channel_ready(VmRef *vm)
 {
     AsbGuestResult r;
@@ -1466,7 +1466,7 @@ static void tool_run_command(ToolCall *t, const JVal *args)
     VmRef vm;
     const char *command = j_str(args, "command"), *shell = j_str(args, "shell"), *cwd = j_str(args, "working_dir");
     int timeout = 60, max_output = 16000;
-    BOOL use_shell = TRUE, windows, desktop = FALSE, elevated = FALSE;
+    BOOL use_shell = TRUE, desktop = FALSE, elevated = FALSE;
     char *encoded = NULL;
     AsbGuestResult r;
     Sb js = { 0 };
@@ -1474,14 +1474,13 @@ static void tool_run_command(ToolCall *t, const JVal *args)
     if (!resolve_vm(t, args, &vm)) return;
     if (!command || !command[0]) { result_error(t, "Pass \"command\": the command line to run in the guest."); return; }
     if (!guest_ready(t, &vm)) return;
-    windows = _stricmp(vm.os, "Linux") != 0;
     j_int(args, "timeout_seconds", &timeout);
     if (timeout < 1) timeout = 1;
     if (timeout > 600) timeout = 600;
     j_int(args, "max_output_bytes", &max_output);
     if (max_output < 256) max_output = 256;
     if (max_output > 200000) max_output = 200000;
-    if (shell && shell[0] && windows) {
+    if (shell && shell[0]) {
         if (!_stricmp(shell, "powershell")) {
             encoded = powershell_command(command);
             if (!encoded) { result_error(t, "Out of memory."); return; }
@@ -1501,7 +1500,7 @@ static void tool_run_command(ToolCall *t, const JVal *args)
     }
     j_bool(args, "desktop", &desktop);
     j_bool(args, "elevated", &elevated);
-    if (desktop && windows) {
+    if (desktop) {
         asb_guest_ping(&vm.target, &r);
         if (r.result != ASB_GUEST_OK || !strstr(r.message, " user")) {
             free(encoded);
@@ -1513,7 +1512,7 @@ static void tool_run_command(ToolCall *t, const JVal *args)
     }
     asb_guest_exec(&vm.target, encoded ? encoded : command, cwd,
                    (use_shell ? ASB_EXEC_SHELL : 0) |
-                   (desktop && windows ? ASB_EXEC_AS_USER | (elevated ? ASB_EXEC_ELEVATED : 0) : 0),
+                   (desktop ? ASB_EXEC_AS_USER | (elevated ? ASB_EXEC_ELEVATED : 0) : 0),
                    (DWORD)timeout * 1000, (DWORD)max_output, &r);
     free(encoded);
     if (r.result != ASB_GUEST_OK) { guest_failure(t, &r); asb_guest_free(&r); return; }
@@ -1745,12 +1744,7 @@ static void tool_get_guest_crash(ToolCall *t, const JVal *args)
         "$o=Get-CimInstance Win32_OperatingSystem; "
         "@{bugchecks=$b;unexpectedShutdowns=$k;dumps=$d;lastBoot=$o.LastBootUpTime.ToString('s');now=(Get-Date).ToString('s');"
         "windowsBuild=$o.Version} | ConvertTo-Json -Depth 4 -Compress";
-    static const char linux_script[] =
-        "echo '== kernel errors, previous boot =='; journalctl -k -b -1 -p 3 --no-pager 2>/dev/null | tail -n 40; "
-        "echo '== kernel errors, this boot =='; dmesg --level=emerg,alert,crit,err 2>/dev/null | tail -n 40; "
-        "echo '== /var/crash =='; ls -l /var/crash 2>/dev/null; echo '== uptime =='; uptime -s 2>/dev/null";
     VmRef vm;
-    BOOL windows;
     char *command;
     AsbGuestResult r;
     Sb js = { 0 }, host = { 0 };
@@ -1758,10 +1752,9 @@ static void tool_get_guest_crash(ToolCall *t, const JVal *args)
 
     if (!resolve_vm(t, args, &vm)) return;
     if (!guest_ready(t, &vm)) return;
-    windows = _stricmp(vm.os, "Linux") != 0;
-    command = windows ? powershell_command(windows_script) : _strdup(linux_script);
+    command = powershell_command(windows_script);
     if (!command) { result_error(t, "Out of memory."); return; }
-    asb_guest_exec(&vm.target, command, NULL, windows ? 0 : ASB_EXEC_SHELL, 60000, 60000, &r);
+    asb_guest_exec(&vm.target, command, NULL, 0, 60000, 60000, &r);
     free(command);
     if (r.result != ASB_GUEST_OK) { guest_failure(t, &r); asb_guest_free(&r); return; }
     while (r.out_len > 0 && (r.out[r.out_len - 1] == '\r' || r.out[r.out_len - 1] == '\n' || r.out[r.out_len - 1] == ' '))
@@ -1769,9 +1762,9 @@ static void tool_get_guest_crash(ToolCall *t, const JVal *args)
 
     log_lines(&host, vm.name, 5, TRUE);
     sb_puts(&js, "{\"guest\":");
-    if (windows && r.out_len && (guest = json_parse(r.out, r.out_len)) != NULL && guest->type == J_OBJ)
+    if (r.out_len && (guest = json_parse(r.out, r.out_len)) != NULL && guest->type == J_OBJ)
         sb_put(&js, r.out, r.out_len);
-    else {   /* Linux report, or PowerShell said something else */
+    else {   /* PowerShell said something else */
         Sb both = { 0 };
         sb_put(&both, r.out, r.out_len);
         if (r.err_len) { sb_puts(&both, "\n"); sb_put(&both, r.err, r.err_len); }
@@ -1783,12 +1776,11 @@ static void tool_get_guest_crash(ToolCall *t, const JVal *args)
     sb_puts(&js, ",\"hostLog\":");
     sb_json(&js, host.p ? host.p : "");
     sb_puts(&js, ",\"next\":");
-    sb_json(&js, windows
-        ? "bugchecks lists the stop codes Windows recorded (newest first) with their four parameters; a crash "
-          "newer than lastBoot cannot exist, so compare times with the moment of your test. Fetch a dump with "
-          "copy_from_guest and analyse it on this PC (cdb/WinDbg: !analyze -v). No new entry and no new dump "
-          "means the guest did not bugcheck."
-        : "Kernel errors of the previous and the current boot. Fetch files from /var/crash with copy_from_guest.");
+    sb_json(&js,
+        "bugchecks lists the stop codes Windows recorded (newest first) with their four parameters; a crash "
+        "newer than lastBoot cannot exist, so compare times with the moment of your test. Fetch a dump with "
+        "copy_from_guest and analyse it on this PC (cdb/WinDbg: !analyze -v). No new entry and no new dump "
+        "means the guest did not bugcheck.");
     sb_puts(&js, "}");
     if (js.failed) result_error(t, "Out of memory."); else result_json(t, FALSE, js.p);
     sb_free(&js); sb_free(&host);
@@ -2058,14 +2050,6 @@ static JVal *script_json(ToolCall *t, const AsbGuestResult *r)
     return NULL;
 }
 
-/* Windows-only tools say so instead of failing in a strange way. */
-static BOOL windows_guest(ToolCall *t, const VmRef *vm, const char *instead)
-{
-    if (_stricmp(vm->os, "Linux") != 0) return TRUE;
-    result_error(t, "This tool is for Windows guests. On this Linux guest use run_command: %s.", instead);
-    return FALSE;
-}
-
 /* Start a JSON object from a guest script's answer, left open so members can
    be added. */
 static void json_reopen(Sb *js, const AsbGuestResult *r)
@@ -2121,9 +2105,7 @@ static BOOL wait_restart(VmRef *vm, int timeout_s, int *waited_s)
 static BOOL guest_reboot(ToolCall *t, VmRef *vm)
 {
     AsbGuestResult r;
-    BOOL windows = _stricmp(vm->os, "Linux") != 0;
-    asb_guest_exec(&vm->target, windows ? "shutdown.exe /r /t 0 /f" : "systemctl reboot || reboot", NULL,
-                   windows ? 0 : ASB_EXEC_SHELL, 30000, 4000, &r);
+    asb_guest_exec(&vm->target, "shutdown.exe /r /t 0 /f", NULL, 0, 30000, 4000, &r);
     /* A connection that breaks here is the restart itself. */
     if (r.result != ASB_GUEST_OK && r.result != ASB_GUEST_IO) { guest_failure(t, &r); asb_guest_free(&r); return FALSE; }
     if (r.result == ASB_GUEST_OK && r.exit_code != 0) {
@@ -2217,7 +2199,7 @@ static void tool_set_verifier(ToolCall *t, const JVal *args)
         result_error(t, "Pass drivers: the driver file names to verify, e.g. [\"mydrv.sys\"].");
         return;
     }
-    if (!guest_ready(t, &vm) || !windows_guest(t, &vm, "kernel debug options are set at build time (CONFIG_KASAN, lockdep)")) {
+    if (!guest_ready(t, &vm)) {
         sb_free(&params);
         return;
     }
@@ -2271,7 +2253,7 @@ static void tool_get_devices(ToolCall *t, const JVal *args)
     if (max < 1) max = 1;
     if (max > 200) max = 200;
     if (filter && strlen(filter) > 100) { result_error(t, "filter is longer than 100 characters."); return; }
-    if (!guest_ready(t, &vm) || !windows_guest(t, &vm, "lspci -k, lsmod, dmesg")) return;
+    if (!guest_ready(t, &vm)) return;
     sb_printf(&params, "{\"problemOnly\":%s,\"max\":%d,\"filter\":", problem_only ? "true" : "false", max);
     sb_json(&params, filter ? filter : "");
     sb_puts(&params, "}");
@@ -2312,7 +2294,7 @@ static void tool_uninstall_driver(ToolCall *t, const JVal *args)
                         "legacy driver service.");
         return;
     }
-    if (!guest_ready(t, &vm) || !windows_guest(t, &vm, "rmmod / modprobe -r")) return;
+    if (!guest_ready(t, &vm)) return;
     sb_puts(&params, "{\"publishedName\":");
     if (published) sb_json(&params, published); else sb_puts(&params, "null");
     sb_puts(&params, ",\"service\":");
@@ -2413,7 +2395,7 @@ static void tool_install_driver(ToolCall *t, const JVal *args)
     }
     j_bool(args, "trust_certificate", &trust);
     j_bool(args, "check_only", &check_only);
-    if (!guest_ready(t, &vm) || !windows_guest(t, &vm, "copy_to_guest the .ko, then insmod")) return;
+    if (!guest_ready(t, &vm)) return;
 
     /* Look at the package with the user's own rights. */
     whost = to_wide(host_path);
@@ -2581,20 +2563,6 @@ static void tool_get_debug_output(ToolCall *t, const JVal *args)
     if (max_bytes < 1000) max_bytes = 1000;
     if (max_bytes > 100000) max_bytes = 100000;
     if (!guest_ready(t, &vm)) return;
-    if (!_stricmp(vm.os, "Linux")) {   /* the kernel log is always there */
-        char command[120];
-        sprintf_s(command, sizeof(command), "dmesg -T 2>/dev/null | tail -c %d", max_bytes);
-        asb_guest_exec(&vm.target, command, NULL, ASB_EXEC_SHELL, 30000, (DWORD)max_bytes + 1000, &r);
-        if (r.result != ASB_GUEST_OK) { guest_failure(t, &r); asb_guest_free(&r); return; }
-        sb_puts(&js, "{\"ok\":true,\"output\":");
-        sb_json_n(&js, r.out, r.out_len);
-        sb_puts(&js, ",\"next\":\"On Linux this is the end of the kernel log (dmesg): printk output needs no capture, "
-                     "so start and stop do nothing.\"}");
-        if (js.failed) result_error(t, "Out of memory."); else result_json(t, FALSE, js.p);
-        sb_free(&js);
-        asb_guest_free(&r);
-        return;
-    }
     sb_puts(&params, "{\"action\":");
     sb_json(&params, action);
     sb_printf(&params, ",\"enableFilter\":%s,\"max\":%d,\"providers\":[", enable_filter ? "true" : "false", max_bytes);
@@ -2778,7 +2746,7 @@ static void tool_analyze_dump(ToolCall *t, const JVal *args)
     } else {
         const char *s;
         BOOL found = FALSE;
-        if (!guest_ready(t, &vm) || !windows_guest(t, &vm, "crash <vmlinux> <vmcore> on the files in /var/crash")) return;
+        if (!guest_ready(t, &vm)) return;
         sb_puts(&params, "{\"path\":");
         if (dump_arg && dump_arg[0]) sb_json(&params, dump_arg); else sb_puts(&params, "null");
         sb_puts(&params, "}");
@@ -3431,8 +3399,8 @@ static const Tool g_tools[] = {
       "set test_mode true: Secure Boot off and test signing on, so test-signed drivers load. Returns the new "
       "VM's id.",
       "{\"type\":\"object\",\"properties\":{"
-      "\"name\":{\"type\":\"string\",\"description\":\"VM name, also the guest's host name: letters, digits, hyphens; at most 15 characters for Windows, lowercase for Linux.\"},"
-      "\"os_type\":{\"type\":\"string\",\"enum\":[\"Windows\",\"Linux\"],\"description\":\"Windows 11 or Ubuntu.\"},"
+      "\"name\":{\"type\":\"string\",\"description\":\"VM name, also the guest's host name: letters, digits, hyphens; at most 15 characters.\"},"
+      "\"os_type\":{\"type\":\"string\",\"enum\":[\"Windows\"],\"description\":\"Windows 11.\"},"
       "\"image_path\":{\"type\":\"string\",\"description\":\"Full path on this PC of the installer ISO. Not needed with template.\"},"
       "\"template\":{\"type\":\"string\",\"description\":\"Name of a template from get_host; much faster than an ISO.\"},"
       "\"admin_user\":{\"type\":\"string\",\"description\":\"Name of the administrator account created in the guest.\"},"
@@ -3475,18 +3443,18 @@ static const Tool g_tools[] = {
       "},\"required\":[\"vm\"],\"additionalProperties\":false}",
       TRUE, FALSE, TRUE, FALSE, FALSE, tool_wait_for_vm },
     { "run_command", "Run a command in a VM",
-      "Run a command inside the guest and return its exit code, stdout and stderr. It runs as SYSTEM on Windows "
+      "Run a command inside the guest and return its exit code, stdout and stderr. It runs as SYSTEM "
       "(through cmd.exe /c by default; shell \"powershell\" runs the text as a PowerShell script, \"none\" "
-      "starts the program directly) and as root through /bin/sh -c on Linux, without a visible window or desktop "
+      "starts the program directly), without a visible window or desktop "
       "session. It works without network, through the guest agent. The VM must be online (wait_for_vm). If the "
       "connection breaks, the guest restarted or crashed: call wait_for_vm, then get_guest_crash. A non-zero exit "
       "code is reported, not an error. To start a program with a window, pass desktop true (it then runs as the "
       "signed-in user).",
       "{\"type\":\"object\",\"properties\":{" VM_PROP ","
       "\"command\":{\"type\":\"string\",\"description\":\"The command line, e.g. pnputil /add-driver C:\\\\Drivers\\\\my.inf /install\"},"
-      "\"shell\":{\"type\":\"string\",\"enum\":[\"cmd\",\"powershell\",\"none\"],\"description\":\"Windows guests only. Default cmd.\"},"
-      "\"working_dir\":{\"type\":\"string\",\"description\":\"Folder in the guest to run in. Default: the system folder (Windows) or / (Linux).\"},"
-      "\"desktop\":{\"type\":\"boolean\",\"description\":\"Windows guests: run it as the signed-in user in their desktop session, so it can show windows (start notepad.exe, an installer, a test GUI). Programs it starts keep running after the command returns. Default false: as SYSTEM, without a desktop.\"},"
+      "\"shell\":{\"type\":\"string\",\"enum\":[\"cmd\",\"powershell\",\"none\"],\"description\":\"Default cmd.\"},"
+      "\"working_dir\":{\"type\":\"string\",\"description\":\"Folder in the guest to run in. Default: the system folder.\"},"
+      "\"desktop\":{\"type\":\"boolean\",\"description\":\"Run it as the signed-in user in their desktop session, so it can show windows (start notepad.exe, an installer, a test GUI). Programs it starts keep running after the command returns. Default false: as SYSTEM, without a desktop.\"},"
       "\"elevated\":{\"type\":\"boolean\",\"description\":\"With desktop: use the user's administrator rights (elevated) when the user is an administrator. Default false.\"},"
       "\"timeout_seconds\":{\"type\":\"integer\",\"minimum\":1,\"maximum\":600,\"description\":\"The command is ended after this long. Default 60.\"},"
       "\"max_output_bytes\":{\"type\":\"integer\",\"minimum\":256,\"maximum\":200000,\"description\":\"Most bytes kept of stdout and of stderr. Default 16000.\"}"
@@ -3497,7 +3465,7 @@ static const Tool g_tools[] = {
       "(content_base64 or content_text, a few MB). Missing folders are created and an existing file is replaced. "
       "Use it to put a driver (.sys, .inf, .cat), a test program or a script into the VM. The VM must be online.",
       "{\"type\":\"object\",\"properties\":{" VM_PROP ","
-      "\"guest_path\":{\"type\":\"string\",\"description\":\"Full destination path in the guest, e.g. C:\\\\Drivers\\\\my.sys or /root/test.sh\"},"
+      "\"guest_path\":{\"type\":\"string\",\"description\":\"Full destination path in the guest, e.g. C:\\\\Drivers\\\\my.sys\"},"
       "\"host_path\":{\"type\":\"string\",\"description\":\"Full path of the file on this PC. It is read with the user's own (non-elevated) rights.\"},"
       "\"content_base64\":{\"type\":\"string\",\"description\":\"The file's bytes as base64, instead of host_path.\"},"
       "\"content_text\":{\"type\":\"string\",\"description\":\"The file's text (written as UTF-8), instead of host_path.\"},"
@@ -3516,9 +3484,9 @@ static const Tool g_tools[] = {
       "},\"required\":[\"vm\",\"guest_path\"],\"additionalProperties\":false}",
       FALSE, FALSE, TRUE, FALSE, TRUE, tool_copy_from_guest },
     { "get_guest_crash", "Check a VM for crashes",
-      "Find out whether the guest crashed: on Windows the recorded bugchecks (stop code and its four parameters, "
+      "Find out whether the guest crashed: the recorded bugchecks (stop code and its four parameters, "
       "newest first), unexpected shutdowns, the crash dump files with their sizes and times, and the last boot "
-      "time; on Linux the kernel errors of the previous and current boot and /var/crash. Call it after a test, "
+      "time. Call it after a test, "
       "or after run_command lost its connection and wait_for_vm brought the VM back. Changes nothing.",
       VM_ONLY, TRUE, FALSE, TRUE, FALSE, FALSE, tool_get_guest_crash },
     { "screenshot", "Take a screenshot of a VM",
@@ -3581,7 +3549,7 @@ static const Tool g_tools[] = {
       "ends it. Only output that passes Windows' debug print filter is captured: DbgPrintEx(DPFLTR_IHVDRIVER_ID, "
       "DPFLTR_ERROR_LEVEL, ...) always passes; plain DbgPrint / KdPrint needs start with enable_filter true and "
       "then restart_vm. The capture ends at a guest restart: start again. providers adds ETW / WPP providers, "
-      "saved as an .etl file returned by stop. On Linux guests it returns the end of dmesg.",
+      "saved as an .etl file returned by stop.",
       "{\"type\":\"object\",\"properties\":{" VM_PROP ","
       "\"action\":{\"type\":\"string\",\"enum\":[\"start\",\"read\",\"stop\",\"status\"],\"description\":\"What to do.\"},"
       "\"enable_filter\":{\"type\":\"boolean\",\"description\":\"With start: set the Debug Print Filter registry values so every DbgPrint level passes (takes effect after a restart). Default false.\"},"
@@ -3687,10 +3655,10 @@ static const Tool g_tools[] = {
 };
 
 static const char g_instructions[] =
-    "App Sandbox runs disposable, GPU-capable Windows 11 and Ubuntu virtual machines on this PC. Use a VM to "
+    "App Sandbox runs disposable, GPU-capable Windows 11 virtual machines on this PC. Use a VM to "
     "try software, installers, drivers and other risky or low-level things instead of the real machine. Call "
     "list_vms first (get_host shows capacity and templates). Usual flow: create_vm or start_vm, then "
-    "wait_for_vm until online, then run_command (runs as SYSTEM or root), copy_to_guest and copy_from_guest. "
+    "wait_for_vm until online, then run_command (runs as SYSTEM), copy_to_guest and copy_from_guest. "
     "Take a snapshot before a risky step and restore it to go back.\n"
     "\n"
     "Details:\n"
@@ -3700,7 +3668,7 @@ static const char g_instructions[] =
     "they wait.\n"
     "- The guest tools (run_command, copy_*, install_driver, get_debug_output, get_guest_crash...) go through "
     "the guest agent: no network or SSH needed, but the VM must be online. If one says the guest agent is too "
-    "old, shut the VM down and start it again (Windows guests are updated before they start).\n"
+    "old, shut the VM down and start it again (the guest components are updated before it starts).\n"
     "- Snapshots need a stopped VM: shutdown_vm, wait_for_vm until \"stopped\", take_snapshot, start_vm. "
     "restore_snapshot starts the VM from a snapshot on a new branch. No tool takes a snapshot of a running VM "
     "for you: take one before installing a driver.\n"
@@ -3718,7 +3686,6 @@ static const char g_instructions[] =
     "\"online\", then get_guest_crash (stop code, dumps) and analyze_dump (faulting module, stack).\n"
     "5. To retry from a clean state: stop_vm, wait_for_vm until \"stopped\", restore_snapshot with the clean "
     "snapshot's index (list_snapshots), wait_for_vm, and go to step 2.\n"
-    "Linux guests: copy_to_guest the module, run_command insmod, get_debug_output for dmesg.\n"
     "\n"
     "Limits: VMs stop when App Sandbox exits. run_command has no desktop unless desktop is true. If tools that "
     "change things are missing, the user has put this server in read-only mode (App Sandbox > Settings > AI "

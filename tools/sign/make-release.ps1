@@ -1,4 +1,4 @@
-<#
+﻿<#
   make-release.ps1 - Build AppSandbox, then conditionally sign + package.
 
   Flow:
@@ -278,10 +278,9 @@ $signtool = Find-SignTool
 # ONE signtool call over every PE we build - app .exe/.dll AND the driver .sys/.dll in
 # bin\Release\drivers - so binaries cost a single PIN. Idempotent: files already signed by our
 # cert are skipped (re-signing a driver binary would change its bytes and break the MS catalog
-# hash on a reuse / cache-hit run). drivers-signed/_attest/_package are excluded; WebView2Loader.dll
-# is left as Microsoft shipped it.
-# WebView2Loader.dll and devcon.exe are Microsoft's binaries - never re-sign them with our cert.
-$msBinaries = @('WebView2Loader.dll', 'devcon.exe')
+# hash on a reuse / cache-hit run). drivers-signed/_attest/_package are excluded.
+# devcon.exe is Microsoft's binary - never re-sign it with our cert.
+$msBinaries = @('devcon.exe')
 $toSign = @(Get-ChildItem $bin -Recurse -Include *.exe, *.dll, *.sys | Where-Object {
     ($_.Name -notin $msBinaries) -and
     ($_.FullName -notmatch '\\(drivers-signed|_attest|_package)\\') -and
@@ -311,17 +310,14 @@ $signedDir  = Join-Path $bin 'drivers-signed'
 $driversDir = Join-Path $bin 'drivers'
 if (-not $SkipDrivers) {
     $haveSigned = (Test-DriverSigned $driversDir 'AppSandboxVDD' $asb.Full) -and `
-                  (Test-DriverSigned $driversDir 'AppSandboxVAD' $asb.Full) -and `
-                  (Test-DriverSigned $driversDir 'AppSandboxSHM' $asb.Full)
+                  (Test-DriverSigned $driversDir 'AppSandboxVAD' $asb.Full)
     if ($ForceDriverSign -or -not $haveSigned) {
         # Reuse a prior MS-signed download only if it matches THIS version; otherwise submit.
         $vddInf = Get-ChildItem (Join-Path $signedDir 'AppSandboxVDD') -Recurse -Filter 'AppSandboxVDD.inf' -ErrorAction SilentlyContinue | Select-Object -First 1
         $vadInf = Get-ChildItem (Join-Path $signedDir 'AppSandboxVAD') -Recurse -Filter 'AppSandboxVAD.inf' -ErrorAction SilentlyContinue | Select-Object -First 1
-        $shmInf = Get-ChildItem (Join-Path $signedDir 'AppSandboxSHM') -Recurse -Filter 'AppSandboxSHM.inf' -ErrorAction SilentlyContinue | Select-Object -First 1
-        $reusable = (-not $ForceDriverSign) -and $vddInf -and $vadInf -and $shmInf -and `
+        $reusable = (-not $ForceDriverSign) -and $vddInf -and $vadInf -and `
                     (Test-DriverSigned $vddInf.DirectoryName 'AppSandboxVDD' $asb.Full) -and `
-                    (Test-DriverSigned $vadInf.DirectoryName 'AppSandboxVAD' $asb.Full) -and `
-                    (Test-DriverSigned $shmInf.DirectoryName 'AppSandboxSHM' $asb.Full)
+                    (Test-DriverSigned $vadInf.DirectoryName 'AppSandboxVAD' $asb.Full)
         if ($reusable) {
             Write-Host "Reusing existing Microsoft-signed drivers (v$($asb.Full)) from drivers-signed - no resubmit."
         } else {
@@ -339,8 +335,7 @@ if (-not $SkipDrivers) {
         }
         # Guard: confirm the deposited drivers are MS-signed AND this version before shipping.
         if (-not ((Test-DriverSigned $driversDir 'AppSandboxVDD' $asb.Full) -and `
-                  (Test-DriverSigned $driversDir 'AppSandboxVAD' $asb.Full) -and `
-                  (Test-DriverSigned $driversDir 'AppSandboxSHM' $asb.Full))) {
+                  (Test-DriverSigned $driversDir 'AppSandboxVAD' $asb.Full))) {
             throw "Drivers in $driversDir are not Microsoft-signed at v$($asb.Full) - aborting (sign-drivers may have failed)."
         }
     } else {
@@ -358,19 +353,20 @@ $stage     = Join-Path $stageRoot 'AppSandbox'
 if (Test-Path $stageRoot) { Remove-Item $stageRoot -Recurse -Force }
 New-Item -ItemType Directory -Force -Path $stage | Out-Null
 
-# Explicit allowlist (not "copy everything minus excludes"): the root holds ONLY the host app +
-# its direct deps; the guest binaries ship under resources\, the signed drivers under drivers\,
-# the web UI under web\.
-$rootBins = @('AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll')
+# Explicit allowlist (not "copy everything minus excludes"): the root holds ONLY the native host
+# + its direct deps; the guest binaries ship under resources\, the signed drivers under drivers\.
+# This stage is what packaging\msix\make-msix.ps1 -Stage takes: it builds the WinUI app
+# (app\AppSandbox) around these files and makes the MSIX.
+$rootBins = @('appsandbox_host.dll', 'appsandbox_core.dll', 'iso-patch.exe')
 foreach ($b in $rootBins) {
     $src = Join-Path $bin $b
     if (-not (Test-Path $src)) { throw "Missing required root binary $b under $bin." }
     Copy-Item $src (Join-Path $stage $b) -Force
 }
 
-# The drivers\, resources\ and web\ subfolders are shipped whole, minus symbols/intermediates
+# The drivers\ and resources\ subfolders are shipped whole, minus symbols/intermediates
 # and the test .cer (the drivers are MS-signed; devcon.exe is Microsoft's and stays).
-foreach ($sub in @('resources', 'drivers', 'web')) {
+foreach ($sub in @('resources', 'drivers')) {
     $srcSub = Join-Path $bin $sub
     if (-not (Test-Path $srcSub)) { throw "Missing required folder $sub under $bin." }
     robocopy $srcSub (Join-Path $stage $sub) /E /XF *.pdb *.lib *.exp *.ilk *.iobj *.ipdb *.log *.cer | Out-Null
@@ -396,8 +392,8 @@ foreach ($sub in @('examples', 'tests')) {
     $global:LASTEXITCODE = 0
 }
 
-# License and third-party notices beside AppSandbox.exe (Settings > About
-# shows them offline).
+# License and third-party notices beside the host (Settings > About shows
+# them offline).
 foreach ($f in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
     $fsrc = Join-Path $repo $f
     if (-not (Test-Path $fsrc)) { throw "Missing $f in the repository root." }
@@ -407,11 +403,10 @@ foreach ($f in @('LICENSE', 'THIRD-PARTY-NOTICES.md')) {
 # Tripwire: the signed drivers come from the deposit (not the build) - fail loudly if any
 # expected artifact is missing rather than shipping a partial zip.
 $required = @(
-    'AppSandbox.exe', 'appsandbox_core.dll', 'iso-patch.exe', 'WebView2Loader.dll',
+    'appsandbox_host.dll', 'appsandbox_core.dll', 'iso-patch.exe',
     'drivers\AppSandboxVDD.dll', 'drivers\AppSandboxVDD.inf', 'drivers\AppSandboxVDD.cat',
     'drivers\AppSandboxVAD.sys', 'drivers\AppSandboxVAD.inf', 'drivers\AppSandboxVAD.cat',
-    'drivers\AppSandboxSHM.sys', 'drivers\AppSandboxSHM.inf', 'drivers\AppSandboxSHM.cat',
-    'drivers\devcon.exe', 'resources', 'web',
+    'drivers\devcon.exe', 'resources',
     'headless-api\asb.py', 'headless-api\README.md', 'headless-api\examples', 'headless-api\tests',
     'LICENSE', 'THIRD-PARTY-NOTICES.md'
 )
@@ -432,8 +427,8 @@ Write-Host ("--- {0} files, {1} MB ---`n" -f $files.Count, $mb)
 
 $zip = Join-Path $bin ("AppSandbox-{0}-{1}-{2}.zip" -f $Version, $OS, $Platform.ToLower())
 if (Test-Path $zip) { Remove-Item $zip -Force }
-# Flat layout: the items sit at the zip root (file.zip\AppSandbox.exe, file.zip\drivers\...),
-# with the drivers\ / resources\ / web\ subfolders preserved - no extra parent folder.
+# Flat layout: the items sit at the zip root (file.zip\appsandbox_host.dll, file.zip\drivers\...),
+# with the drivers\ / resources\ subfolders preserved - no extra parent folder.
 Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
 Remove-Item $stageRoot -Recurse -Force
 

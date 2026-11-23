@@ -1,0 +1,51 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<Page
+    x:Class="AppSandbox.Views.ActivityPage"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+
+    <Grid Padding="36,24,36,24" RowDefinitions="Auto,*" RowSpacing="16">
+
+        <Grid ColumnDefinitions="Auto,*,Auto" ColumnSpacing="14">
+            <Border Style="{StaticResource PageIconTileStyle}">
+                <FontIcon Glyph="&#xE9D9;" Style="{StaticResource PageIconGlyphStyle}" />
+            </Border>
+            <StackPanel Grid.Column="1" VerticalAlignment="Center">
+                <TextBlock Text="Activity" Style="{StaticResource TitleTextBlockStyle}" />
+                <TextBlock x:Name="SummaryText" Style="{StaticResource BodyTextBlockStyle}" Foreground="{ThemeResource TextFillColorSecondaryBrush}" />
+            </StackPanel>
+            <StackPanel Grid.Column="2" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
+                <Button Click="Copy_Click">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <FontIcon Glyph="&#xE8C8;" FontSize="14" />
+                        <TextBlock Text="Copy" />
+                    </StackPanel>
+                </Button>
+                <Button Click="Clear_Click">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <FontIcon Glyph="&#xE74D;" FontSize="14" />
+                        <TextBlock Text="Clear" />
+                    </StackPanel>
+                </Button>
+                <Button Click="ShowFile_Click" ToolTipService.ToolTip="The full log on disk: appsandbox.log">
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <FontIcon Glyph="&#xE838;" FontSize="14" />
+                        <TextBlock Text="Show log file" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+        </Grid>
+
+        <!-- What App Sandbox did, as it happens: the newest lines of appsandbox.log. -->
+        <Border Grid.Row="1" Style="{StaticResource CardStyle}" Padding="4">
+            <ListView x:Name="Lines" SelectionMode="None" IsItemClickEnabled="False">
+                <ListView.ItemContainerStyle>
+                    <Style TargetType="ListViewItem" BasedOn="{StaticResource DefaultListViewItemStyle}">
+                        <Setter Property="MinHeight" Value="0" />
+                        <Setter Property="Padding" Value="12,2" />
+                    </Style>
+                </ListView.ItemContainerStyle>
+            </ListView>
+        </Border>
+    </Grid>
+</Page>

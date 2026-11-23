@@ -1,10 +1,11 @@
 # Build check for pull requests and branch pushes.
 #
-# Builds the whole solution (app, guest tools, drivers) for Release x64 and
+# Builds the native solution (host, guest tools, drivers) for Release x64 and
 # ARM64 with Visual Studio 2022 + the WDK, the same way as
-# windows-test-build.yml, but packages and publishes nothing. release/**
-# branches are left out because windows-test-build.yml already builds them.
-# A Linux job checks the web UI for syntax errors and the core source lists.
+# windows-test-build.yml, and on x64 the WinUI app (app\AppSandbox) around it,
+# but packages and publishes nothing. release/** branches are left out because
+# windows-test-build.yml already builds them. A Linux job checks the core
+# source lists and the generated MCP scripts.
 name: CI
 
 on:
@@ -54,17 +55,28 @@ jobs:
         shell: cmd
         run: msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=${{ matrix.platform }} /m /v:minimal /nologo
 
+      - uses: actions/setup-dotnet@v4
+        if: matrix.platform == 'x64'
+        with:
+          dotnet-version: '10.0.x'
+
+      # The app project is x64 only. No package: that is windows-test-build.yml's job.
+      - name: Build the app (Release|x64)
+        if: matrix.platform == 'x64'
+        shell: pwsh
+        run: dotnet build app\AppSandbox\AppSandbox.csproj -c Release -p:Platform=x64 -p:GenerateAppxPackageOnBuild=false -v:minimal -nologo
+
   lint:
-    name: Web UI syntax and source lists
+    name: Source lists and generated files
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
 
-      - name: Syntax-check web/app.js
-        run: node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"
-
-      # Compares src/core with AppSandboxCore.vcxproj and the Xcode project:
-      # a file added to src/core must be listed in both.
-      - name: Check src/core against the project files
+      # A file added to src/core must be listed in AppSandboxCore.vcxproj.
+      - name: Check src/core against the project file
         run: python3 tools/check-sources.py
+
+      # src/app_win/mcp_scripts.h is generated from mcp_scripts/*.ps1.
+      - name: Check the generated MCP scripts
+        run: python3 tools/gen-mcp-scripts.py --check

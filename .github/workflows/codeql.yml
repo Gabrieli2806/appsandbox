@@ -2,15 +2,15 @@
 #
 # Builds only these user-mode projects, not the drivers or the other guest
 # tools:
-#   /t:AppSandbox  builds AppSandbox.exe and the projects it depends on in
+#   /t:AppSandbox  builds appsandbox_host.dll and the projects it depends on in
 #                  AppSandbox.sln: AppSandboxCore (appsandbox_core.dll), agent
 #                  (its post-build creates release\resources, which
 #                  AppSandbox's post-build copies) and the four NVIDIA shims.
 #   /t:iso-patch   builds iso-patch.exe, the host tool that turns installer
-#                  ISOs into VHDX images (squashfs, ext4 and xz parsers).
-# AppSandbox.exe and appsandbox_core.dll read data from the VM, which is
+#                  ISOs into VHDX images.
+# appsandbox_host.dll and appsandbox_core.dll read data from the VM, which is
 # untrusted, and iso-patch.exe reads downloaded images. The drivers
-# (VDD, VAD, ivshmem and their packages) are left out because a WDK build adds
+# (VDD, VAD and their packages) are left out because a WDK build adds
 # WPP preprocessing, PREfast (/analyze), Inf2Cat and test signing. These steps
 # slow down the CodeQL build tracer and are the most likely to break under it.
 # CodeQL's default C/C++ queries are also not written for KMDF/UMDF code.

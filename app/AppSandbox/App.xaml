@@ -1,0 +1,150 @@
+﻿<?xml version="1.0" encoding="UTF-8" ?>
+<Application
+    x:Class="AppSandbox.App"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml">
+    <Application.Resources>
+        <ResourceDictionary>
+            <ResourceDictionary.MergedDictionaries>
+                <XamlControlsResources xmlns="using:Microsoft.UI.Xaml.Controls" />
+            </ResourceDictionary.MergedDictionaries>
+
+            <!-- The shared G2806 vocabulary: page header tiles, one-row setting
+                 cards, accent section labels, chips and the tray menu rows. Same
+                 names and values as InputMapper, GCapture and the rest of the G2806 apps. -->
+
+            <!-- Page header: a solid accent tile with the glyph knocked out of it. -->
+            <Style x:Key="PageIconTileStyle" TargetType="Border">
+                <Setter Property="Width" Value="48" />
+                <Setter Property="Height" Value="48" />
+                <Setter Property="CornerRadius" Value="12" />
+                <Setter Property="VerticalAlignment" Value="Top" />
+                <Setter Property="Background" Value="{ThemeResource AccentFillColorDefaultBrush}" />
+            </Style>
+
+            <Style x:Key="PageIconGlyphStyle" TargetType="FontIcon">
+                <Setter Property="FontSize" Value="22" />
+                <Setter Property="Foreground" Value="{ThemeResource TextOnAccentFillColorPrimaryBrush}" />
+            </Style>
+
+            <Style x:Key="CardStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="8" />
+                <Setter Property="Padding" Value="16" />
+            </Style>
+
+            <!-- Section label above a run of setting cards: accent glyph + caps. -->
+            <Style x:Key="SectionGlyphStyle" TargetType="FontIcon">
+                <Setter Property="FontSize" Value="14" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            </Style>
+
+            <Style x:Key="SectionLabelStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{ThemeResource AccentTextFillColorPrimaryBrush}" />
+            </Style>
+
+            <!-- A setting row: icon, title, one line about it, control on the right. -->
+            <Style x:Key="RowGlyphStyle" TargetType="FontIcon">
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+
+            <Style x:Key="RowDescriptionStyle" TargetType="TextBlock" BasedOn="{StaticResource CaptionTextBlockStyle}">
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+
+            <!-- Small rounded facts: processors, memory, disk, network. Quiet on purpose. -->
+            <Style x:Key="ChipStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorSecondaryBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="10" />
+                <Setter Property="Padding" Value="8,2" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+
+            <Style x:Key="ChipTextStyle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="TextTrimming" Value="CharacterEllipsis" />
+            </Style>
+
+            <Style x:Key="ChipGlyphStyle" TargetType="FontIcon">
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+
+            <!-- A keyboard key. -->
+            <Style x:Key="KeycapStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource ControlFillColorDefaultBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource ControlStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1,1,1,2" />
+                <Setter Property="CornerRadius" Value="4" />
+                <Setter Property="Padding" Value="6,1" />
+                <Setter Property="MinWidth" Value="24" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+
+            <Style x:Key="KeycapTextStyle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="11" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="HorizontalAlignment" Value="Center" />
+                <Setter Property="Foreground" Value="{ThemeResource TextFillColorSecondaryBrush}" />
+            </Style>
+
+            <!-- A row in the notification-area menu: full width, icon then label,
+                 and nothing drawn until the pointer is on it. -->
+            <Style x:Key="TrayMenuItemStyle" TargetType="Button">
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="CornerRadius" Value="6" />
+                <Setter Property="Padding" Value="10,9" />
+                <Setter Property="HorizontalAlignment" Value="Stretch" />
+                <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            </Style>
+
+            <!-- Icon-only buttons in toolbars and the floating controls. -->
+            <Style x:Key="IconButtonStyle" TargetType="Button">
+                <Setter Property="Padding" Value="10,8" />
+                <Setter Property="MinWidth" Value="40" />
+                <Setter Property="MinHeight" Value="36" />
+            </Style>
+
+            <Style x:Key="SubtleIconButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="BorderThickness" Value="0" />
+                <Setter Property="CornerRadius" Value="6" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="Width" Value="36" />
+                <Setter Property="Height" Value="36" />
+            </Style>
+
+            <!-- The state of a VM, on its card and its page: a quiet pill, tinted
+                 green while it runs and amber while it is on its way down. -->
+            <Style x:Key="StatusPillStyle" TargetType="Border">
+                <Setter Property="Background" Value="{ThemeResource CardBackgroundFillColorSecondaryBrush}" />
+                <Setter Property="BorderBrush" Value="{ThemeResource CardStrokeColorDefaultBrush}" />
+                <Setter Property="BorderThickness" Value="1" />
+                <Setter Property="CornerRadius" Value="11" />
+                <Setter Property="Padding" Value="10,3" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+            </Style>
+
+            <!-- The tile a VM is known by in lists: its system's glyph, or its own picture. -->
+            <Style x:Key="VmTileStyle" TargetType="Border">
+                <Setter Property="Width" Value="44" />
+                <Setter Property="Height" Value="44" />
+                <Setter Property="CornerRadius" Value="10" />
+                <Setter Property="VerticalAlignment" Value="Center" />
+                <Setter Property="Background" Value="{ThemeResource ControlFillColorSecondaryBrush}" />
+            </Style>
+        </ResourceDictionary>
+    </Application.Resources>
+</Application>

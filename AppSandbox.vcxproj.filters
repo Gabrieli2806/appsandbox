@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="utf-8"?>
+﻿<?xml version="1.0" encoding="utf-8"?>
 <Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
   <ItemGroup>
     <Filter Include="App">
@@ -15,7 +15,7 @@
     </Filter>
   </ItemGroup>
   <ItemGroup>
-    <ClCompile Include="src\app_win\main.c">
+    <ClCompile Include="src\app_win\host.c">
       <Filter>App</Filter>
     </ClCompile>
     <ClCompile Include="src\app_win\ui.c">
@@ -24,7 +24,7 @@
     <ClCompile Include="src\app_win\mcp.c">
       <Filter>App</Filter>
     </ClCompile>
-    <ClCompile Include="src\app_win\webview2_bridge.c">
+    <ClCompile Include="src\app_win\ui_bridge.c">
       <Filter>App</Filter>
     </ClCompile>
     <ClCompile Include="src\backend_win\vm_display.c">
@@ -44,7 +44,7 @@
     <ClInclude Include="src\app_win\mcp.h">
       <Filter>App</Filter>
     </ClInclude>
-    <ClInclude Include="src\app_win\webview2_bridge.h">
+    <ClInclude Include="src\app_win\ui_bridge.h">
       <Filter>App</Filter>
     </ClInclude>
     <ClInclude Include="src\backend_win\asb_core.h">
