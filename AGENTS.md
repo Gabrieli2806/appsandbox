@@ -6,74 +6,92 @@ VMs. Read it before editing. Humans: README.md is the user-facing overview.
 
 ## 1. What App Sandbox is
 
-A VM manager for Windows 11 hosts (HCS/HCN, no Hyper-V Manager) and macOS
-hosts (Virtualization.framework, plus QEMU+HVF for Windows-on-Mac). Windows
+A VM manager for Windows 11 hosts (HCS/HCN, no Hyper-V Manager). Windows
 guests get GPU-PV, an IddCx virtual display driver, audio, clipboard, input
-and SSH over Hyper-V sockets. Ubuntu guests get the same through Linux
-daemons and a DRM driver. The UI is HTML/JS in WebView2 (WKWebView on Mac);
-everything else is C (C++ only where an API needs it).
+and SSH over Hyper-V sockets. Any other system can be installed by hand in a
+manual-install ("Other") VM with the basic console. The app is a WinUI 3
+shell (C#) over a native host DLL; everything that touches VMs is C (C++
+only where an API needs it). It is installed and updated as an MSIX.
+
+Linux (Ubuntu) guests and the macOS host were removed: do not add code
+paths for them back.
 
 ## 2. Repository map
 
 | Path | What |
 |---|---|
-| `AppSandbox.sln` | Windows solution (Debug/Release × x64/ARM64) |
-| `AppSandbox.vcxproj` | `AppSandbox.exe`: GUI + `--headless` daemon. C (`CompileAsC`); `vm_video_decode.cpp` is per-file C++ |
+| `AppSandbox.sln` | Native solution (Debug/Release × x64/ARM64): host DLLs, guest tools, drivers |
+| `AppSandbox.vcxproj` | `appsandbox_host.dll`: the UI-thread logic, VM windows, local API, MCP server. C (`CompileAsC`); `vm_video_decode.cpp` is per-file C++ |
 | `AppSandboxCore.vcxproj` | `appsandbox_core.dll`: VM orchestration (C, `ASB_BUILDING_DLL`) |
-| `src/app_win/` | `main.c` (entry, single instance, `--vm` shortcuts), `ui.c` (window, tray, WebView2 commands), `webview2_bridge.c`, `headless.c` (HTTP API), `mcp.c` (MCP server for AI agents, section 9) |
+| `app/AppSandbox/` | `AppSandbox.exe`: the WinUI 3 shell (C#, .NET 10, Windows App SDK, self-contained) and its MSIX. Not in the solution: built with `dotnet build` (section 3). `Program.cs` (entry, UI thread), `MainWindow` (navigation, tray icon, notices, closing), `Services/` (`HostBridge` = P/Invoke to the host, `AppState` = what the host said, `VmActions`, `Dialogs`, `UiSettings`, `TrayIcon`), `Models/`, `Views/` (pages, dialogs, `TrayMenuWindow`, `McpSettingsCard`) |
+| `src/app_win/` | `host.c` / `host.h` (the DLL's entry points: instance lock, command line, `--headless`, start), `ui.c` (JSON commands from the shell, display windows, VM operations that wait, exit sequence), `ui_bridge.c` (messages to the shell, JSON helpers), `headless.c` (HTTP API), `mcp.c` (MCP server for AI agents, section 9) |
 | `src/backend_win/` | `asb_core.c` (orchestrator, `vms.cfg`), `hcs_vm.c` (HCS JSON, GPU-PV, Plan9 shares, hvsocket service table), `hcn_network.c`, `gpu_enum.c`, `disk_util.c` (new-VM staging), `guest_tools.c` (offline guest update), `snapshot.c`, `vm_agent.c` (agent channel), `vm_exec.c` (guest command channel: run a command, copy files), `asb_display.c` (frame reader without a window, used by the MCP screenshot), `vm_display_idd.c` (viewer window), `vm_video_decode.cpp` (H.264/HEVC decode), `vm_clipboard.c`, `vm_ssh_proxy.c`, `prereq.c` |
-| `src/core/` | Platform-neutral: `protocol.h` (input packets), `asb_display_protocol.h`, `asb_exec_protocol.h` (guest command channel), `asb_events.*`, `asb_types.h`, `asb_vm_id.h` |
-| `src/app_mac/`, `src/backend_mac/` | macOS app (Objective-C), `AppSandbox.xcodeproj` |
-| `web/` | `index.html`, `app.js`, `style.css` (one UI for both hosts) |
+| `src/core/` | Shared by host and guest: `protocol.h` (input packets), `asb_display_protocol.h`, `asb_exec_protocol.h` (guest command channel), `asb_events.*`, `asb_types.h`, `asb_vm_id.h` |
 | `tools/agent/` | Windows guest: `agent.c` (service `AppSandboxAgent`), `appsandbox-input.c` (SendInput + ViGEm gamepads), `appsandbox-displays.c`, clipboard, audio, `p9copy.c` |
 | `tools/vdd/` | IddCx display driver (UMDF2, C++17): `vdd.cpp`, `vdd.h` (wire protocol), `vdd_encoder.cpp` (NVENC / Media Foundation), `ThirdParty/` (UMDF headers, `nvEncodeAPI.h` MIT) |
-| `tools/vad/`, `tools/ivshmem/` | Virtual audio driver (KMDF), ivshmem driver for Mac hosts |
-| `tools/transport/` | `asb_transport.*`: one API over AF_HYPERV (PC) or ivshmem rings (Mac) |
-| `tools/linux/` | Ubuntu guest: daemons (`agent/`), `asb_drm/` display driver, `dxgkrnl/`, `wsl-mesa/` |
-| `tools/iso-patch/` | ISO/VHDX builder, repo prefetch for Linux guests |
+| `tools/vad/` | Virtual audio driver (KMDF) |
+| `tools/transport/` | `asb_transport.*`: the guest side's Hyper-V socket helpers |
+| `tools/provision/` | What a new Windows VM runs at first boot (SetupComplete) |
+| `tools/iso-patch/` | `iso-patch.exe`: Windows installer ISO to VHDX (DISM, bcdboot) |
 | `tools/headless-api/` | Python SDK `asb.py`, API reference README, examples, integration tests |
 | `tools/sign/` | Release/sign scripts (EV signing needs the owner's hardware key) |
-| `vendor/` | devcon, WebView2, QEMU (Mac), virtio |
-| `.github/workflows/` | `windows-test-build.yml` (Release x64 build, zip + MSIX, pre-release `test-build-N` on `release/**` pushes), `ci.yml` (build check x64 + ARM64 on PRs and other branches, web UI syntax and `tools/check-sources.py`), `codeql.yml` (CodeQL for the host C/C++) |
+| `packaging/msix/` | `make-msix.ps1`: builds the app around a native build, signs the MSIX, writes `Install-AppSandbox.ps1` |
+| `vendor/` | devcon |
+| `.github/workflows/` | `windows-test-build.yml` (native Release x64 build, the app, signed MSIX, pre-release `test-build-N` on `release/**` pushes), `ci.yml` (native x64 + ARM64 and the app on PRs and other branches, `tools/check-sources.py`, generated MCP scripts), `codeql.yml` (CodeQL for the host C/C++) |
 
 Stale, ignore: `tools/agent/build.cmd`, `tools/agent/deploy.bat`, the
-`src\ui.h` entry in `AppSandboxCore.vcxproj`, links to
-`docs/linux-idd-implementation-plan.md` and `tools/shm-test` (do not exist).
+`src\ui.h` entry in `AppSandboxCore.vcxproj`.
 
 ## 3. Building and testing
 
-- Windows: Visual Studio 2022 + Windows SDK + **WDK**. From a *cmd* prompt
+- Native: Visual Studio 2022 + Windows SDK + **WDK**. From a *cmd* prompt
   (not PowerShell 7 — the driver post-build steps need Windows PowerShell 5):
   `msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64`.
-  Output: `bin\Release\` (`AppSandbox.exe`, `resources\` guest exes, `drivers\`).
+  Output: `bin\Release\` (`appsandbox_host.dll`, `appsandbox_core.dll`,
+  `iso-patch.exe`, `resources\` guest exes, `drivers\`).
+- App: .NET 10 SDK. `dotnet build app\AppSandbox\AppSandbox.csproj -c Release
+  -p:Platform=x64` (build the csproj, never the solution). It takes the
+  native files from `bin\Release` (`-p:AsbStage=<folder>` for another one)
+  and makes an unsigned MSIX under `app\AppSandbox\AppPackages`; add
+  `-p:GenerateAppxPackageOnBuild=false` for a quick compile check.
+- MSIX to install: `packaging\msix\make-msix.ps1 -Stage bin\Release -Version
+  a.b.c.d -OutDir out` builds the app, signs the package with a test
+  certificate and writes `Install-AppSandbox.ps1` (run elevated; it trusts
+  the certificate and installs or updates). The app must not be running.
+- Without the WDK (drivers cannot be built): build the user-mode projects one
+  by one with `/p:PlatformToolset=v145` (Build Tools 2026) into a scratch
+  folder, put them over the unzipped `drivers\` + `resources\` of the last
+  CI package, and use that folder as the stage.
+- Looking at the shell without administrator rights or VMs: a **Debug** build
+  with `ASB_UI_DEMO=<file with one host message per line>` plays those
+  messages instead of starting the host (`HostBridge.Start`), and
+  `ASB_UI_PAGE` (`settings`, `activity`, `create`, `tray`, `vm:<id>|<section>`,
+  `edit:<id>`) opens a page; start it with `__COMPAT_LAYER=RunAsInvoker`.
 - Drivers are **test-signed** per build; the `.cer` is extracted and must ship
   next to them (App Sandbox enables test signing in the guest).
 - Version: `Directory.Build.props` (`AsbVersionMajor/Minor/Patch/Revision`).
   CI passes `/p:AsbVersionRevision=<run number>` so every build's driver
   package is newer than the last (Windows will not "update" to the same
-  DriverVer). `AsbSourceRepo`/`AsbSourceRef` decide where Ubuntu guests fetch
-  their sources from.
+  DriverVer), and the same four parts to `make-msix.ps1` (an MSIX with the
+  same version and other contents does not install). `AsbSourceRepo` is the
+  GitHub repository Settings > About links to.
 - No unit tests. Verification = CI build + manual run on a real Windows host
   with a GPU. `tools/headless-api/tests` is a slow integration suite (real
-  ISOs, elevated daemon). Without a Windows box you can still syntax-check C
-  with `x86_64-w64-mingw32-gcc -fsyntax-only` (include `-Isrc -Isrc/core
-  -Isrc/app_win -Isrc/backend_win -Ivendor/webview2 -Itools/transport`);
-  driver code needs the WDK and can only be compiled in CI.
-- JS: `node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"`
-  catches syntax errors.
-- CI: `ci.yml` builds Release x64 and ARM64 for every pull request and every
-  push outside `release/**` (an ARM64 failure does not fail the run yet), and
-  runs the JS check and `tools/check-sources.py` on Linux. `codeql.yml` runs
-  CodeQL on the user-mode host projects for pull requests, `main`,
-  `release/**` and once a week. Set `ASB_SKIP_PACKAGE_PROJECT=1` (environment
-  variable or `/p:`) to stop `AppSandboxPackage` from running
-  `make-release.ps1` after a Release build.
+  ISOs, elevated daemon). Driver code needs the WDK and can only be compiled
+  in CI.
+- CI: `ci.yml` builds the native solution for Release x64 and ARM64 and, on
+  x64, the app, for every pull request and every push outside `release/**`;
+  a Linux job runs `tools/check-sources.py` and `tools/gen-mcp-scripts.py
+  --check`. `codeql.yml` runs CodeQL on the user-mode host projects for pull
+  requests, `main`, `release/**` and once a week. Set
+  `ASB_SKIP_PACKAGE_PROJECT=1` (environment variable or `/p:`) to stop
+  `AppSandboxPackage` from running `make-release.ps1` after a Release build.
 
 ## 4. Host ↔ guest channels
 
-Hyper-V socket services `a5b0cafe-000N-4000-8000-000000000001` (Windows
-guests) / vsock port N (Linux guests), registered in `hcs_vm.c` (ports 1–6;
-7 and 8 are not in the service table and work with HCS's defaults):
+Hyper-V socket services `a5b0cafe-000N-4000-8000-000000000001`, registered
+in `hcs_vm.c` (ports 1–6; 7 and 8 are not in the service table and work
+with HCS's defaults):
 
 | N | Channel | Format |
 |---|---|---|
@@ -83,7 +101,7 @@ guests) / vsock port N (Linux guests), registered in `hcs_vm.c` (ports 1–6;
 | 4 | Audio | `ASA1` header then length-prefixed PCM |
 | 5/6 | Clipboard host→guest / guest→host | `vm_clipboard.c` |
 | 7 | SSH | proxied TCP |
-| 8 | Command (exec) | `src/core/asb_exec_protocol.h`: one `ASXQ` request and one `ASXR` response per connection (ping, run a command, write a file, read a file). Guest agent listens (`tools/agent/agent.c`, `tools/linux/agent/appsandbox-agent.c`); host side is `vm_exec.c` |
+| 8 | Command (exec) | `src/core/asb_exec_protocol.h`: one `ASXQ` request and one `ASXR` response per connection (ping, run a command, write a file, read a file). The guest agent listens (`tools/agent/agent.c`); host side is `vm_exec.c` |
 
 Display protocol (`VDD_PROTOCOL_VERSION`, currently 4), defined once in
 `src/core/asb_display_protocol.h` for the driver and the viewer:
@@ -109,27 +127,28 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
    The command channel (8) has a version in every message; a guest agent
    older than the channel simply does not listen, and the host tells the
    user to update the guest components.
-2. **Mirrored definitions are kept in sync by hand** (except the display
-   protocol, which is one shared header): audio header (`appsandbox-audio.c` ↔ viewer);
-   clipboard (Windows host, Mac host, guests); `protocol.h` (shared);
-   `asb_exec_protocol.h` (shared by the host and the Windows agent, repeated
-   in the Linux agent, which builds from one file).
+2. **Mirrored definitions are kept in sync by hand** (except the display,
+   input and command protocols, which are shared headers in `src/core`):
+   audio header (`appsandbox-audio.c` ↔ viewer); clipboard (host ↔ guest
+   helpers).
 3. **Guest-side changes need delivery.** New VMs get files from
    `disk_util.c`. Existing Windows VMs get the 6 helper exes and the VDD
    package from `guest_tools.c` (offline, VM stopped, signature in
    `guest_tools.sig`); the agent installs a staged VDD at the next boot
    (`apply_pending_vdd_update`, result reported with `log:`). If you add a
-   guest file, add it to **both** lists. VAD/ivshmem changes need a new VM.
-   Linux guests compile from GitHub at `ASB_SOURCE_REPO@ASB_SOURCE_REF`.
+   guest file, add it to **both** lists. VAD changes need a new VM.
 4. **Driver (UMDF/IddCx) constraints** (`tools/vdd`): built with /WX; some
    Win32 macros are missing (use `0` instead of `WAIT_OBJECT_0` in new files);
    IddCx APIs must run on WDF threads (use WDF timers, not raw threads); the
    cached D3D device must survive IddCx teardown; load optional DLLs at run
    time (`mfplat.dll`, `nvEncodeAPI64.dll`) so a missing one only disables a
    feature. The VDD log is `C:\ProgramData\AppSandboxVDD.log` in the guest.
-5. **Mac host (ivshmem)**: one writer per shared word, no atomic RMW on the
-   BAR, VDD stays at 1920x1080@60 (`legacySingleMode`).
-6. **C by default.** New host/guest code is C (`CompileAsC`). Use C++ only
+5. **The shell never touches VMs.** `app/AppSandbox` only sends commands to
+   the host and shows what it answers (section 7). VM state, settings in
+   `vms.cfg`, files of a VM and anything elevated belong in the host. The
+   shell keeps only how its own window looks (`%LOCALAPPDATA%\AppSandbox\
+   shell.json`).
+6. **C by default.** New host/guest code is C (`CompileAsC`); the shell is C#. Use C++ only
    for COM-heavy APIs (Media Foundation, D3D video) in its own file with an
    `extern "C"` header and a per-file `<CompileAs>CompileAsCpp</CompileAs>`.
 7. **Elevation**: the app requires admin (HCS, http.sys). Do not add features
@@ -187,30 +206,81 @@ the Hyper-V basic console: `hcs_vm.c` adds `VideoMonitor.ConnectionOptions`
 (`\\.\pipe\<name>.BasicSession`, ACL = current user) and `ui.c`
 `do_connect_vm` routes these VMs to the RDP viewer (`vm_display.c`). Secure
 Boot is skipped. `install_complete` is TRUE from creation. The ISO stays
-attached until "Remove installer ISO" (`asb_vm_eject_iso`). (Windows and
-Ubuntu VMs detach their installer ISO automatically once the agent reports
-the installation complete.) Shutdown falls
+attached until "Remove installer ISO" (`asb_vm_eject_iso`). (Windows VMs
+detach their installer ISO automatically once the agent reports the
+installation complete.) A VM record from an older version with a Linux or
+macOS guest is loaded as "Other" (`retire_unsupported_guest`). Shutdown falls
 back to `HcsShutDownComputeSystem`. Not yet: headless API create for
 "Other", import of "Other" exports, Secure Boot option.
 
-## 7. UI ↔ C
+## 7. Shell ↔ host
 
-`web/app.js` → `sendCmd(action, data)` → `on_webview2_message` →
-`handle_webview2_message` in `src/app_win/ui.c` (one `else if` per action).
-State returns as JSON via `webview2_post`: `vmListChanged {vms, hostInfo}`,
-`hostInfo`, `fullState`, `log`, `alert`, …; per-VM fields are built in
-`build_vm_json`, host fields in `send_host_info`. Add the field in C, render
-it in `app.js`, style in `style.css`. Keep `.win-only` for Windows-host UI.
-Settings → Folders and logs / About use `openFolder`, `openVmFolder`,
-`copyVmPath`, `copyDiagnostics`, `openLink`, `showDocument`; long VM
-operations (force stop, delete, shut down) run on a worker thread and answer
-with `notice`/`createResult`/`exitProgress` messages. The core starts on a
-worker thread: the UI names its thread with `asb_set_ui_thread` first so
-HCS waits made on it keep pumping messages.
+`AppSandbox.exe` (WinUI, `app/AppSandbox`) loads `appsandbox_host.dll` and
+calls four functions (`src/app_win/host.h`): `asb_host_begin` (first thing
+in the process: data-folder access list, command line, single-instance
+lock; says whether to run, hand over to the running instance or be the
+`--headless` daemon), `asb_host_run_headless`, `asb_host_start(shell window,
+callback)` and `asb_host_command(json)`.
+
+- **One thread.** `Program.cs` starts WinUI on a thread with an 8 MB stack
+  (and the exe reserves 8 MB for the threads the host starts: `VmConfig` /
+  `VmInstance` are about 600 KB). The host creates its own never-shown
+  window on that thread (`ui_create_main_window`): it receives the messages
+  of the backend, the local API, a second launch (`UI_SHOW_MAIN_MESSAGE`,
+  `WM_COPYDATA` for `--vm`) and Windows ending the session.
+- **Shell → host**: `HostBridge.Send(action, fields)` → `asb_host_command` →
+  posted to the host's window (`WM_SHELL_COMMAND`) → `on_shell_message` →
+  `handle_shell_message` in `ui.c` (one `else if` per action). Never called
+  synchronously from a XAML handler: a command can wait on HCS or open a
+  dialog, and both dispatch messages. Actions: `uiReady`, `createVm`,
+  `startVm`, `shutdownVm`, `stopVm`, `confirmForceStop`, `connectIddVm`,
+  `sshConnect`, `deleteVm`, `deleteTemplate`, `editVm`, `setDisplayMode`,
+  `setVideoCodec`, `setVideoBitrate`, `setPerformanceMode`, `ejectIso`,
+  `getVmIcon`, `setVmIcon`, `clearVmIcon`, `createShortcut`,
+  `updateGuestTools`, `exportVm`, `importVm`, `snapTake`, `snapDelete`,
+  `snapDeleteBranch`, `snapRename`, `setViewerPrefs`,
+  `setAutoUpdateGuestTools`, `setCloseBehavior`, `getMcpStatus`,
+  `setMcpEnabled`, `setMcpReadOnly`, `getDiskSpace`, `browseDiskDirectory`,
+  `browseImage`, `enableFeature`, `enableFeatureReboot`, `openFolder`,
+  `openVmFolder`, `copyVmPath`, `copyDiagnostics`, `openLink`,
+  `showDocument`, `dismissVmError`, `cancelExit`, and `requestExit
+  {fromClose}` (the window's close button or Quit in the tray: the host
+  decides with the user what happens to running VMs).
+- **Host → shell**: `ui_bridge_post(json)` → the callback → the shell copies
+  the text and handles it from its dispatcher queue (`AppState.OnMessage`).
+  Types: `vmListChanged {vms, hostInfo}`, `fullState`, `hostInfo`,
+  `templates`, `coreLoading`, `coreReady`, `prereqRequired`, `prereqReboot`,
+  `prereqProgress`, `prereqResult`, `log`, `alert`, `notice`, `createResult`,
+  `document`, `vmIcon`, `diskSpace`, `browseResult`,
+  `diskDirectoryBrowseResult`, `exitProgress`, `mcpStatus`, `window {show}`
+  (show the window, or hide it to the tray) and `exit` (the host has shut
+  down: the process ends). Per-VM fields are built in `build_vm_json`, host
+  fields in `build_host_info_json`; `VmInfo.Parse` / `HostInfo.Parse` read
+  them.
+- **Adding something**: add the field or action in C, read it in `Models/`,
+  show it in a page. Pages listen to `AppState` events in `Loaded` and stop
+  in `Unloaded`; they keep no copy of the state.
+- **Dialogs**: file and folder pickers and the exit questions are native
+  (`ui.c`, owned by the shell's window: WinRT pickers do not work elevated).
+  Everything else is a `ContentDialog` through `Dialogs.ShowAsync`, which
+  queues them (WinUI shows one at a time), so never open one from inside
+  another: use a flyout.
+- **Design**: the shell follows the owner's other WinUI apps (GCapture,
+  InputMapper, GMic, GDeck): the shared styles in `App.xaml`
+  (`PageIconTileStyle`, `CardStyle`, `SectionLabelStyle`, `RowGlyphStyle`,
+  `TrayMenuItemStyle`…), `TitleBar` + `NavigationView`, pages in a
+  `ScrollViewer Padding="36,24,36,24"`, one card per setting row, Segoe
+  Fluent glyphs, Mica by default, and the notification-area menu as a small
+  acrylic WinUI window (`TrayMenuWindow`; one click opens it, a double click
+  the app). `McpSettingsCard.cs` is the same file in every app.
+- Long VM operations (force stop, delete, shut down) run on a worker thread
+  in the host and answer with `notice`/`createResult`/`exitProgress`
+  messages. The core starts on a worker thread: `ui.c` names its thread with
+  `asb_set_ui_thread` first so HCS waits made on it keep pumping messages.
 
 ## 8. Headless API (agent-facing)
 
-`src/app_win/headless.c` (Mac mirror: `src/app_mac/headless.m`): http.sys on
+`src/app_win/headless.c`: http.sys on
 `127.0.0.1:8787` (+20 ports), bearer token and port in
 `%ProgramData%\AppSandbox\host.json`. Routes under `/v1`: `version`,
 `events` (SSE), `host`, `templates`, `vms` (list/create), `vms/{name}`
@@ -292,9 +362,9 @@ the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
     again, so lines printed in that second are lost. Only output that passes
     the Debug Print Filter is traced; `enable_filter` sets the registry
     values (reboot needed). `providers` adds a second session for ETW / WPP
-    providers whose .etl `stop` returns. Linux: the end of `dmesg`.
+    providers whose .etl `stop` returns.
   - `set_verifier`: `verifier.exe /standard | /flags | /reset`, optional
-    restart. `restart_vm`: `shutdown /r` (or `systemctl reboot`) and a wait
+    restart. `restart_vm`: `shutdown /r` and a wait
     for the agent to go offline and come back.
   - `analyze_dump`: finds `cdb.exe` / `kd.exe` on the host (Windows Kits
     Debuggers, PATH, the WinDbg app's folder), copies the dump out with the
@@ -314,8 +384,7 @@ the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
   not the control channel: `vm_exec.c` opens one Hyper-V socket connection
   per call to the guest agent, which runs the command as SYSTEM (Windows:
   `cmd.exe /c`, PowerShell through `-EncodedCommand`, or directly; in a job
-  object so the time limit ends the whole process tree) or root (Linux:
-  `/bin/sh -c` in its own process group), with stdout and stderr captured
+  object so the time limit ends the whole process tree), with stdout and stderr captured
   separately and capped. File copies stream in 256 KiB chunks; the guest
   writes to `<name>.asbpart` and renames. `copy_from_guest` saves only into
   the user's `Downloads\App Sandbox\<vm>`; `copy_to_guest` reads a host path
@@ -339,9 +408,7 @@ the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
 - **Delivery of the guest side** (rule 5.3): the agent with the channel
   reaches an existing Windows VM through the normal guest-components update
   (before its next start when automatic updates are on); a VM whose agent is
-  older answers the tools with "update the guest components". Linux guests
-  build `appsandbox-agent.c` at install time from `ASB_SOURCE_REPO@REF`, so
-  only VMs created after the change is in that ref have the channel.
+  older answers the tools with "update the guest components".
 - **screenshot**: with the VM's window open, a copy of the window's picture
   (`vm_display_idd_copy_frame`; not available in performance mode, where the
   window holds no CPU copy); otherwise `asb_display.c` connects to the frame
@@ -365,7 +432,7 @@ the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
   `changes`), mention it in `g_instructions` if it is part of a flow, list
   it in `tools/headless-api/README.md`, and run `mcp-check.py`. If it needs
   the guest, add an operation to `asb_exec_protocol.h` (old agents answer
-  `ASX_STATUS_UNSUPPORTED`) in both agents.
+  `ASX_STATUS_UNSUPPORTED`) and to the agent.
 - **Security** (the app is elevated, the endpoint has no token, the guest
   is not trusted):
   - Host files are opened, and the debugger is started, with a de-elevated
@@ -389,18 +456,15 @@ the contract shared by the owner's apps (`..\CLAUDE.md`, section "MCP");
     can drive VMs and, through `copy_to_guest` + `run_command`, read files
     the app's user can read. Turn the server off on a shared PC.
 - **Not done**: automatic snapshots (they need a stopped VM); Unicode text
-  in `send_input`; Ctrl+Alt+Del; export/import and VM edits; the macOS host
-  (`src/app_mac/headless.m` has no MCP endpoint, and the ivshmem transport
-  has no region for channel 8, so the Windows agent's command listener does
-  not start there).
+  in `send_input`; Ctrl+Alt+Del; export/import and VM edits.
 
 ## 10. Other roadmap items
 
 ### Drag and drop files into the VM window ("Inbox")
 
 Drop files from the host onto the VM window; they are copied into an
-**Inbox** folder in the guest (e.g. `C:\Users\<user>\Desktop\Inbox`, or
-`~/Desktop/Inbox` on Ubuntu), and the folder opens when the copy finishes.
+**Inbox** folder in the guest (e.g. `C:\Users\<user>\Desktop\Inbox`), and
+the folder opens when the copy finishes.
 
 - **Host, receiving the drop**: `vm_display_idd.c` calls `DragAcceptFiles`
   on the VM window and handles `WM_DROPFILES` (`DragQueryFileW`). App
@@ -413,7 +477,7 @@ Drop files from the host onto the VM window; they are copied into an
   FILE_DATA messages, 1 MiB chunks, host→guest channel 5) with a new
   "deliver to Inbox" message type. Alternatively add an agent command on
   channel 1. Either way, bump the protocol and ignore the message on old
-  guests (rule 5.1), and update the Linux guest daemon too.
+  guests (rule 5.1).
 - **Guest**: the receiver writes to a temporary name and renames it when
   done, resolves name clashes (`name (2).ext`), refuses `..` and absolute
   paths, and creates the Inbox in the interactive user's profile (the
@@ -432,15 +496,18 @@ Drop files from the host onto the VM window; they are copied into an
   rumble back channel (needs a host reader on ch3), PlayStation controllers
   (host HID/GameInput), stats overlay (FPS, encode/decode time, bit rate).
 - Secure shared folders (read-only or allow-listed).
-- Localisation (Spanish UI) with a language selector.
-- Packaging: MSIX is possible for the app, but HCS, drivers and elevation
-  need care (see README "Packaging").
+- Localisation (Spanish UI): the shell's strings are in code and XAML; the
+  owner's other apps use `Strings\<language>\Resources.resw` with `x:Uid`.
+- Start with Windows: the other apps use a `windows.startupTask`; an
+  elevated app is not started that way (Windows shows no UAC prompt at
+  sign-in), so it needs a scheduled task with highest privileges.
 
 ## 11. Working conventions
 
 - Small, focused commits; message explains why. Keep comments describing
   behaviour, not history.
-- Test builds: push to `release/test` (fork) → CI publishes `test-build-N`.
+- Test builds: push to `release/test` (fork) → CI publishes `test-build-N`
+  (`*-msix.zip`: the package, its test certificate, `Install-AppSandbox.ps1`).
 - When unsure whether a change reaches existing VMs, assume it does not and
   check rule 3.
 
@@ -449,17 +516,24 @@ Drop files from the host onto the VM window; they are copied into an
 Read this first when continuing the work on another machine or with another
 agent. Keep it short and current.
 
-- **Branches** (fork `Toroluis34/appsandbox`): work on
-  `feature/performance-mode`; `release/test` is fast-forwarded to it and CI
-  ("Windows test build") publishes `test-build-N` (zip + MSIX). Also on
-  push: `ci.yml` (x64 + ARM64 build, web syntax, `tools/check-sources.py`)
-  and CodeQL. Upstream is `jamesstringer90/appsandbox` (`main`).
-- **Local checks without Windows**: mingw syntax check, e.g.
-  `x86_64-w64-mingw32-gcc -fsyntax-only -DUNICODE -D_UNICODE -DWINVER=0x0A00
-  -D_WIN32_WINNT=0x0A00 -Isrc -Isrc/core -Isrc/app_win -Isrc/backend_win
-  -Ivendor/webview2 <file.c>` (missing WDK/imapi/DNS headers are expected
-  errors); `node -e "new Function(require('fs').readFileSync('web/app.js','utf8'))"`.
-  MSVC is only in CI; the owner tests on real hardware.
+- **Branches** (fork `Gabrieli2806/appsandbox`): the WinUI app is on
+  `feature/winui`; `release/test` is fast-forwarded to the branch being
+  tested and CI ("Windows test build") publishes `test-build-N`
+  (`*-msix.zip`). Also on push: `ci.yml` and CodeQL. Upstream is
+  `jamesstringer90/appsandbox` (`main`).
+- **WinUI app** (0.2.0): Linux guests and the macOS host removed; the
+  WebView2 page replaced by `app/AppSandbox` over `appsandbox_host.dll`
+  (sections 2, 3, 7). Checked on the build PC: native and app builds, every
+  page and dialog with recorded host messages (`ASB_UI_DEMO`), the real
+  host started without elevation (it reports Virtual Machine Platform as
+  off), a second launch showing the hidden window, closing with no VM
+  running, the MSIX built and signed by `make-msix.ps1`. Not yet checked
+  elevated on real VMs: create, start, the VM window, shutdown with VMs
+  running (exit question, tray), `--vm` shortcuts, the MCP server from the
+  packaged app, Explorer restart bringing the tray icon back.
+- **Local checks**: the native user-mode projects build with Build Tools 2026
+  (`/p:PlatformToolset=v145`); the drivers need the WDK (CI only). The owner
+  tests on real hardware.
 - **Done recently** (test-build-27 to 29): adaptive-resize look (rounded
   picture, shadow, dimmed blur); viewer teardown/use-after-free and
   GPU-reset recovery; Settings → Folders and logs, About; exit confirmation
@@ -505,19 +579,15 @@ agent. Keep it short and current.
     threads and then frees their state (`VddDestroySwapProc`); the guest
     clipboard writer does not match `FORMAT_DATA_RESP` to its request and
     shares `g_clip_fmts` between threads without a lock; guest helpers have no
-    invalid-parameter handler, so a `swprintf_s` path overflow ends them; the
-    VM list JSON uses a fixed 131072-character buffer (`send_vm_list`);
-    `asb_display.c` (unused) is behind the input and display protocols.
-  - WebView2 `0x800700AA` at app start after build 27 (data folder ACL
-    hardening is the suspect). Build 29 moved the user data folder to
-    `%LOCALAPPDATA%\AppSandbox\WebView2` with fallbacks; confirm with the
-    owner's `appsandbox.log` ("WebView2: user data folder ...").
+    invalid-parameter handler, so a `swprintf_s` path overflow ends them.
   - D3DMappingLayers signature/digest check (`d3dlayers.c`) is unverified
     against a real download; if guests lose GL/Vulkan, relax it.
   - Not done: shortcuts by VM id (`--vm-id`), Start-menu shortcuts under
     MSIX (`FOLDERID_CommonPrograms` when packaged), theme following Windows
     by default, x64-on-ARM64 start-up check, per-OS RAM minimum, cancel for
-    long operations, Ubuntu apt InRelease verification (`tools/iso-patch`).
+    long operations, the shell's strings in `.resw` (Spanish), start with
+    Windows (scheduled task), trimming the WebView2 / ONNX files the Windows
+    App SDK metapackage brings into the package.
 - **Owner decisions** (see `docs/RELEASE_CHECKLIST.md`): product name and
   branding (upstream's "App Sandbox"), code-signing certificate, driver
   attestation signing (guests still need test signing), privacy policy,

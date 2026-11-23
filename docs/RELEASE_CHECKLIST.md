@@ -1,7 +1,8 @@
-# Release checklist: stable zip and Microsoft Store
+# Release checklist: stable MSIX release and Microsoft Store
 
-What has to be done before the first stable release of this fork, as a zip
-and as a Microsoft Store (MSIX) package. Items marked **(owner)** need a
+What has to be done before the first stable release of this fork, as an MSIX
+on GitHub and as a Microsoft Store package. (MSIX is the only form the app
+ships in; there is no zip to unpack and run.) Items marked **(owner)** need a
 decision, an account or a certificate that only the owner has; **(code)**
 items need a change in the repository.
 
@@ -15,9 +16,11 @@ items need a change in the repository.
    - reserve it in Partner Center (section 4);
    - pass it to `packaging/msix/make-msix.ps1` with `-DisplayName` and
      `-PublisherDisplayName` (the manifest no longer hard-codes it);
-   - **(code)** change `ProductName` in `build/version.rc`, the window and
-     tray titles (`src/app_win/ui.c`, `main.c`), `web/index.html`,
-     `web/app.js` and README;
+   - **(code)** change `ProductName` in `build/version.rc`, the name in the
+     app (`app/AppSandbox`: `Package.appxmanifest`, the title in
+     `MainWindow.xaml`, `Views/TrayMenuWindow`, `Views/SettingsPage`, and
+     `Product` in `AppSandbox.csproj`), the native dialogs and messages
+     (`src/app_win/ui.c`, `host.c`) and README;
    - add an About line: "Based on App Sandbox by James Stringer (MIT)", and
      your own copyright line in `LICENSE` under James Stringer's (use the
      legal name you publish under).
@@ -35,13 +38,17 @@ items need a change in the repository.
 
 ---
 
-## 2. Before any stable release (zip and Store)
+## 2. Before any stable release (GitHub and Store)
 
 ### 2.1 Code signing (owner + code)
-- Sign every PE file the project builds: `AppSandbox.exe`,
+- Sign every PE file the native solution builds: `appsandbox_host.dll`,
   `appsandbox_core.dll`, `iso-patch.exe`, everything under `resources\`
   (guest helpers, NVIDIA shims) and the drivers' binaries before attestation.
-  `WebView2Loader.dll` and `devcon.exe` are already Microsoft-signed.
+  `devcon.exe` is already Microsoft-signed.
+- The app's own files (`AppSandbox.exe`, `AppSandbox.dll`) and the .NET and
+  Windows App SDK files beside them are made by the app build inside
+  `make-msix.ps1`; they are covered by the signature of the MSIX
+  (`-Thumbprint` or `-PfxPath`), or by the Store's for a Store package.
 - **(code)** `tools/sign/make-release.ps1` only signs when the upstream
   "App Sandbox LLC" YubiKey is present. Change it (or add a CI release job)
   to use your certificate, for example `signtool sign /dlib
@@ -52,7 +59,7 @@ items need a change in the repository.
 - Register a Partner Center **hardware** account (needs the EV certificate),
   fill `tools/sign/partner-center.local.json` and your own
   `submission-config.json`, and run `tools/sign/sign-drivers.ps1` for
-  **AppSandboxVDD**, **AppSandboxVAD** and **AppSandboxSHM** (x64, and ARM64
+  **AppSandboxVDD** and **AppSandboxVAD** (x64, and ARM64
   if you ship it).
 - Build the release stage from the attested drivers **without** `*.cer`
   (`make-release.ps1` already excludes them). Guest component updates work
@@ -63,32 +70,13 @@ items need a change in the repository.
   stages that ship a `.cer`. Release notes must not tell users that test
   signing is enabled.
 - Check: a new Windows VM from the signed stage, with Secure Boot on, has the
-  display driver, audio and SHM driver working and `bcdedit` shows
+  display driver and audio working and `bcdedit` shows
   `testsigning No`.
 
-### 2.3 Linux guest sources (code)
-- Ubuntu VMs download and compile the guest sources from
-  `AsbSourceRepo@AsbSourceRef` (default: upstream `jamesstringer90/appsandbox`
-  at `main`). Only `windows-test-build.yml` sets them. Every release build
-  must pass `/p:AsbSourceRepo=<your repo> /p:AsbSourceRef=<release tag or
-  commit>`; make `make-release.ps1` fail when they are empty. Keep the tag
-  forever (a deleted tag or a private repository breaks Ubuntu VM creation
-  for that release). Better: pack the Linux sources into `resources\` at
-  build time.
-
-### 2.4 Ubuntu packages over HTTP with `[trusted=yes]` (code, must fix)
-- `tools/iso-patch/prefetch_build_deps.c` downloads `Packages.xz` and the
-  `.deb` files from `http://archive.ubuntu.com` and checks the `.deb` hashes
-  only against that unauthenticated index; `ubuntu_vhdx.c` then installs them
-  with `deb [trusted=yes]`. Anyone on the network path while a VM is created
-  can run code as root in the new guest.
-- Fix: download `dists/<codename>{,-updates,-security}/InRelease`, verify it
-  against the Ubuntu archive key (embedded, or `gpgv --keyring
-  /usr/share/keyrings/ubuntu-archive-keyring.gpg` in the guest), check
-  `Packages.xz` against the SHA256 listed in `InRelease`, and drop
-  `[trusted=yes]` (ship the verified `InRelease` in the local repository).
-- ARM64: `archive.ubuntu.com` has no arm64 packages (`ports.ubuntu.com`
-  does). Fix the mirror before shipping an ARM64 build.
+### 2.3, 2.4 (no longer apply)
+- These covered the Ubuntu guest sources and the Ubuntu package downloads.
+  Ubuntu guests were removed, and with them every download from GitHub source
+  archives, `archive.ubuntu.com` and `pkgs.dev.azure.com`.
 
 ### 2.5 D3DMappingLayers from Windows Update (owner + code)
 - `src/backend_win/d3dlayers.c` downloads Microsoft's "OpenCL, OpenGL and
@@ -106,8 +94,8 @@ items need a change in the repository.
   A set that fails both checks is discarded and `d3dlayers.retry` blocks new
   downloads for 24 hours. Neither check has been confirmed against a real
   download yet. **Before release, on a real host:**
-  - Delete `d3dlayers`, `d3dlayers.verified` and `d3dlayers.retry` beside
-    `AppSandbox.exe` (zip) or in `%ProgramData%\AppSandbox` (MSIX), start a
+  - Delete `d3dlayers`, `d3dlayers.verified` and `d3dlayers.retry` in
+    `%ProgramData%\AppSandbox`, start a
     GPU VM and check the log: `package matches the SHA-256 digest` (or
     `SHA-1`) and `staged 6 mapping-layer files`. If it says the package does
     not match or has no digest, the FE3 parsing in `parse_leaf` needs a look.
@@ -120,37 +108,49 @@ items need a change in the repository.
 - Longer term, prefer redistributable sources: Mesa d3d12/dzn (already built
   in `tools/win-mesa-gl`), microsoft/OpenCLOn12 (MIT) and `dxil.dll` from
   DirectXShaderCompiler releases; or let the guest install the Compatibility
-  Pack from the Store itself. Likewise the Linux `libd3d12`/`libdxcore`
-  NuGet packages from `pkgs.dev.azure.com/shine-oss`
-  (`prefetch_wsl_deps.c`): prefer the host's `System32\lxss\lib`.
+  Pack from the Store itself.
 - Disclose both downloads in the privacy policy (section 5).
 
 ### 2.6 Licences (done in code, keep it that way)
-- `LICENSE` and `THIRD-PARTY-NOTICES.md` are in the CI zip (checked by the
-  `$required` list) and always in the MSIX (`make-msix.ps1` adds them).
-  **(code)** Add both to `tools/sign/make-release.ps1`'s stage and its
-  `$required` list too.
+- `LICENSE` and `THIRD-PARTY-NOTICES.md` are always in the MSIX (the app
+  project `app/AppSandbox/AppSandbox.csproj` takes them from the repository
+  root) and in the native stage of `tools/sign/make-release.ps1` (checked by
+  its `$required` list).
 - When you add a third-party file, add it to `THIRD-PARTY-NOTICES.md`.
-- **(code)** An About panel in the UI with version, a link to the notices
-  and to the privacy policy.
+- Settings → About shows the version, the license and the notices.
+  **(code)** Add a link to the privacy policy there.
 
 ### 2.7 Test pass on a clean Windows 11 x64 PC
-- Zip and MSIX: install, start (UAC), create a Windows VM with SSH and GPU
-  and an Ubuntu VM; the host log shows `OpenSSH MSI downloaded and verified`.
+- Install the MSIX, start (UAC), create a Windows VM with SSH and GPU;
+  the host log shows `OpenSSH MSI downloaded and verified`.
 - Update guest components on a VM made with the previous release.
 - Uninstall: note what stays behind (section 4.6).
 
 ---
 
-## 3. Zip release
+## 3. GitHub release (MSIX)
 
-1. Build Release x64 with `AsbSourceRepo`/`AsbSourceRef` set (2.3).
+1. Build the native solution, Release x64, with `/p:AsbSourceRepo=<owner>/<repo>`
+   (the repository Settings → About links to).
 2. Sign binaries, attest drivers, stage without `*.cer` (2.1, 2.2).
-   Until `make-release.ps1` copies them (2.6), copy `LICENSE` and
-   `THIRD-PARTY-NOTICES.md` to the root of the stage by hand.
-3. Zip; publish as a GitHub release (not pre-release) with SHA-256 of the zip
+   `make-release.ps1` writes that native stage as
+   `bin\Release\AppSandbox-<version>-win-x64.zip`; it is the input of the
+   next step, not something to publish.
+3. Unzip the stage and build the package from it, signed with your
+   certificate (its subject must be the `-Publisher` you pass):
+   ```powershell
+   .\packaging\msix\make-msix.ps1 -Stage <unzipped stage> `
+       -Version <Major.Minor.Patch.Build> -OutDir out `
+       -Name '<package name>' -Publisher '<CN=...>' `
+       -DisplayName '<name>' -PublisherDisplayName '<publisher>' `
+       -Thumbprint <certificate thumbprint> -TimestampUrl <RFC 3161 URL>
+   ```
+   (`-PfxPath` / `-PfxPassword` instead of `-Thumbprint` for a .pfx file.)
+   No `Install-AppSandbox.ps1` is written: that is only for packages signed
+   with the test certificate.
+4. Publish the `.msix` as a GitHub release (not pre-release) with its SHA-256
    in the notes.
-4. Remove the "test signing" and "SmartScreen" text from the release notes.
+5. Remove the "test signing" and "SmartScreen" text from the release notes.
 
 ---
 
@@ -185,17 +185,18 @@ items need a change in the repository.
 ### 4.3 ARM64 (owner + code)
 - The Store offers an x64-only package to Windows on ARM PCs, where it would
   build x64 guests that cannot run. Either upload an arm64 package too
-  (`make-msix.ps1 -Arch arm64` from an ARM64 stage; CI does not build one
-  yet), or **(code)** add a start-up check in `src/app_win/main.c`:
+  (not possible yet: the native projects build for ARM64, but the app
+  project and `make-msix.ps1` are x64 only), or **(code)** add a start-up
+  check in `src/app_win/host.c` (`asb_host_begin`):
   `IsWow64Process2(GetCurrentProcess(), &proc, &native)` and, when an x64
   build sees `native == IMAGE_FILE_MACHINE_ARM64`, show "This is the x64
   version. Install the ARM64 version of <name>." and exit.
 
 ### 4.4 Restricted capabilities: justification text
 > The app is a virtual machine manager for Windows 11. It is a full-trust
-> Win32 desktop application (`runFullTrust`): its UI runs in WebView2 and it
-> calls Win32 APIs that are not available to packaged apps in an app
-> container: the Host Compute Service and Host Compute Network APIs (create
+> Win32 desktop application (`runFullTrust`): its UI is WinUI 3 (Windows App
+> SDK, shipped inside the package) and it calls Win32 APIs that are not
+> available to packaged apps in an app container: the Host Compute Service and Host Compute Network APIs (create
 > and run VMs, virtual switches and NAT), the Virtual Disk API (create and
 > mount VHDX files), Hyper-V sockets to talk to its guest agents, and HTTP
 > Server API (http.sys) for its local automation API on 127.0.0.1.
@@ -216,9 +217,9 @@ items need a change in the repository.
 >   Platform". If it is off, the app offers to enable it; a restart is
 >   needed.
 > - To create a VM you need an installation ISO: a Windows 11 ISO from
->   microsoft.com/software-download/windows11 or an Ubuntu Desktop ISO from
->   ubuntu.com. Creating a VM downloads components from GitHub, Microsoft and
->   archive.ubuntu.com (see the privacy policy). A GPU is optional.
+>   microsoft.com/software-download/windows11. Creating a VM downloads
+>   components from GitHub and Microsoft (see the privacy policy). A GPU is
+>   optional.
 > - Without an ISO you can still review the main window, the Create VM
 >   dialog and Settings.
 > - The guest drivers in the package are installed only inside the virtual
@@ -247,25 +248,20 @@ The app has no telemetry and no account. It contacts these hosts:
 | `displaycatalog.mp.microsoft.com` | Starting or creating a Windows VM with GPU, if the D3D mapping layers are not cached | Product lookup for 9NQPSL29BFFF (market US, en-us) |
 | `fe3.delivery.mp.microsoft.com` | Same | Windows Update protocol requests with a fixed, generic device description (no data about the user's PC) and random message IDs; receives a download link |
 | `*.delivery.mp.microsoft.com` (Microsoft CDN, often plain HTTP) | Same | Downloads the Compatibility Pack package |
-| `codeload.github.com` | Creating an Ubuntu VM | Downloads this project's Linux guest sources |
-| `archive.ubuntu.com` (plain HTTP) | Creating an Ubuntu VM | Downloads package indexes and `.deb` packages |
-| `pkgs.dev.azure.com` | Creating an Ubuntu VM | Downloads Microsoft's Direct3D/DXCore NuGet packages |
 | `127.0.0.1` (first free port from 8787 to 8806) | While the headless service (`AppSandbox.exe --headless`) runs | Local automation API (bearer token in `host.json`); not reachable from other computers |
 
 Also state that:
-- The UI is local files shown in Microsoft Edge WebView2; WebView2 itself
-  follows Microsoft's privacy statement.
-- Network traffic of the virtual machines (Windows Update, apt, browsing in
+- The UI is a native WinUI 3 window (the Windows App SDK ships inside the
+  package). It loads nothing from the network and shows no web content.
+- Network traffic of the virtual machines (Windows Update, browsing in
   the guest) is the guest operating system's, not the app's.
 - Stored locally only: `%ProgramData%\AppSandbox\vms.cfg` (VM list and
   settings), `host.json` (local API token), `ssh\id_appsandbox` (private key
-  for SSH into guests), download caches (beside `AppSandbox.exe` for the zip,
-  in `%ProgramData%\AppSandbox` for the MSIX), and in each VM's folder its disks,
+  for SSH into guests), download caches (also in `%ProgramData%\AppSandbox`),
+  `%LOCALAPPDATA%\AppSandbox\shell.json` (how the app's window looks), and
+  in each VM's folder its disks,
   `display_settings.json` and the setup answer file, which contains the VM
   account password you entered (base64, not encrypted).
-- The macOS host (not part of this release) downloads from the upstream
-  repository (`src/backend_mac/iso_patch_mac.m`); change those URLs before
-  a Mac release.
 
 Find new endpoints before each release:
-`git grep -nE "https?://" -- src tools/iso-patch tools/agent web`.
+`git grep -nE "https?://" -- src tools/iso-patch tools/agent app`.

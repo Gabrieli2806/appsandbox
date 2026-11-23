@@ -3,15 +3,15 @@
 
 # App Sandbox
 
-App Sandbox is a virtual machine app for Windows and macOS that's focused on performance and ease of use.
+App Sandbox is a virtual machine app for Windows that's focused on performance and ease of use.
 
-Windows features:
+Features:
 - Works on Windows 11 Home or Pro, without Hyper-V
-- Windows 11 or Ubuntu 26.04 LTS VM Support
+- Windows 11 VM support
 - Zero touch install
 - Copy and Paste
 - 2 Channel Audio
-- GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12 (Windows only), OpenGL, Vulkan, CUDA, OpenCL
+- GPU Acceleration via Paravirtualization (GPU-PV) with support for DirectX 12, OpenGL, Vulkan, CUDA, OpenCL
 - GPU Hardware Video Decoder/Encoder support
 - SSH via Hyper-V socket proxy (no network required)
 - Snapshots
@@ -31,33 +31,21 @@ Windows features:
 - Supports running Claude Cowork and Docker inside the VM thanks to Nested Virtualization Support
 - Headless mode: a scriptable local HTTP/JSON API + dependency-free Python SDK (`asb.py`) for creating and driving GPU-accelerated VMs programmatically
 
-Mac features:
-- macOS or Windows 11 ARM VM support
-- Zero touch install for Windows 11 and macOS
-- Copy and Paste
-- 2 Channel Audio
-- macOS: GPU Acceleration via Paravirtualization with support for Metal, Windows: No GPU Acceleration
-- SSH via virtio-vsock (no network required)
-- Fixed 1080P60 display on Windows 11 guests, Dynamic display sizing on macOS guests
-- Provision and boot with / without internet
-- Headless mode: the same scriptable local HTTP/JSON API + Python SDK (`asb.py`) as on Windows, for driving macOS and Windows 11 VMs programmatically
-
 Requirements:
-Windows 11 with an x64 Processor or macOS 27 or newer (M Series)
+Windows 11 with an x64 Processor
 
 ## About App Sandbox
 
-App Sandbox creates and runs full desktop virtual machines — Windows 11, Ubuntu, and
-macOS. It is free and open-source (MIT), distributed as prebuilt binaries (EV-signed on
-Windows, Apple-Developer-signed on macOS) on its
+App Sandbox creates and runs full desktop Windows 11 virtual machines (and lets you
+install any other OS by hand from its ISO). It is free and open-source (MIT),
+distributed as prebuilt binaries on its
 [Releases](https://github.com/jamesstringer90/appsandbox/releases) page. It is driven two
 ways: from a graphical UI, or programmatically through the local API with a
-dependency-free Python SDK (`asb.py`). Either way you pick an OS, point it at an installer
-image, and App Sandbox provisions the disk, runs an unattended install, and boots the
-guest. You supply a Windows or Ubuntu ISO; macOS guests download their restore image
-automatically. It runs on a Windows 11 (x64) PC or an Apple Silicon Mac, including laptops.
+dependency-free Python SDK (`asb.py`). Either way you point it at a Windows installer
+ISO, and App Sandbox provisions the disk, runs an unattended install, and boots the
+guest. It runs on a Windows 11 (x64) PC, including laptops.
 
-**Runs on Windows 11 Home, without Hyper-V.** On Windows, App Sandbox does not use Hyper-V
+**Runs on Windows 11 Home, without Hyper-V.** App Sandbox does not use Hyper-V
 or Hyper-V Manager; it creates and runs VMs through the Windows Host Compute System (HCS)
 and Host Compute Network (HCN) APIs, which require only the *Virtual Machine Platform*
 feature. Hyper-V is limited to Windows 11 Pro and Enterprise, while Virtual Machine
@@ -65,8 +53,8 @@ Platform is available on Windows 11 Home, so a Windows 11 Pro license is not req
 Virtual Machine Platform is the same Windows feature WSL2 uses.
 
 **What you can use it for:**
-- A full Windows or Ubuntu **desktop** VM — a complete graphical OS with GPU acceleration
-  (OpenGL, Vulkan, CUDA) — for building and testing your own software on a clean install.
+- A full Windows **desktop** VM — a complete graphical OS with GPU acceleration
+  (DirectX, OpenGL, Vulkan, CUDA) — for building and testing your own software on a clean install.
 - Running a program in a VM, kept separate from your main OS and files.
 - Developing and testing Windows drivers: a built-in **Test Mode** enables test-signing
   inside the guest, so the host's Secure Boot and boot configuration are left unchanged.
@@ -78,43 +66,31 @@ Virtual Machine Platform is the same Windows feature WSL2 uses.
   GPU-accelerated VMs — with the Python SDK.
 
 **Headless API.** The GUI automatically exposes the local HTTP/JSON API on `127.0.0.1`.
-`appsandbox.exe --headless` (or
-`sudo /Applications/AppSandbox.app/Contents/MacOS/AppSandbox --headless` on macOS)
+`AppSandbox.exe --headless` (the installed app's execution alias, from an elevated prompt)
 runs the same core without the management UI or automatic viewers. `-headless` is
 also supported; only one core process can run at a time. The stdlib-only Python SDK
 (`asb.py`) wraps it: create GPU-accelerated VMs (GPU-PV is a `gpuMode` create option), SSH
-in over an auto-deployed key (Windows, Ubuntu, or macOS guests), snapshot and branch them,
+in over an auto-deployed key, snapshot and branch them,
 open the live display, and run several at once — how many run concurrently is bounded by host
 CPU, RAM, and GPU memory, not by a fixed limit. The daemon is single-host — it drives VMs on
 the machine it runs on and does not provision cloud VMs; for CI, run it on a self-hosted
-runner. Snapshots and branches are Windows-host-only. Templates support Windows guests
-on both hosts and macOS guests on Mac hosts, avoiding a fresh OS installation. A VM persists
+runner. Templates avoid a fresh OS installation. A VM persists
 until deleted. A snapshot is a disk-state checkpoint taken with the VM stopped, and a branch
 forks a writable disk from it to run divergent actions. The full API reference and runnable
 examples are in [`tools/headless-api/`](tools/headless-api/).
 
 **How it works:** this repo also aims to be a working example of creating full desktop VMs
-programmatically with the Windows HCS/HCN APIs and Apple's Virtualization.framework. On
-Windows, App Sandbox submits a hand-built HCS machine document to `computecore.dll` /
+programmatically with the Windows HCS/HCN APIs. App Sandbox submits a hand-built HCS machine document to `computecore.dll` /
 `computenetwork.dll` — the HCS/HCN layer that also underlies WSL2 and Windows Sandbox —
 rather than going through Hyper-V Manager. GPU acceleration uses GPU paravirtualization
 (GPU-PV) to share the host's installed GPU with the guest — the same WSL2 path, not a
 dedicated passthrough (no VFIO/IOMMU, no second GPU). Windows guests get DirectX 12, OpenGL,
-Vulkan, CUDA, and OpenCL; Ubuntu guests the same minus DirectX; macOS guests Metal. A custom
+Vulkan, CUDA, and OpenCL. A custom
 **IddCx** indirect display driver and a virtual audio device carry the screen and sound, and
 guest↔host clipboard, audio, input, and SSH run over **Hyper-V sockets**. Guest disks are
-built by an in-repo tool with support for ext4, squashfs, qcow2, and VHDX. On macOS, App
-Sandbox uses Apple's **Virtualization.framework** (`VZVirtualMachine`, `VZMacOSInstaller`)
-over **virtio-vsock**. On Windows, Linux (Ubuntu) guests reach the GPU through a custom
-DRM/KMS kernel module (`asb_drm`), Microsoft's WSL2 `dxgkrnl`, and a custom Mesa build. The
-apps are native C / Objective-C with an HTML/JS UI (WebView2 on Windows, WKWebView on macOS).
-
-Windows guests on macOS use **QEMU 11.1.3** with HVF acceleration, built from our
-public [asb-qemu fork](https://github.com/jamesstringer90/asb-qemu/tree/asb-ivshmem-11.1.3).
-It preserves our four ivshmem changes, including support on macOS and the optional
-`x-device-id` override. QEMU, its libraries, and firmware ship inside the macOS app.
-See the [QEMU build notes](vendor/qemu-ivshmem/README.md) for the pinned source and
-rebuild instructions.
+built by an in-repo tool (`iso-patch.exe`: Windows ISO → VHDX). Everything that touches VMs
+is native C (`appsandbox_host.dll`, `appsandbox_core.dll`); the UI is a WinUI 3 app
+(`AppSandbox.exe`, C#) that loads them.
 
 # Tips:
 Windows VMs: you choose the username and password when you create the VM (the username defaults to `user`; there is no default password).
@@ -123,7 +99,7 @@ Windows VMs: you choose the username and password when you create the VM (the us
 
 [Windows] Game controllers: install [ViGEmBus](https://github.com/nefarius/ViGEmBus/releases) once inside the Windows VM; controllers are sent while the VM window has focus.
 
-[Windows] Logs: the Activity panel / `%ProgramData%\AppSandbox\appsandbox.log` on the host (Settings → Folders and logs opens it); inside a Windows guest `C:\Windows\AppSandbox\agent.log` and `C:\ProgramData\AppSandboxVDD.log` (display driver, encoder).
+[Windows] Logs: the Activity page / `%ProgramData%\AppSandbox\appsandbox.log` on the host (Settings → Folders and logs opens it); inside a Windows guest `C:\Windows\AppSandbox\agent.log` and `C:\ProgramData\AppSandboxVDD.log` (display driver, encoder).
 
 [Windows] Enable hotkeys or mute the VM audio: connect to the VM and right-click the connection title bar  
 
@@ -144,19 +120,35 @@ This is a bug in Windows itself (cumulative updates from September/October 2026,
 
 ## Building from source
 
-Windows: Visual Studio 2022 with the Windows SDK and the **WDK** (driver projects). From a
-*Developer Command Prompt* (cmd, not PowerShell 7):
+Two steps: the native part, then the app around it.
 
-```
-msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
-```
+1. Native: Visual Studio 2022 with the Windows SDK and the **WDK** (driver projects). From a
+   *Developer Command Prompt* (cmd, not PowerShell 7):
 
-The app, `resources\` (guest helpers) and `drivers\` (test-signed guest drivers) land in
-`bin\Release\`. Run `AppSandbox.exe` as administrator. Version numbers come from
-`Directory.Build.props`. The GitHub workflow in `.github/workflows/windows-test-build.yml`
-builds the same way and publishes test pre-releases from `release/**` branches.
+   ```
+   msbuild AppSandbox.sln /p:Configuration=Release /p:Platform=x64
+   ```
 
-macOS: open `AppSandbox.xcodeproj` (see `tools/sign/SIGNING_MAC.md` for signing).
+   The host (`appsandbox_host.dll`, `appsandbox_core.dll`, `iso-patch.exe`), `resources\`
+   (guest helpers) and `drivers\` (test-signed guest drivers) land in `bin\Release\`.
+
+2. App: the .NET 10 SDK. Either build the WinUI project (never the solution), which takes the
+   native files from `bin\Release` and makes an unsigned MSIX under
+   `app\AppSandbox\AppPackages`:
+
+   ```
+   dotnet build app\AppSandbox\AppSandbox.csproj -c Release -p:Platform=x64
+   ```
+
+   or build, sign and get an installer in one go (see Packaging):
+
+   ```
+   powershell -ExecutionPolicy Bypass -File packaging\msix\make-msix.ps1 -Stage bin\Release -Version 0.2.0.1 -OutDir out
+   ```
+
+Version numbers come from `Directory.Build.props`. The GitHub workflow in
+`.github/workflows/windows-test-build.yml` builds the same way and publishes test
+pre-releases from `release/**` branches.
 
 Changes to guest-side code (helpers in `tools/agent`, the display driver in `tools/vdd`)
 reach existing Windows VMs through **Update guest components** (VM stopped) or the automatic
@@ -171,10 +163,26 @@ before changing code, whether you are a person or an AI agent.
 
 ## Packaging
 
-The release is a zip with `AppSandbox.exe`, `appsandbox_core.dll`, `web\`, `resources\` and
-`drivers\`. An MSIX package is possible for the app itself, but App Sandbox needs
-administrator rights (HCS, http.sys) and installs guest drivers inside VMs, so an MSIX build
-must run as a full-trust desktop app that elevates; see `AGENTS.md`.
+App Sandbox ships, installs and updates only as an MSIX package: `AppSandbox.exe` (the WinUI
+app, with the .NET runtime and the Windows App SDK inside the package), `appsandbox_host.dll`,
+`appsandbox_core.dll`, `iso-patch.exe`, `resources\` and `drivers\`. There is no zip to unpack
+and run.
+
+To install a test build (from CI, or the `-OutDir` of `packaging\msix\make-msix.ps1`): unzip
+it into an empty folder, exit App Sandbox if it is running (notification-area icon → Quit;
+exiting turns its VMs off, so shut them down first), and in an elevated PowerShell run
+
+```
+powershell -ExecutionPolicy Bypass -File .\Install-AppSandbox.ps1
+```
+
+It trusts the test certificate next to it and installs or updates the package for the user
+who runs it. VMs and settings in `%ProgramData%\AppSandbox` are kept.
+
+App Sandbox needs administrator rights (HCS, http.sys) and installs guest drivers inside VMs
+(never on the host), so the package is a full-trust desktop app that elevates: every start
+shows a UAC prompt. The guest drivers in a test build are test-signed, and App Sandbox enables
+test signing inside the VM when it installs them. See `AGENTS.md`.
 
 ## Sharing fixes and features
 
@@ -188,11 +196,9 @@ See the [contribution guidelines](CONTRIBUTING.md) for details.
 AppSandbox is licensed under the [MIT License](LICENSE) — Copyright (c) 2026 James Stringer.
 
 It bundles third-party components that are **not** covered by the MIT license and
-retain their own terms — most notably the Microsoft WSL2 `dxgkrnl` GPU driver
-(GPL-2.0) and the embedded XZ decoder (0BSD). See
-[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for the full list. AppSandbox's
-own Linux DRM kernel module (`tools/linux/asb_drm/`) is dual-licensed MIT OR
-GPL-2.0 so it can resolve the kernel's GPL-only symbols.
+retain their own terms, among them the .NET runtime and the Windows App SDK (WinUI) that
+ship inside the package. See [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md) for
+the full list.
 
 ## Acknowledgements
 

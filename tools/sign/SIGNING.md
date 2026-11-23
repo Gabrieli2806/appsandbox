@@ -1,8 +1,10 @@
 # AppSandbox — Code Signing & Release Packaging
 
-How to produce a fully-signed AppSandbox release: every binary we build is
+How to produce a fully-signed AppSandbox release: every native binary we build is
 **EV Authenticode-signed**, the two drivers are **Microsoft attestation-signed**,
-and the result is zipped for distribution.
+and the result is zipped as the **native stage** that `packaging\msix\make-msix.ps1`
+turns into the MSIX (§4). The MSIX is the only thing that is distributed; the zip is
+not a runnable release.
 
 This is written so anyone with **(a)** an EV code-signing certificate on a hardware
 token and **(b)** a Microsoft Partner Center *Hardware* account can reproduce it.
@@ -17,9 +19,10 @@ token and **(b)** a Microsoft Partner Center *Hardware* account can reproduce it
 
 | Artifact | Signing | Tool |
 | --- | --- | --- |
-| `AppSandbox.exe`, `appsandbox_core.dll`, `iso-patch.exe`, the 6 `appsandbox-*.exe` (host + the guest copies under `resources\`) | **EV Authenticode** (your cert) | `signtool` |
+| `appsandbox_host.dll`, `appsandbox_core.dll`, `iso-patch.exe`, the 6 `appsandbox-*.exe` (the guest helpers under `resources\`) | **EV Authenticode** (your cert) | `signtool` |
 | `AppSandboxVDD.{dll,inf,cat}`, `AppSandboxVAD.{sys,inf,cat}` | **EV-signed** (binary + catalog) **then Microsoft attestation** — you EV-sign the `.sys`/`.dll`, regenerate + EV-sign the `.cat`, EV-sign the CAB; Microsoft returns the package with the **catalog MS-signed** (the binary keeps your EV signature) | `signtool` + `inf2cat` + `makecab` + Hardware API |
-| `WebView2Loader.dll` | already Microsoft-signed — **not** re-signed | — |
+| `devcon.exe` (`drivers\`) | already Microsoft-signed — **not** re-signed | — |
+| The MSIX (`AppSandbox.exe`, the WinUI app, with the .NET runtime, the Windows App SDK and the signed stage inside) | **package signature** — your cert (`-Thumbprint` / `-PfxPath`), a test certificate, or left unsigned for the Store (`-Store`) | `make-msix.ps1` (`signtool`) |
 | Mesa GL trio — `opengl32.dll`, `gallium_wgl.dll`, `z-1.dll` (both arches, vendored in `tools/win-mesa-gl/prebuilt`) | **EV Authenticode**, **pre-signed once** via `tools/win-mesa-gl/build/sign-mesa.ps1` (they are prebuilt, not built at release time; `make-release.ps1` skips files already signed by our cert, so it does not re-sign them) | `signtool` |
 
 Two different signatures because kernel-mode / UMDF drivers will not load on retail
@@ -83,7 +86,7 @@ tools\sign\test-hardware-api.ps1
 | `submission-config.json` | yes | Product names, OS signature targets, driver→cab mapping, timestamp URL, optional `evCertThumbprint` (x64 values; `sign-drivers.ps1 -Platform ARM64` derives the ARM64 equivalents at sign time) |
 | `test-hardware-api.ps1` | yes | Validate creds + Hardware roles |
 | `sign-drivers.ps1` | yes | EV-sign drivers (binary + catalog + cab) → attestation submit (both in parallel) → download MS-signed |
-| `make-release.ps1` | yes | Build → (if YubiKey) sign all binaries + driver-attest + ZIP; else skip |
+| `make-release.ps1` | yes | Build → (if YubiKey) sign all native binaries + driver-attest + ZIP (the native stage); else skip |
 | `AppSandboxPackage.vcxproj` | yes | Utility project; runs `make-release.ps1 -NoBuild -Platform $(Platform)` after a successful `Release|x64` **or** `Release|ARM64` VS build |
 | `SIGNING.md` | yes | This document |
 
@@ -120,10 +123,46 @@ tools\sign\make-release.ps1 -Platform ARM64  # Windows on ARM
   waits, and downloads the MS-signed drivers; then writes `bin\Release\AppSandbox-<ver>-win-x64.zip`
   (no `.pdb`/intermediates, MS-signed drivers swapped in, test `.cer` dropped). **Three PINs
   total.** (If `bin\Release\drivers-signed\` already exists it's reused — no resubmit.)
+  The zip is the native stage: `appsandbox_host.dll`, `appsandbox_core.dll`, `iso-patch.exe`,
+  `resources\`, `drivers\`, `headless-api\`, `LICENSE` and `THIRD-PARTY-NOTICES.md`. It has
+  no `AppSandbox.exe` and cannot be run as it is.
 - **If the YubiKey is out:** stops after the build — no signing, no ZIP.
 
 Switches: `-NoBuild`, `-SkipDrivers`, `-ForceDriverSign`, `-Version <v>`. The version comes
 from `Directory.Build.props` unless `-Version` overrides it.
+
+### From the signed stage to the MSIX
+Unzip the stage and give it to `packaging\msix\make-msix.ps1` (needs the .NET 10 SDK). It
+builds the WinUI app (`app\AppSandbox`) around those files, which makes the package, and
+signs the package:
+```powershell
+# release: signed with a certificate already in Cert:\CurrentUser\My (e.g. the EV token)
+packaging\msix\make-msix.ps1 -Stage <unzipped stage> -Version <Major.Minor.Patch.Build> -OutDir out `
+    -Name '<package name>' -Publisher '<CN=...>' -DisplayName '<name>' -PublisherDisplayName '<publisher>' `
+    -Thumbprint <thumbprint> -TimestampUrl <RFC 3161 URL>
+
+# Microsoft Store
+packaging\msix\make-msix.ps1 -Store -Stage <unzipped stage> -Version <Major.Minor.Patch.Build> -OutDir out `
+    -Name '<Identity Name>' -Publisher '<CN=...>' -DisplayName '<reserved name>' -PublisherDisplayName '<publisher display name>'
+```
+- `-Version` always has four parts and the package gets exactly that; with `-Store` it
+  becomes `Major.Minor.Build.0` (the Store reserves the fourth part) and `Major` must be at
+  least 1.
+- Signing: `-Thumbprint` (a code-signing certificate already in `Cert:\CurrentUser\My`, for
+  example on a hardware token), or `-PfxPath` with `-PfxPassword` (imported for the signing
+  and removed afterwards). With neither, a self-signed **test** certificate is made (subject =
+  `-Publisher`) and its `.cer` and `Install-AppSandbox.ps1` are written next to the package —
+  that is what CI test builds are. `-TimestampUrl` adds an RFC 3161 timestamp.
+- `-Store` leaves the package unsigned (Partner Center signs it) unless `-Thumbprint` or
+  `-PfxPath` is given, and refuses the test identity defaults (`-Name`, `-Publisher`), a
+  missing `-DisplayName` / `-PublisherDisplayName`, and a stage with test-signed drivers
+  (`drivers\*.cer`).
+- **x64 only** for now: the app project is x64 (`-Arch` accepts only `x64`), although the
+  native projects, and `make-release.ps1 -Platform ARM64`, also build ARM64.
+- The files the app build adds (`AppSandbox.exe`, `AppSandbox.dll`, the .NET runtime, the
+  Windows App SDK) are not EV-signed one by one; the package signature covers them.
+
+See `docs\RELEASE_CHECKLIST.md` (§3, §4.2) for the release and Store steps around it.
 
 ### Driver attestation only (when a driver changes)
 ```powershell
@@ -159,7 +198,7 @@ signtool verify /pa /v <file>
 is EV-signed, the catalog is regenerated with `inf2cat` (so it hashes the EV-signed binary)
 and then EV-signed, and the CAB itself is EV-signed (that signature authenticates the
 submission). Microsoft returns the same shape with the **catalog re-signed by Microsoft**; the
-binary keeps our EV embedded signature. `make-release.ps1` swaps that package into the zip.
+binary keeps our EV embedded signature. `make-release.ps1` swaps that package into the stage zip.
 
 CAB rules (`sign-drivers.ps1` handles these): each driver in its **own subfolder**, no files
 at the cab root, include the **`.pdb`** (Microsoft's crash analysis wants it).
@@ -237,10 +276,12 @@ and `generate_vhdx_manifest` — best gated on a "test-signed vs MS-signed" buil
 - **Drivers** stamp `DriverVer` from `$(AsbVersion)` via the `<TimeStamp>` metadata on the
   `<Inf>` item in each driver `.vcxproj` (WDK StampInf). They opt out of the binary VERSIONINFO
   via `<AsbEmbedVersion>false</AsbEmbedVersion>`.
-- **Zip name** (`make-release.ps1`) and **Partner Center product/submission names**
+- **Stage zip name** (`make-release.ps1`) and **Partner Center product/submission names**
   (`sign-drivers.ps1`) read `Directory.Build.props` too.
+- **The MSIX and the app** (`AppSandbox.exe`) get the version passed to
+  `make-msix.ps1 -Version` (CI passes the same four parts).
 
-Current value: **`0.1.0.0`**. The drivers are **Windows 11+ only** (the VDD references the
+Current value: **`0.2.0.0`**. The drivers are **Windows 11+ only** (the VDD references the
 inbox `WudfRd.inf`, which is Win11+).
 
 `Directory.Build.props` also sets `SkipPackageVerification=true` for **non-VS** builds (see §6).
