@@ -2,11 +2,9 @@
 
 Custom Mesa build that gives AppSandbox **Windows** GPU-PV guests hardware
 OpenGL by shipping Mesa's own `opengl32.dll` (gallium **d3d12** driver + WGL
-frontend) system-wide in the guest's System32. Windows/D3D12 counterpart of
-`tools/linux/wsl-mesa/`.
+frontend) system-wide in the guest's System32.
 
-Built from the **same upstream Mesa** as `wsl-mesa` — only the build target and
-options differ (Windows WGL drop-in vs Linux `.so` + dzn ICD). Mesa is MIT, so
+Built from unmodified upstream Mesa. Mesa is MIT, so
 only the binaries + license notice are vendored here; the source is **not**
 copied into this repo. See `THIRD-PARTY-NOTICES.md`.
 
@@ -20,7 +18,7 @@ Meson configuration (see `build/build-mesa.cmd`):
 -Dvulkan-drivers=                # none (Vulkan stays on the dzn registry ICD)
 -Dgallium-wgl-dll-name=gallium_wgl   # else the drop-in imports itself
 -Dllvm=disabled
--Dvideo-codecs=all               # video/d3d12-encoder kept ON (matches MS + wsl-mesa)
+-Dvideo-codecs=all               # video/d3d12-encoder kept ON (matches MS)
 -Dcpp_args=/wd4189 -Dc_args=/wd4189  # dodge the MSVC warning-as-error from the video encoder
 -Db_vscrt=mt                     # static CRT -> no VCRUNTIME/MSVCP to ship
 -Dopengl=true -Dshared-glapi=enabled
@@ -69,7 +67,7 @@ Microsoft's `opengl32`.
 
 ## Versioning
 
-Built from a **stable Mesa release branch** (the `wsl-mesa` pattern), with the
+Built from a **stable Mesa release branch**, with the
 resulting version recorded in each `BUILDINFO`. Current branch: **`26.1`** — the
 latest upstream stable and the closest to the `26.2.0-devel` Mesa that
 Microsoft's `OpenGLOn12` ships. Bump `MESA_BRANCH` in `build-mesa.cmd`

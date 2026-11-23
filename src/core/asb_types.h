@@ -1,8 +1,6 @@
 /*
- * asb_types.h -- Platform-neutral VM descriptor types and error codes.
- *
- * Shared by both platform orchestrators (asb_core on Windows,
- * asb_core_mac on macOS) and their UI layers.
+ * asb_types.h -- VM event types shared by the orchestrator (asb_core) and
+ * the UI layers.
  */
 
 #ifndef ASB_TYPES_H
@@ -15,57 +13,7 @@
 extern "C" {
 #endif
 
-/* Return codes shared by both platform orchestrators. */
-#define BACKEND_OK                   0
-#define BACKEND_ERR_INVALID_ARG     -1
-#define BACKEND_ERR_NOT_FOUND       -2
-#define BACKEND_ERR_FAILED          -3
-#define BACKEND_ERR_NOT_IMPLEMENTED -4
-#define BACKEND_ERR_ALREADY_RUNNING -5
-#define BACKEND_ERR_NOT_RUNNING     -6
-#define BACKEND_ERR_NO_DISPLAY      -7   /* no console GUI session to show a window in */
-#define BACKEND_ERR_NOT_READY       -8   /* VM running but the guest agent isn't online yet */
-
 #define CORE_VM_NAME_MAX       128
-#define CORE_VM_OS_TYPE_MAX     32
-#define CORE_VM_STATUS_MAX     128
-
-/* ---- VM configuration (inputs to create_vm) ---- */
-
-typedef struct CoreVmConfig {
-    const char *name;
-    const char *os_type;        /* "macOS", "Windows", "Linux" */
-    const char *image_path;     /* installer .ipsw/.iso, or NULL */
-    const char *template_name;  /* template to clone, or NULL */
-    int         ram_mb;
-    int         hdd_gb;
-    int         cpu_cores;
-    int         gpu_mode;
-    int         network_mode;   /* 0=none, 1=NAT, 2=bridged, 3=internal */
-    const char *net_adapter;    /* for bridged, or NULL */
-    const char *username;
-    const char *password;
-    int         is_template;
-} CoreVmConfig;
-
-/* ---- VM snapshot state (outputs from list_vms) ---- */
-
-typedef struct CoreVmInfo {
-    uint64_t    vm_id;
-    char        name[CORE_VM_NAME_MAX];
-    char        os_type[CORE_VM_OS_TYPE_MAX];
-    int         running;
-    int         shutting_down;
-    int         ram_mb;
-    int         hdd_gb;
-    int         cpu_cores;
-    int         gpu_mode;
-    char        gpu_name[64];
-    int         network_mode;
-    int         install_complete;
-    int         install_progress;                  /* 0-100, or -1 if not installing */
-    char        install_status[CORE_VM_STATUS_MAX];
-} CoreVmInfo;
 
 /* ---- Asynchronous events from the backend ---- */
 

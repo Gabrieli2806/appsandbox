@@ -1,4 +1,0 @@
-# Build outputs land here on the Linux dev box.  Not committed —
-# release/resources/linux/ (Windows side) is the canonical staging
-# location.  See README.md.
-dist/

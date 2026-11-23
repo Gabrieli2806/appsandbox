@@ -9,8 +9,7 @@
  * Pulled in via asb_transport.h, so EVERY transport-linking Windows binary (agent, the channel EXEs,
  * p9copy, the VDD) is covered from one place — including each binary's OWN Interlocked* uses, because
  * #pragma intrinsic is in effect for the whole translation unit once this header is included near the
- * top. No-op off MSVC, so the Mac host (clang: asb_ivshmem_transport.m / idd_display.m, which use
- * __sync_* directly) compiles this header harmlessly.
+ * top. No-op off MSVC.
  */
 #ifndef ASB_ATOMICS_H
 #define ASB_ATOMICS_H

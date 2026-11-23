@@ -209,37 +209,17 @@ static BOOL get_current_user_sid_string(wchar_t *out, size_t out_chars)
 
 void hcs_service_guid(const wchar_t *os_type, unsigned port, GUID *out)
 {
-    /* Default to Windows-style GUIDs whenever os_type isn't explicitly
-       set to a non-Windows value. Protects existing Windows VMs from any
-       regression if their os_type field happens to be missing/empty —
-       e.g. a vms.cfg entry from an older build that pre-dates the field.
-       Only the explicit string "Linux" (or any other non-Windows guest
-       string in the future) flips to the vsock-template GUIDs. */
-    BOOL is_windows = !os_type
-                   || os_type[0] == L'\0'
-                   || _wcsicmp(os_type, L"Windows") == 0;
-    if (is_windows) {
-        /* a5b0cafe-<port>-4000-8000-000000000001 — the original AppSandbox
-           service GUIDs, reached via AF_HYPERV from a Windows guest. */
-        out->Data1    = 0xa5b0cafeu;
-        out->Data2    = (unsigned short)port;
-        out->Data3    = 0x4000;
-        out->Data4[0] = 0x80; out->Data4[1] = 0x00;
-        out->Data4[2] = 0x00; out->Data4[3] = 0x00;
-        out->Data4[4] = 0x00; out->Data4[5] = 0x00;
-        out->Data4[6] = 0x00; out->Data4[7] = 0x01;
-    } else {
-        /* <port>-FACB-11E6-BD58-64006A7986D3 — the Linux vsock template.
-           A Linux guest calling bind/connect on AF_VSOCK port N is mapped
-           by hv_sock onto exactly this GUID on the Hyper-V side. */
-        out->Data1    = port;
-        out->Data2    = 0xFACB;
-        out->Data3    = 0x11E6;
-        out->Data4[0] = 0xBD; out->Data4[1] = 0x58;
-        out->Data4[2] = 0x64; out->Data4[3] = 0x00;
-        out->Data4[4] = 0x6A; out->Data4[5] = 0x79;
-        out->Data4[6] = 0x86; out->Data4[7] = 0xD3;
-    }
+    /* a5b0cafe-<port>-4000-8000-000000000001, reached via AF_HYPERV from
+       the guest. The same for every guest; a manual-install VM ("Other")
+       has nothing listening on them. */
+    (void)os_type;
+    out->Data1    = 0xa5b0cafeu;
+    out->Data2    = (unsigned short)port;
+    out->Data3    = 0x4000;
+    out->Data4[0] = 0x80; out->Data4[1] = 0x00;
+    out->Data4[2] = 0x00; out->Data4[3] = 0x00;
+    out->Data4[4] = 0x00; out->Data4[5] = 0x00;
+    out->Data4[6] = 0x00; out->Data4[7] = 0x01;
 }
 
 void hcs_service_guid_str(const wchar_t *os_type, unsigned port,
@@ -1150,9 +1130,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     /* Secure Boot — uses ApplySecureBootTemplate + SecureBootTemplateId
        inside the Uefi section. No BootThis — UEFI auto-discovers boot devices.
        Skip when test_mode is enabled (required for test-signed drivers like VDD).
-       Linux: never applies a template — the direct-ISO->VHDX build produces an
-       unsigned GRUB/kernel chain, so Secure Boot would block boot. Only the
-       Windows, non-test-mode path applies the MS UEFI CA template below. */
+       Manual-install VMs ("Other") never apply a template: most non-Windows
+       installers are not signed for it. Only the Windows, non-test-mode path
+       applies the MS UEFI CA template below. */
     secureboot_section[0] = L'\0';
     if (config->test_mode) {
         /* No Secure Boot — allows test-signed drivers to load */
@@ -1212,11 +1192,9 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
     }
 
     /* ComPorts — virtual COM1 wired to a named pipe (\\.\pipe\<vm>.com1)
-       for Linux VMs. systemd's StandardOutput=journal+console writes
-       firstboot script output to /dev/console (= /dev/ttyS0 = com1),
-       which is the only practical way to debug agent / DKMS build
-       failures from the host without an SSH session into the guest.
-       Windows VMs omit it. */
+       for manual-install VMs ("Other"), so a guest that writes its console
+       to the first serial port can be read from the host. Windows VMs
+       omit it. */
     comports_section[0] = L'\0';
     if (!is_windows) {
         wchar_t name_esc[MAX_PATH * 2];
@@ -1288,12 +1266,10 @@ BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
         }
     }
 
-    /* ServiceTable: the AppSandbox service GUIDs of this VM. Windows guests
-       get the a5b0cafe-XXXX-... form (reached via AF_HYPERV from the in-VM
-       agent and helpers). Linux guests get the vsock-template form so a
-       guest doing bind(AF_VSOCK, port=N) ends up registered as the
-       corresponding <N>-FACB-... GUID on the host side. Ports 1–6 cover
-       agent + frame + input + audio + the two clipboard channels.
+    /* ServiceTable: the AppSandbox service GUIDs of this VM, the
+       a5b0cafe-XXXX-... form (reached via AF_HYPERV from the in-VM agent
+       and helpers). Ports 1–6 cover agent + frame + input + audio + the
+       two clipboard channels.
 
        The two descriptors say which HOST processes may bind (listen) and
        connect to these services. Every channel is guest-listens /

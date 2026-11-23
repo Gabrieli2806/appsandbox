@@ -10,7 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "p9copy.h"
-#include "../transport/asb_transport.h"   /* AF_HYPERV on a Windows host, ivshmem on a macOS host */
+#include "../transport/asb_transport.h"   /* asb_transport_init (WSAStartup) */
 
 /* ---- Hyper-V socket definitions ---- */
 
@@ -88,9 +88,7 @@ static GUID make_vsock_guid(UINT32 port)
 typedef struct {
     BYTE     sendbuf[P9_MSIZE];
     BYTE     recvbuf[P9_MSIZE];
-    SOCKET   sock;             /* PC (AF_HYPERV) */
-    AsbConn *conn;             /* ivshmem (macOS host) */
-    int      is_ivshmem;
+    SOCKET   sock;             /* AF_HYPERV */
     UINT16   tag;
     UINT32   next_fid;
     UINT32   msize;
@@ -159,8 +157,6 @@ static void unpack_str(BYTE **p, char *out, int max)
 
 static BOOL sock_send(P9Session *s, BYTE *data, int size)
 {
-    if (s->is_ivshmem)
-        return asb_send(s->conn, data, size) == size;
     int sent = 0;
     while (sent < size) {
         int n = send(s->sock, (char *)(data + sent), size - sent, 0);
@@ -180,8 +176,7 @@ static BOOL sock_recv_msg(P9Session *s)
 
     /* Read 4-byte size header */
     while (recvd < 4) {
-        int n = s->is_ivshmem ? asb_recv(s->conn, (char *)(s->recvbuf + recvd), 4 - recvd)
-                              : recv(s->sock, (char *)(s->recvbuf + recvd), 4 - recvd, 0);
+        int n = recv(s->sock, (char *)(s->recvbuf + recvd), 4 - recvd, 0);
         if (n <= 0) {
             P9LOG("9P recv failed.");
             return FALSE;
@@ -196,8 +191,7 @@ static BOOL sock_recv_msg(P9Session *s)
 
     /* Read rest of message */
     while (recvd < (int)size) {
-        int n = s->is_ivshmem ? asb_recv(s->conn, (char *)(s->recvbuf + recvd), (int)size - recvd)
-                              : recv(s->sock, (char *)(s->recvbuf + recvd), (int)size - recvd, 0);
+        int n = recv(s->sock, (char *)(s->recvbuf + recvd), (int)size - recvd, 0);
         if (n <= 0) {
             P9LOG("9P recv failed.");
             return FALSE;
@@ -1132,19 +1126,10 @@ int p9_copy_share_ex(UINT32 port, const char *share_name,
     P9LOG("9P connecting to share '%s' on port %u...", share_name, port);
 
     asb_transport_init();
-    if (asb_transport_is_ivshmem()) {
-        s.is_ivshmem = 1;
-        s.conn = asb_connect((int)port);   /* ivshmem ch<port> connect-out (host serves 9P) */
-        if (!s.conn) {
-            result = P9_ERR_CONN;
-            goto done;
-        }
-    } else {
-        s.sock = connect_hvsocket(port);
-        if (s.sock == INVALID_SOCKET) {
-            result = P9_ERR_CONN;
-            goto done;
-        }
+    s.sock = connect_hvsocket(port);
+    if (s.sock == INVALID_SOCKET) {
+        result = P9_ERR_CONN;
+        goto done;
     }
 
     P9LOG("9P connected. Negotiating protocol...");
@@ -1178,11 +1163,8 @@ int p9_copy_share_ex(UINT32 port, const char *share_name,
               share_name, s.files_copied, s.files_pending);
 
 done:
-    if (s.is_ivshmem) {
-        if (s.conn) asb_close(s.conn);
-    } else if (s.sock != INVALID_SOCKET) {
+    if (s.sock != INVALID_SOCKET)
         closesocket(s.sock);
-    }
     if (files_copied)
         *files_copied = s.files_copied;
     if (s.options.files_pending)

@@ -30,7 +30,7 @@
 #include <wtsapi32.h>
 #include <stdio.h>
 #include <stdarg.h>
-#include "../transport/asb_transport.h"   /* AF_HYPERV on PC, ivshmem on Mac */
+#include "../transport/asb_transport.h"   /* AF_HYPERV */
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "ole32.lib")
@@ -298,13 +298,6 @@ static BOOL stream_loop(AsbConn *s,
 
         Sleep(AUDIO_POLL_MS);
 
-        /* ivshmem only: detect a host disconnect while idle. During silence there is no PCM to send,
-           so the send_all calls below never fire; asb_poll reports when the host has dropped the slot
-           so we fall back to the accept loop. On a Windows (AF_HYPERV) host a disconnect is reported
-           by send_all failing, so this idle poll is only needed on the ivshmem backend. */
-        if (asb_transport_is_ivshmem() && asb_poll(s, 0) < 0)
-            return FALSE;
-
         /* Drain everything that's queued right now. */
         for (;;) {
             BYTE *pData = NULL;
@@ -433,8 +426,7 @@ int main(void)
         CoUninitialize();
         return 1;
     }
-    audio_log("Listening on audio channel (transport=%s).",
-              asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+    audio_log("Listening on audio channel (transport=hyperv).");
 
     for (;;) {
         AsbConn *c = asb_accept(l, -1);

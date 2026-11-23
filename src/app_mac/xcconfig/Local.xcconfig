@@ -1,8 +1,0 @@
-// App version is stamped into the built Info.plist at build time by the
-// "Stamp version" build phase (tools/sign/stamp-version.sh), sourced from
-// Directory.Build.props — the single source of truth. Nothing to set here.
-
-// Optional per-developer signing overrides. Create LocalUser.xcconfig
-// next to this file with settings like DEVELOPMENT_TEAM = ABCDEFG123 to
-// override; that file is gitignored.
-#include? "LocalUser.xcconfig"

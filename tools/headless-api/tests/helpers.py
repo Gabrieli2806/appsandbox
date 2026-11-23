@@ -1,13 +1,11 @@
 """
-Shared helpers for the headless-api test suite (Windows + macOS). Every test
+Shared helpers for the headless-api test suite. Every test
 prepares the throwaway VM(s) it needs and removes them afterward -- no test
 assumes any pre-existing VM or configuration. Throwaways are named
 ``brk-<tag>``; ``destroy_vm`` removes both the VM and its on-disk folder.
 
-Install images default per platform: drop ISOs next to the tests or override
-with env vars ``ASB_ISO_LINUX`` / ``ASB_ISO_WINDOWS``; macOS guests install
-from an IPSW (``ASB_IPSW_MACOS``, or empty to use the daemon's cached /
-auto-fetched restore image).
+Install image: drop the Windows ISO next to the tests or override it with the
+env var ``ASB_ISO_WINDOWS``.
 """
 import os, sys, time, shutil, subprocess, tempfile
 
@@ -15,15 +13,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__)))) 
 import asb
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-IS_MAC = sys.platform == "darwin"
 ASB_DIR = asb._support_dir()
-# Per-VM folders live directly under the support dir on Windows, and under a
-# VMs/ subdir on macOS. The disk artifact name differs too (vhdx vs raw img).
-VMS_DIR = os.path.join(ASB_DIR, "VMs") if IS_MAC else ASB_DIR
-DISK_NAME = "disk.img" if IS_MAC else "disk.vhdx"
-ISO_LIN = os.environ.get("ASB_ISO_LINUX",   os.path.join(_HERE, "ubuntu-desktop-amd64.iso"))
+# Per-VM folders live directly under the support dir.
+VMS_DIR = ASB_DIR
+DISK_NAME = "disk.vhdx"
 ISO_WIN = os.environ.get("ASB_ISO_WINDOWS", os.path.join(_HERE, "Win11_x64.iso"))
-IPSW_MAC = os.environ.get("ASB_IPSW_MACOS", "")
 
 
 def vm_dir(name):
@@ -103,19 +97,16 @@ def ssh_key_login(port, user, command="whoami", timeout=90):
     """Run ``command`` in the guest over SSH using the deployed AppSandbox key,
     with BatchMode (key auth only -- no password fallback, so success proves the
     key works). ssh refuses broad-permission keys, so the key is copied to a
-    private temp file first (the Windows source is admin-owned in %ProgramData%;
-    icacls there, chmod 600 on macOS). Returns ``(returncode, stdout, stderr)``."""
+    private temp file first (the source is admin-owned in %ProgramData%; icacls
+    restricts the copy). Returns ``(returncode, stdout, stderr)``."""
     keysrc = asb.key_path()
     if not os.path.isfile(keysrc):
         return (1, "", "AppSandbox private key not found: %s" % keysrc)
     tmpkey = os.path.join(tempfile.gettempdir(), "asb_test_id")
     known = os.path.join(tempfile.gettempdir(), "asb_known_hosts")
     shutil.copyfile(keysrc, tmpkey)
-    if IS_MAC:
-        os.chmod(tmpkey, 0o600)
-    else:
-        subprocess.run(["icacls", tmpkey, "/inheritance:r", "/grant:r",
-                        "%s:F" % os.environ.get("USERNAME", "")], capture_output=True)
+    subprocess.run(["icacls", tmpkey, "/inheritance:r", "/grant:r",
+                    "%s:F" % os.environ.get("USERNAME", "")], capture_output=True)
     try:
         r = subprocess.run(
             ["ssh", "-i", tmpkey, "-p", str(port),

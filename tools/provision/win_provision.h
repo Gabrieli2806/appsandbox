@@ -33,8 +33,8 @@ int asb_provision_login_setup(FILE *f);
 
 int asb_provision_nat_setup(FILE *f);
 
-/* SetupComplete.cmd -- runs as SYSTEM before first logon: trust the test cert, install AppSandboxSHM
- * (pnputil; no-op on Win-to-Win), install the VDD + VAD root devices (devcon), disable display sleep,
+/* SetupComplete.cmd -- runs as SYSTEM before first logon: trust the test cert, install the
+ * VDD + VAD root devices (devcon), disable display sleep,
  * and -- if ssh_msi_name is non-NULL -- install OpenSSH Server (msiexec + sc + net start).
  * ssh_msi_name is the basename of the MSI staged into \Windows\AppSandbox\. */
 int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_media);

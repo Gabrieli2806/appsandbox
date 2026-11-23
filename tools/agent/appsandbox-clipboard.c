@@ -23,7 +23,7 @@
 #include <stdarg.h>
 #include <shellapi.h>
 #include <shlobj.h>
-#include "../transport/asb_transport.h"   /* AF_HYPERV on PC, ivshmem on Mac */
+#include "../transport/asb_transport.h"   /* AF_HYPERV */
 
 #pragma comment(lib, "ws2_32.lib")
 #pragma comment(lib, "user32.lib")
@@ -736,8 +736,7 @@ int main(void)
         DeleteCriticalSection(&g_send_cs);
         return 1;
     }
-    clip_log("Listening on clipboard channel (transport=%s).",
-             asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+    clip_log("Listening on clipboard channel (transport=hyperv).");
 
     /* Accept loop — one client at a time */
     for (;;) {

@@ -5,13 +5,9 @@
 #include <stddef.h>
 #include <string.h>
 #include <wchar.h>
-#ifdef _WIN32
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
-#else
-#include <stdlib.h>
-#endif
 
 typedef uint64_t AsbVmId;
 #define ASB_VM_ID_TEXT_SIZE 20
@@ -55,12 +51,8 @@ static inline AsbVmId asb_vm_id_parse_w(const wchar_t *text) {
 static inline AsbVmId asb_vm_id_new(void) {
     AsbVmId id = 0;
     do {
-#ifdef _WIN32
         if (BCryptGenRandom(NULL, (PUCHAR)&id, sizeof(id), BCRYPT_USE_SYSTEM_PREFERRED_RNG) != 0)
             return 0;
-#else
-        arc4random_buf(&id, sizeof(id));
-#endif
     } while (!id);
     return id;
 }

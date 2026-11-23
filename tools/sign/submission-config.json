@@ -40,14 +40,6 @@
       "sourceDir": "..\\..\\bin\\Release\\drivers",
       "required": [ "AppSandboxVAD.sys", "AppSandboxVAD.inf", "AppSandboxVAD.cat" ],
       "optional": [ "AppSandboxVAD.pdb" ]
-    },
-    {
-      "productName": "App Sandbox Shared Memory Driver",
-      "cabFolder": "AppSandboxSHM",
-      "cabName": "AppSandboxSHM.cab",
-      "sourceDir": "..\\..\\bin\\Release\\drivers",
-      "required": [ "AppSandboxSHM.sys", "AppSandboxSHM.inf", "AppSandboxSHM.cat" ],
-      "optional": [ "AppSandboxSHM.pdb" ]
     }
   ]
 }

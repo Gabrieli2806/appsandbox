@@ -48,7 +48,7 @@ typedef struct AsbDisplay AsbDisplay;
 
 typedef struct {
     const wchar_t *name;
-    const wchar_t *os_type;        /* L"Windows" or L"Linux" */
+    const wchar_t *os_type;        /* L"Windows", or L"Other" for a manual install */
     const wchar_t *image_path;     /* ISO path, or NULL for template */
     const wchar_t *template_name;  /* template name, or NULL for image */
     DWORD  ram_mb;

@@ -25,7 +25,7 @@
       <WppEnabled>false</WppEnabled>
       <EnablePREfast>false</EnablePREfast>
     </ClCompile>
-    <!-- ivshmem transport (Windows-VMs-on-Mac frame path). Plain C; no WPP/PREfast. -->
+    <!-- Host transport (Hyper-V sockets). Plain C; no WPP/PREfast. -->
     <ClCompile Include="..\transport\asb_transport.c">
       <CompileAs>CompileAsC</CompileAs>
       <WppEnabled>false</WppEnabled>

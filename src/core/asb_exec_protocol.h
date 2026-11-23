@@ -3,9 +3,8 @@
  * in the guest, write a file into it, read a file out of it. Used by the
  * host's MCP tools (run_command, copy_to_guest, copy_from_guest).
  *
- * Transport: Hyper-V socket service a5b0cafe-0008-4000-8000-000000000001 on
- * Windows guests, AF_VSOCK port 8 on Linux guests. The guest agent listens,
- * the host connects; one request and one response per connection, then both
+ * Transport: Hyper-V socket service a5b0cafe-0008-4000-8000-000000000001.
+ * The guest agent listens, the host connects; one request and one response per connection, then both
  * sides close. Requests run in parallel (one connection each).
  *
  * Compatibility (AGENTS.md, rule 5.1):
@@ -15,9 +14,6 @@
  *  - Every message is little-endian and starts with a magic and a version.
  *    Never change the layout of version 1; add operations (unknown ones are
  *    answered with ASX_STATUS_UNSUPPORTED) or bump the version.
- *
- * Mirrored by hand in tools/linux/agent/appsandbox-agent.c (Linux guests
- * build from that single file).
  */
 #ifndef ASB_EXEC_PROTOCOL_H
 #define ASB_EXEC_PROTOCOL_H
@@ -30,7 +26,7 @@
 #define ASX_VERSION          1u
 
 /* Operations. */
-#define ASX_OP_PING          1u  /* -> text = "windows" or "linux", then the agent's extras, space
+#define ASX_OP_PING          1u  /* -> text = "windows", then the agent's extras, space
                                     separated: "desktop" = it knows ASX_EXEC_DESKTOP,
                                     "user" = it knows ASX_EXEC_AS_USER / ASX_EXEC_ELEVATED */
 #define ASX_OP_EXEC          2u  /* a = command, b = working directory (may be empty) */
@@ -38,8 +34,8 @@
 #define ASX_OP_READ_FILE     4u  /* a = guest path; data_len = largest size accepted */
 
 /* Request flags. */
-#define ASX_EXEC_SHELL       0x1u  /* EXEC: run through the system shell (cmd.exe /c, /bin/sh -c);
-                                      without it the command line is started as it is (Windows) */
+#define ASX_EXEC_SHELL       0x1u  /* EXEC: run through the system shell (cmd.exe /c);
+                                      without it the command line is started as it is */
 
 #define ASX_EXEC_DESKTOP     0x2u  /* EXEC, Windows guests: start the process in the signed-in user's
                                       desktop session (still as SYSTEM), so it can show windows and

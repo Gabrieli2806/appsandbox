@@ -4,19 +4,18 @@ its config while stopped, take/rename/delete a snapshot, branch from a snapshot,
 read SSH info, then delete it. Self-contained -- it makes its own VM and removes
 it at the end, so it assumes no existing configuration.
 
-    python examples/full_lifecycle.py [linux|windows]
+    python examples/full_lifecycle.py
 
-A fresh Linux guest installs in a few minutes; Windows can take ~15-20. Point
+A fresh Windows guest can take ~15-20 minutes to install. Point
 imagePath at an ISO you have. Run from an elevated shell (the daemon is too).
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import asb
 
-OS_TYPE = "Windows" if (len(sys.argv) > 1 and sys.argv[1].lower().startswith("win")) else "Linux"
+OS_TYPE = "Windows"
 NAME = "demo-vm"
-ISO = (r"C:\ISOs\ubuntu-24.04.iso" if OS_TYPE == "Linux"
-       else r"C:\ISOs\Win11_24H2.iso")   # <-- edit to a real ISO path
+ISO = r"C:\ISOs\Win11_24H2.iso"   # <-- edit to a real ISO path
 
 c = asb.connect()
 print("daemon:", c.version().get("version"), "| host free:", c.host()["freeGb"], "GB")

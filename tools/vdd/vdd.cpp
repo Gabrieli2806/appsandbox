@@ -34,7 +34,7 @@ Environment:
 #include <cfgmgr32.h> /* CM_Locate_DevNode, CM_Disable_DevNode */
 #include <d3dkmthk.h>  /* D3DKMTSetProcessSchedulingPriorityClass */
 #include <setupapi.h>  /* SetupDiGetClassDevs, SetupDiEnumDeviceInfo */
-#include "../transport/asb_transport.h"  /* ivshmem frame channel (Windows-VMs-on-Mac path only) */
+#include "../transport/asb_transport.h"  /* host frame channel (Hyper-V socket) */
 #include "vdd_encoder.h"  /* performance mode: hardware H.264 */
 #include <objbase.h>     /* CoInitializeEx */
 
@@ -153,13 +153,6 @@ static void VddRebuildModeListLocked(VDD_DEVICE_CONTEXT* ctx, const VDD_MODE* pr
     UINT n = 0;
     VDD_MODE def = { VDD_WIDTH, VDD_HEIGHT, VDD_REFRESH };
 
-    if (ctx->legacySingleMode) {
-        ctx->modes[0] = def;
-        ctx->modeCount = 1;
-        ctx->preferredMode = 0;
-        return;
-    }
-
     for (UINT r = 0; r < g_NumRefreshRates; r++) {
         for (UINT i = 0; i < g_NumResolutions && n < VDD_MAX_MODES; i++) {
             VDD_MODE m = { g_SupportedResolutions[i].width, g_SupportedResolutions[i].height,
@@ -218,7 +211,7 @@ static void VddRequestMode(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height, UIN
     VDD_MODE m;
     BOOL known = FALSE, replug = FALSE;
 
-    if (!ctx || ctx->legacySingleMode) return;
+    if (!ctx) return;
 
     /* Width a multiple of 8 and height even keep every scan-out path happy. */
     width &= ~7u;
@@ -258,26 +251,24 @@ static void VddRequestMode(VDD_DEVICE_CONTEXT* ctx, UINT width, UINT height, UIN
 /*                                                                           */
 /*  The frame channel (listen/accept/send on the ch2 service a5b0cafe-0002)  */
 /*  goes through asb_transport: asb_listen(ASB_CH_DISPLAY)/asb_accept/       */
-/*  asb_send resolve to AF_HYPERV HvSocket on a Windows host and to the      */
-/*  ivshmem ch2 stream slot on a macOS host.                                 */
+/*  asb_send, an AF_HYPERV HvSocket.                                         */
 /* ========================================================================= */
 
 /* Send exactly len bytes over the transport. Returns 0 on success, -1 on failure
-   (asb_send loops until all bytes are sent on both backends). */
+   (asb_send loops until all bytes are sent). */
 static int VddSendAll(AsbConn* c, const char* data, int len)
 {
     return asb_send(c, data, len) == len ? 0 : -1;
 }
 
-/* Close a client connection and clear *pc. PC: graceful shutdown(SD_BOTH) then closesocket; ivshmem:
-   asb_close marks the slot CLOSING. */
+/* Close a client connection and clear *pc: graceful shutdown(SD_BOTH) then closesocket. */
 static void VddCloseConn(AsbConn* volatile* pc)
 {
     AsbConn* c = *pc;
     if (!c) return;
     {
         unsigned long long s = asb_conn_socket_u64(c);
-        if (s != ~0ull) shutdown((SOCKET)s, SD_BOTH);   /* PC only; ivshmem returns ~0 */
+        if (s != ~0ull) shutdown((SOCKET)s, SD_BOTH);
     }
     asb_close(c);
     *pc = NULL;
@@ -287,13 +278,13 @@ static void VddCloseConn(AsbConn* volatile* pc)
 /*  Network listener thread (accepts host connections over HvSocket)         */
 /* ========================================================================= */
 
-/* One-shot transport backend selection (PC AF_HYPERV vs Mac ivshmem). Done off the loader lock
-   (in the network thread, never in DllMain) since the ivshmem probe enumerates device interfaces. */
+/* One-shot transport initialisation (WSAStartup). Done off the loader lock
+   (in the network thread, never in DllMain). */
 static volatile LONG g_transportInited = 0;
 static void VddEnsureTransportInit(void)
 {
     if (InterlockedCompareExchange(&g_transportInited, 1, 0) == 0)
-        asb_transport_init();   /* selects ivshmem if the host published the directory, else AF_HYPERV */
+        asb_transport_init();
 }
 
 static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
@@ -305,19 +296,16 @@ static DWORD WINAPI VddNetworkThread(LPVOID lpParameter)
     VddEnsureTransportInit();
 
     while (!proc->bStopNetwork) {
-        /* (Re)create the listener. PC: socket(AF_HYPERV)+bind(ch2 GUID, wildcard)+listen;
-           Mac: bind the ivshmem ch2 slot. */
+        /* (Re)create the listener: socket(AF_HYPERV)+bind(ch2 GUID, wildcard)+listen. */
         l = asb_listen(ASB_CH_DISPLAY);
         if (!l) {
-            VddLog("Network: asb_listen(ch2) failed, retrying in 3s (transport=%s)",
-                   asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+            VddLog("Network: asb_listen(ch2) failed, retrying in 3s (transport=hyperv)");
             for (int w = 0; w < 3000 && !proc->bStopNetwork; w += 500)
                 Sleep(500);
             continue;
         }
 
-        VddLog("Network: listening for host connections (transport=%s)",
-               asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+        VddLog("Network: listening for host connections (transport=hyperv)");
 
         /* Accept loop — 1s timeout so we re-check bStopNetwork between accepts. */
         while (!proc->bStopNetwork) {
@@ -1039,17 +1027,11 @@ static void VddSwapChainRunCore(VDD_SWAP_PROC* proc)
                 (PVOID volatile*)&proc->hPendingConn, NULL);
             if (pending) {
                 EnterCriticalSection(&proc->sendLock);   /* no frame in flight while swapping */
-                /* Drop the previous client. On PC the old socket is distinct -> close it. On ivshmem
-                   the pending connection is the SAME single slot the host just re-armed, so closing
-                   the old wrapper would mark the shared slot CLOSING and kill the new one — abandon
-                   the stale wrapper instead. */
+                /* Drop the previous client (its socket is distinct from the pending one). */
                 if (proc->hClientConn) {
-                    if (asb_conn_socket_u64(proc->hClientConn) != ~0ull)
-                        VddCloseConn(&proc->hClientConn);          /* PC: real close */
-                    else { asb_abandon(proc->hClientConn); proc->hClientConn = NULL; }  /* ivshmem */
+                    VddCloseConn(&proc->hClientConn);
                     VddLog("Frame: replaced previous client connection");
                 }
-                asb_stream_reset(pending);   /* ivshmem: align the fresh full frame at ring offset 0 (no-op on PC) */
                 /* A stalled host must not pin the sender forever. */
                 asb_set_timeout(pending, 0, 5000);
                 proc->hClientConn = pending;
@@ -1388,14 +1370,8 @@ static void VddContextInit(VDD_DEVICE_CONTEXT* ctx, WDFDEVICE device)
 
     InitializeSRWLock(&ctx->modeLock);
 
-    /* A macOS host reads frames through a fixed-size ivshmem region, so keep
-       the single 1920x1080@60 mode there. The transport probe is safe here
-       (not under the loader lock). */
-    VddEnsureTransportInit();
-    ctx->legacySingleMode = asb_transport_is_ivshmem() ? TRUE : FALSE;
     VddRebuildModeListLocked(ctx, nullptr);
-    VddLog("ContextInit: %u modes offered%s", ctx->modeCount,
-           ctx->legacySingleMode ? " (macOS host: single mode)" : "");
+    VddLog("ContextInit: %u modes offered", ctx->modeCount);
 
     g_pVddContext = ctx;
 }

@@ -107,19 +107,6 @@ int generate_vhdx_manifest(const wchar_t *manifest_path,
    Returns TRUE if the MSI is available at the returned path. */
 BOOL ensure_ssh_msi_cached(wchar_t *msi_path_out, int max_chars);
 
-/* Stage the Linux agent ELFs + kernel modules + DKMS sources + systemd
-   units + modprobe.d/modules-load.d + wsl-mesa + wsl-deps under
-   <staging>/extras/. The direct-ISO->VHDX flow populates this dir (via
-   the prefetch modules) and turns it into a manifest for iso-patch --stage. */
-void stage_linux_agent_and_extras(const wchar_t *staging,
-                                  const wchar_t *res_dir,
-                                  BOOL ssh_enabled);
-
-/* Hash a wide-char plaintext password into glibc $6$<salt>$<sha512> format
-   for /etc/shadow. Generates a fresh random 16-char salt. UTF-8 conversion
-   of the plaintext is wiped on return. Returns TRUE on success. */
-BOOL unix_password_hash(const wchar_t *plain, char *hash_out, size_t hash_out_size);
-
 /* Write language.json alongside VHDX */
 void vm_save_language_json(const wchar_t *vhdx_path, const wchar_t *lang);
 

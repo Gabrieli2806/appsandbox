@@ -814,31 +814,6 @@ BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverSha
 #endif
 }
 
-BOOL gpu_append_lxsslib_share(GpuDriverShareList *list)
-{
-    wchar_t sys_dir[MAX_PATH];
-    wchar_t path[MAX_PATH];
-    GpuDriverShare *s;
-
-    if (!list) return FALSE;
-    if (list->count >= MAX_GPU_SHARES) return FALSE;
-
-    if (!GetSystemDirectoryW(sys_dir, MAX_PATH)) return FALSE;
-    swprintf_s(path, MAX_PATH, L"%s\\lxss\\lib", sys_dir);
-    if (GetFileAttributesW(path) == INVALID_FILE_ATTRIBUTES) return FALSE;
-
-    s = &list->shares[list->count];
-    wcscpy_s(s->share_name, 128, L"AppSandbox.HostLxssLib");
-    wcscpy_s(s->host_path, MAX_PATH, path);
-    /* guest_path is informational on the wire — the Linux agent ignores
-     * it and uses share_name as the routing key, mounting at the WSL
-     * canonical /usr/lib/wsl/lib. Filled in for log readability. */
-    wcscpy_s(s->guest_path, MAX_PATH, L"/usr/lib/wsl/lib");
-    s->file_filter[0] = L'\0';
-    list->count++;
-    return TRUE;
-}
-
 BOOL gpu_append_gl_layers_share(GpuDriverShareList *list, const wchar_t *host_dir)
 {
     GpuDriverShare *s;

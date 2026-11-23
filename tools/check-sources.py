@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """
-Cross-check src/core/ source files against the project files in the
-Windows and macOS build systems. Prints anything that is on disk but
-not listed in a project file, or listed in a project file but missing
-from disk.
+Cross-check src/core/ source files against AppSandboxCore.vcxproj.
+Prints anything that is on disk but not listed in the project file, or
+listed in the project file but missing from disk.
 
 Usage:
     python tools/check-sources.py
@@ -18,7 +17,6 @@ import sys
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 CORE_DIR = os.path.join(REPO_ROOT, "src", "core")
 VCXPROJ = os.path.join(REPO_ROOT, "AppSandboxCore.vcxproj")
-XCODEPROJ = os.path.join(REPO_ROOT, "AppSandbox.xcodeproj", "project.pbxproj")
 
 
 def find_core_files():
@@ -38,22 +36,6 @@ def parse_vcxproj(path):
         text = f.read()
     matches = re.findall(r'Include="src\\core\\([^"]+)"', text)
     return set(matches)
-
-
-def parse_xcodeproj(path):
-    if not os.path.isfile(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        text = f.read()
-    has_core_group = 'path = src/core' in text
-    if not has_core_group:
-        return set()
-    result = set()
-    for m in re.finditer(r'isa\s*=\s*PBXFileReference\s*;[^}]*path\s*=\s*(\S+\.[ch])\s*;', text):
-        fname = m.group(1)
-        if os.path.isfile(os.path.join(CORE_DIR, fname)):
-            result.add(fname)
-    return result
 
 
 def report(label, on_disk, in_proj):
@@ -82,7 +64,6 @@ def main():
     on_disk = set(find_core_files())
     total_drift = 0
     total_drift += report("AppSandboxCore.vcxproj", on_disk, parse_vcxproj(VCXPROJ))
-    total_drift += report("AppSandbox.xcodeproj", on_disk, parse_xcodeproj(XCODEPROJ))
     if total_drift > 0:
         print(f"\n{total_drift} drift(s) detected")
         return 1

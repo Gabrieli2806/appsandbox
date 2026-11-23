@@ -1,19 +1,16 @@
 """
 The full per-VM test sequence, parametrized by a create-spec. The master harness
-(run_all.py) runs this CONCURRENTLY across several specs (Linux + Windows on a
-Windows host; a macOS guest on a macOS host) -- so multi-VM concurrency is
-inherent where the platform has multiple guest types, and every path is proven
-on each OS. Each call creates its own VM, runs everything against it, and
-deletes it. There is no separate multi-VM test. Feature differences are
-capability-gated via version()["capabilities"] (snapshots/templates are
-Windows-only; those routes assert 501 on macOS).
+(run_all.py) runs this once per spec, concurrently when there are several.
+Each call creates its own VM, runs everything against it, and deletes it.
+There is no separate multi-VM test. Snapshots are gated on
+version()["capabilities"].
 
 Lifecycle discipline (mirrors the GUI):
   * Every VM start boots all the way to ONLINE (agent connected) before the VM is
     used -- the ONLY exceptions are the delete/edit-during-build tests, which
     deliberately act before the guest finishes installing.
   * Every shutdown is the GRACEFUL, agent-mediated one (asb_vm_shutdown -> hcs_stop_vm
-    -> the guest agent's InitiateSystemShutdownExW / `systemctl`), sent once the
+    -> the guest agent's InitiateSystemShutdownExW), sent once the
     agent is online -- with no agent the core returns ERROR_NOT_SUPPORTED and nothing
     shuts down.
   * Force-stop (POST .../stop) is exercised in exactly ONE dedicated test.
@@ -32,30 +29,23 @@ import helpers
 
 def run_vm_lifecycle(spec):
     name = spec["name"]
-    os_type = spec.get("os_type", "Linux")
+    os_type = spec.get("os_type", "Windows")
     ram = spec.get("ram", 4096)
     hdd = spec.get("hdd", 24)
     cores = spec.get("cores", 2)
     image = spec.get("image")            # explicit per-spec override (may be "")
     if image is None:
-        if os_type == "Linux":
-            image = helpers.ISO_LIN
-        elif os_type == "Windows":
-            image = helpers.ISO_WIN
-        else:                            # macOS: IPSW; "" = cached/auto-fetched
-            image = helpers.IPSW_MAC
-    ONLINE_T = 600 if os_type == "Linux" else 1800   # boot-to-online budget
-    GRACE_T  = 240 if os_type == "Linux" else 600    # graceful-shutdown budget
-    # The build/install/download phase is stall-based -- it fails only after
+        image = helpers.ISO_WIN
+    ONLINE_T = 1800   # boot-to-online budget
+    GRACE_T  = 600    # graceful-shutdown budget
+    # The build/install phase is stall-based -- it fails only after
     # BUILD_STALL seconds of zero observable movement, however long a healthy
-    # download/install takes. EXCEPTION: a Windows guest's first boot (OOBE +
-    # SetupComplete + driver/agent install) reports NO host-side progress -- it
-    # stays "Installing Windows" (indeterminate) until the guest agent connects,
-    # exactly like Windows-on-Windows -- so that phase is a legitimately
-    # signal-less window. It can run 10+ minutes (longer under concurrent
-    # multi-VM load), so give Windows a real budget; Linux/macOS stream live
-    # progress and keep the tight 600 s stall.
-    BUILD_STALL = 3600 if os_type == "Windows" else 600
+    # install takes. A Windows guest's first boot (OOBE + SetupComplete +
+    # driver/agent install) reports NO host-side progress -- it stays
+    # "Installing Windows" (indeterminate) until the guest agent connects -- so
+    # that phase is a legitimately signal-less window. It can run 10+ minutes
+    # (longer under concurrent multi-VM load), hence the generous budget.
+    BUILD_STALL = 3600
 
     c = asb.connect()
     caps = c.version().get("capabilities", {})
@@ -119,7 +109,7 @@ def run_vm_lifecycle(spec):
     cfg = dict(name=name, osType=os_type, ramMb=ram, hddGb=hdd, cpuCores=cores,
                gpuMode=1, networkMode=1, testMode=True, sshEnabled=True, sshDeployKey=True,
                adminUser="user", adminPass="test123")
-    if image:   # macOS may omit it (cached/auto-fetched restore image)
+    if image:
         cfg["imagePath"] = image
     try:
         # --- create (validates the create path) ---
@@ -127,8 +117,8 @@ def run_vm_lifecycle(spec):
         check("create -> 202", code in (200, 202), "%s %s" % (code, body))
 
         # --- delete/edit-during-build guards: the ONLY paths that act before the
-        #     guest finishes installing (deliberately pre-online). Windows
-        #     surfaces this as building=true; macOS as state=="installing". ---
+        #     guest finishes installing (deliberately pre-online): building=true
+        #     or state=="installing". ---
         deadline = time.time() + 90
         caught_building = False
         while time.time() < deadline:
@@ -143,10 +133,9 @@ def run_vm_lifecycle(spec):
             check("edit during build -> 409", c.edit(name, ramMb=ram)[0] == 409)
             check("still present after refused delete", name in {v["name"] for v in c.list()})
 
-        # --- wait until built/installed. Create auto-starts on both platforms
-        #     (the macOS install briefly parks at "stopped" before the core
-        #     auto-boots it once the disk is released), so this just waits past
-        #     building/installing; boot_online is idempotent if it's already up.
+        # --- wait until built/installed. Create auto-starts the VM, so this
+        #     just waits past building/installing; boot_online is idempotent if
+        #     it's already up.
         #     Stall-based: live progress keeps the wait alive; a hung build
         #     fails after BUILD_STALL seconds of no movement. ---
         try:
@@ -167,35 +156,25 @@ def run_vm_lifecycle(spec):
 
         # --- display: a quick programmatic open + close now that the VM is online.
         #     Readiness (running + agentOnline + the display driver up) is a latched,
-        #     passive flag -- never a frame-channel probe. On macOS there is no frame
-        #     channel/driver (VZVirtualMachineView binds the in-process framebuffer),
-        #     so readiness is just running + agentOnline. SKIPped (not failed) so CI
-        #     stays green in two cases:
-        #       * Linux guest whose deployed agent predates the idd_status push, so
-        #         readiness never latches -- exercised once a fresh Linux VM auto-builds
-        #         the updated agent;
-        #       * a daemon in a non-interactive session that can't show a window
-        #         (409 no_display) -- e.g. a sudo/launchd daemon with no console Aqua
-        #         session, on either Windows or macOS. ---
+        #     passive flag -- never a frame-channel probe. SKIPped (not failed)
+        #     when the daemon runs in a non-interactive session that can't show a
+        #     window (409 no_display). ---
         check("display not open before open", son.get("displayOpen") is False)
         deadline = time.time() + 90
         while time.time() < deadline and not c.display_ready(name):
             time.sleep(2)
         ready = c.display_ready(name)
-        if not ready and os_type == "Linux":
-            print("  SKIP  [%s] display open/close -- Linux guest readiness needs the pushed agent" % name, flush=True)
+        check("display ready when online", ready, "display_status=%s" % c.display_status(name))
+        oc, ob = c.open_display(name)
+        if oc == 409 and ob.get("error", {}).get("code") == "no_display":
+            print("  SKIP  [%s] display open/close -- no interactive desktop on daemon session" % name, flush=True)
         else:
-            check("display ready when online", ready, "display_status=%s" % c.display_status(name))
-            oc, ob = c.open_display(name)
-            if oc == 409 and ob.get("error", {}).get("code") == "no_display":
-                print("  SKIP  [%s] display open/close -- no interactive desktop on daemon session" % name, flush=True)
-            else:
-                check("display open -> 200", oc == 200, "%s %s" % (oc, ob))
-                check("displayOpen true after open", bool(st()) and st().get("displayOpen") is True)
-                cc, cb = c.close_display(name)
-                check("display close -> 200", cc == 200, "%s %s" % (cc, cb))
-                check("displayOpen false after close", bool(st()) and st().get("displayOpen") is False)
-            check("daemon alive after display open/close", bool(c.version().get("product")))
+            check("display open -> 200", oc == 200, "%s %s" % (oc, ob))
+            check("displayOpen true after open", bool(st()) and st().get("displayOpen") is True)
+            cc, cb = c.close_display(name)
+            check("display close -> 200", cc == 200, "%s %s" % (cc, cb))
+            check("displayOpen false after close", bool(st()) and st().get("displayOpen") is False)
+        check("daemon alive after display open/close", bool(c.version().get("product")))
 
         # --- duplicate name rejected ---
         check("duplicate name -> 400", c._req("POST", "/vms", dict(cfg))[0] == 400)
@@ -209,9 +188,7 @@ def run_vm_lifecycle(spec):
         #     Once online the guest agent writes the AppSandbox public key into the
         #     guest's authorized_keys and reports it back: sshState becomes 4 and
         #     keyDeployed flips true. We then prove a key-only BatchMode login works
-        #     (no password). NOTE: the Linux/macOS agent is built from the pushed
-        #     GitHub branch, so keyDeployed stays false -- and these checks stay red --
-        #     until `headless-api` is pushed; the Windows agent is built locally. ---
+        #     (no password). ---
         si = c.ssh_info(name)
         check("sshInfo host == 127.0.0.1", si.get("host") == "127.0.0.1")
         deadline = time.time() + 180
@@ -256,7 +233,7 @@ def run_vm_lifecycle(spec):
         check("edit odd RAM -> 400", c._req("PUT", "/vms/" + name, {"ramMb": 4001})[0] == 400)
         check("edit gpuMode=9 -> 400", c._req("PUT", "/vms/" + name, {"gpuMode": 9})[0] == 400)
 
-        # --- snapshots + branches (Windows-only; capability-gated). Validate the
+        # --- snapshots + branches (capability-gated). Validate the
         #     on-disk artifacts, not just the API list: the base disk and a
         #     per-snapshot differencing VHDX under <vm>\snapshots\. ---
         vm_dir = helpers.vm_dir(name)

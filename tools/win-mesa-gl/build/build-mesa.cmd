@@ -1,8 +1,7 @@
 @echo off
 REM ======================================================================
 REM build-mesa.cmd -- build Mesa's standalone OpenGL stack (the "opengl32
-REM trio") for AppSandbox Windows GPU-PV guests. Windows/D3D12 counterpart
-REM of tools/linux/wsl-mesa/build/build-mesa.sh.
+REM trio") for AppSandbox Windows GPU-PV guests.
 REM
 REM Produces three self-contained DLLs (static CRT, no VCRUNTIME/MSVCP):
 REM     opengl32.dll      Mesa drop-in OpenGL (full gl*/wgl*)
@@ -32,7 +31,7 @@ REM     MESON        meson launcher   (auto-detected)
 REM ======================================================================
 setlocal EnableExtensions EnableDelayedExpansion
 
-REM ---- pinned to a STABLE release branch (matches the wsl-mesa pattern).
+REM ---- pinned to a STABLE release branch.
 REM      26.1 is the latest stable and the closest to the 26.2.0-devel Mesa
 REM      that Microsoft's OpenGLOn12 ships. Bump deliberately + re-verify
 REM      before re-vendoring. ----
@@ -96,7 +95,7 @@ if not defined MESON (
 where python >nul 2>nul || ( echo [build-mesa] ERROR: python not on PATH & exit /b 1 )
 
 REM ---- configure. Video/d3d12-encoder are KEPT ON (-Dvideo-codecs=all),
-REM      matching Microsoft's shipping build + wsl-mesa. /wd4189 neutralises
+REM      matching Microsoft's shipping build. /wd4189 neutralises
 REM      the MSVC "unreferenced local" warning the video encoder promotes to
 REM      an error; if a warning-as-error still breaks the build, add a (void)
 REM      cast on the variable the failure names and re-run. ----
@@ -141,7 +140,7 @@ set "ZFOUND="
 for /r "%BUILD%\subprojects" %%f in (z-1.dll) do ( copy /Y "%%f" "%OUT_DIR%\" >nul && set "ZFOUND=1" )
 if not defined ZFOUND ( echo [build-mesa] ERROR: z-1.dll not found under %BUILD%\subprojects & exit /b 1 )
 
-REM ---- record provenance (mirrors wsl-mesa BUILDINFO) ----
+REM ---- record provenance (BUILDINFO) ----
 > "%OUT_DIR%\BUILDINFO" echo mesa-version : !MVER!
 >>"%OUT_DIR%\BUILDINFO" echo mesa-branch  : %MESA_BRANCH%
 >>"%OUT_DIR%\BUILDINFO" echo arch         : %ARCH%

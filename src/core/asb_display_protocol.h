@@ -9,8 +9,6 @@
  *    the version the driver reports in VDD_WIRE_HELLO. Old drivers never
  *    answer the hello query; old hosts never send it.
  *  - Never change the layout of an existing message.
- *
- * Platform-neutral (stdint types), so the macOS host's viewer can use it too.
  */
 #ifndef ASB_DISPLAY_PROTOCOL_H
 #define ASB_DISPLAY_PROTOCOL_H

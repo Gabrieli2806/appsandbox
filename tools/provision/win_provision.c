@@ -1,7 +1,6 @@
 /*
- * win_provision.c -- see win_provision.h. Platform-neutral; no Win32 / no Foundation.
- * Content is byte-faithful to src/backend_win/disk_util.c's generate_vhdx_* functions, with the
- * single addition of the AppSandboxSHM install step (harmless no-op on Windows-to-Windows).
+ * win_provision.c -- see win_provision.h. Plain C, no Win32: the generators behind
+ * src/backend_win/disk_util.c's generate_vhdx_* functions.
  */
 #include "win_provision.h"
 #include <string.h>
@@ -13,8 +12,8 @@ static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0
 /* Decode one UTF-8 sequence at s (NUL-terminated); returns the Unicode code point and
    sets *adv to the bytes consumed. Malformed -> U+FFFD, *adv=1. The continuation-byte
    checks short-circuit on the first non-continuation byte (NUL included), so it never
-   reads past the terminator. The input is UTF-8 on both hosts (macOS passes
-   NSString.UTF8String; Windows passes WideCharToMultiByte(CP_UTF8,...)). */
+   reads past the terminator. The input is UTF-8 (the caller passes
+   WideCharToMultiByte(CP_UTF8,...)). */
 static unsigned asb_utf8_next(const unsigned char *s, int *adv) {
     unsigned char c = s[0];
     if (c < 0x80) { *adv = 1; return c; }
@@ -334,7 +333,7 @@ int asb_provision_nat_setup(FILE *f) {
         "$ErrorActionPreference = 'Stop'; "
         "for ($attempt = 0; $attempt -lt 60; $attempt++) { "
         "$adapters = @(Get-CimInstance Win32_NetworkAdapterConfiguration | Where-Object { "
-        "$_.IPEnabled -and $_.ServiceName -in @('netkvm', 'netvsc') -and $_.DefaultIPGateway -and "
+        "$_.IPEnabled -and $_.ServiceName -in @('netvsc') -and $_.DefaultIPGateway -and "
         "@($_.IPAddress | Where-Object { $_ -notlike '*:*' -and $_ -notlike '169.254.*' -and $_ -ne '0.0.0.0' }).Count }); "
         "$profiles = @($adapters | ForEach-Object { "
         "Get-NetConnectionProfile -InterfaceIndex $_.InterfaceIndex -ErrorAction SilentlyContinue } | "
@@ -408,23 +407,6 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_medi
         "echo [SETUP] Enabling test signing... >> \"%LOG%\"\r\n"
         "bcdedit /set testsigning on >> \"%LOG%\" 2>&1\r\n"
         "\r\n"
-        "REM ---- AppSandboxSHM: shared-memory transport PCI driver for QEMU's ivshmem device\r\n"
-        "REM PCI\\VEN_1AF4&DEV_1110. Installed FIRST so the transport is up before the VDD/agent connect.\r\n"
-        "REM It is test-signed, so trust its .cer with certutil (same as the VDD) then bind it to the\r\n"
-        "REM already-enumerated PCI device with `devcon update` -- the SUBSYS-qualified driver outranks\r\n"
-        "REM the inbox RAM-controller driver. Same pattern as NetKVM below; Windows-to-Windows has no\r\n"
-        "REM 1af4:1110 device, so it is a no-op there.\r\n"
-        "if exist \"%DRVDIR%\\AppSandboxSHM.cer\" (\r\n"
-        "    echo [SHM] Installing certificate... >> \"%LOG%\"\r\n"
-        "    certutil -addstore Root \"%DRVDIR%\\AppSandboxSHM.cer\" >> \"%LOG%\" 2>&1\r\n"
-        "    certutil -f -addstore TrustedPublisher \"%DRVDIR%\\AppSandboxSHM.cer\" >> \"%LOG%\" 2>&1\r\n"
-        ")\r\n"
-        "if exist \"%DRVDIR%\\AppSandboxSHM.inf\" (\r\n"
-        "    echo [SHM] Installing transport driver with devcon update... >> \"%LOG%\"\r\n"
-        "    \"%DRVDIR%\\devcon.exe\" update \"%DRVDIR%\\AppSandboxSHM.inf\" \"PCI\\VEN_1AF4&DEV_1110&SUBSYS_11001AF4&REV_01\" >> \"%LOG%\" 2>&1\r\n"
-        "    echo [SHM] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-        ")\r\n"
-        "\r\n"
         "REM ---- VDD (IddCx virtual display) -- its cert (WDKTestCert) then devcon install (Root device)\r\n"
         "if exist \"%DRVDIR%\\AppSandboxVDD.cer\" (\r\n"
         "    echo [VDD] Installing certificate... >> \"%LOG%\"\r\n"
@@ -447,15 +429,6 @@ int asb_provision_setupcomplete(FILE *f, const char *ssh_msi_name, int from_medi
         "    echo [VAD] Installing driver with devcon... >> \"%LOG%\"\r\n"
         "    \"%DRVDIR%\\devcon.exe\" install \"%DRVDIR%\\AppSandboxVAD.inf\" Root\\AppSandboxVAD >> \"%LOG%\" 2>&1\r\n"
         "    echo [VAD] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
-        ")\r\n"
-        "\r\n"
-        "REM ---- NetKVM (virtio-net NIC) -- Red Hat WHQL-signed (no cert needed). `devcon update` binds\r\n"
-        "REM it to the existing virtio-net-pci device (1af4:1000) for NAT networking. netkvmp.exe must sit\r\n"
-        "REM beside the INF (the INF CopyFiles-es it). No matching device on Windows-to-Windows -> no-op.\r\n"
-        "if exist \"%DRVDIR%\\netkvm.inf\" (\r\n"
-        "    echo [NETKVM] Installing virtio-net driver with devcon... >> \"%LOG%\"\r\n"
-        "    \"%DRVDIR%\\devcon.exe\" update \"%DRVDIR%\\netkvm.inf\" \"PCI\\VEN_1AF4&DEV_1000&SUBSYS_00011AF4&REV_00\" >> \"%LOG%\" 2>&1\r\n"
-        "    echo [NETKVM] devcon exit code: %errorlevel% >> \"%LOG%\"\r\n"
         ")\r\n"
         "\r\n",
         f);

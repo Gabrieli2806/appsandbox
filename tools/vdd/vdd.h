@@ -33,12 +33,12 @@ Environment:
 #include <avrt.h>
 
 #include "Trace.h"
-#include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV on PC, ivshmem on Mac) */
+#include "../transport/asb_transport.h"   /* AsbConn — host connection (AF_HYPERV) */
 
 /* ============================================================================
  *  Display constants
  * ============================================================================ */
-/* Default (and, on a macOS host, only) mode. */
+/* Default mode. */
 #define VDD_WIDTH            1920
 #define VDD_HEIGHT           1080
 #define VDD_REFRESH          60
@@ -197,8 +197,7 @@ typedef struct _VDD_SWAP_PROC {
     /* Staging texture for CPU readback (owned, per-swap-chain) */
     ID3D11Texture2D*    pStagingTex;
 
-    /* Host connection via asb_transport — AF_HYPERV HvSocket on a Windows host, ivshmem stream
-       slot on a macOS host. One emit path, two backends. */
+    /* Host connection via asb_transport (AF_HYPERV HvSocket). */
     HANDLE              hNetworkThread;     /* listener/accept thread */
     AsbConn * volatile  hClientConn;        /* active client, owned by swap chain thread */
     AsbConn * volatile  hPendingConn;       /* new client from network thread, picked up by swap chain */
@@ -274,7 +273,6 @@ typedef struct _VDD_DEVICE_CONTEXT {
     VDD_MODE            modes[VDD_MAX_MODES];
     UINT                modeCount;
     UINT                preferredMode;      /* index into modes[] */
-    BOOL                legacySingleMode;   /* macOS host: only 1920x1080@60 */
 
     /* Recent custom modes (ring), kept so returning to a size does not need
        another monitor re-plug. */

@@ -3,8 +3,8 @@
  *
  * Runs in the interactive console session (Session 1+), spawned by the agent
  * service via CreateProcessAsUser. Receives InputPacket messages from the host
- * over the AppSandbox transport (asb_transport, ASB_CH_INPUT: AF_HYPERV on a
- * Windows host, ivshmem shared memory on a macOS host) and calls SendInput to
+ * over the AppSandbox transport (asb_transport, ASB_CH_INPUT: a Hyper-V
+ * socket) and calls SendInput to
  * inject mouse/keyboard events into the active desktop.
  *
  * Logs to C:\Windows\AppSandbox\input.log (beside agent.log).
@@ -708,8 +708,7 @@ int main(void)
         input_log("asb_listen(ASB_CH_INPUT) failed.");
         return 1;
     }
-    input_log("Listening on input channel (transport=%s).",
-              asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+    input_log("Listening on input channel (transport=hyperv).");
 
     /* Accept loop — one host connection at a time. */
     for (;;) {

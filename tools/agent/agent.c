@@ -3195,7 +3195,7 @@ static void handle_client(AsbConn *client)
 
     agent_log("Client connected.");
 
-    /* Set timeouts so recv/send don't block forever if host disconnects (no-op on ivshmem) */
+    /* Set timeouts so recv/send don't block forever if host disconnects */
     asb_set_timeout(client, 10000, 10000);
 
     /* Send hello, and publish the connection to the other threads in the same
@@ -3523,8 +3523,7 @@ static DWORD WINAPI listener_thread(LPVOID param)
             if (WaitForSingleObject(g_stop_event, 3000) == WAIT_OBJECT_0) break;
             continue;
         }
-        agent_log("Listening on agent control channel (transport=%s)",
-                  asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+        agent_log("Listening on agent control channel (transport=hyperv)");
 
         /* Accept loop — one client at a time */
         while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {
@@ -3552,7 +3551,7 @@ static volatile BOOL g_ssh_waiting = FALSE;
 #define SSH_RELAY_BUF 8192
 
 typedef struct SshRelayCtx {
-    AsbConn *hv;        /* transport connection to the host (AF_HYPERV on PC, ivshmem on Mac) */
+    AsbConn *hv;        /* transport connection to the host (AF_HYPERV) */
     SOCKET   tcp_sock;  /* localhost:22 (sshd) */
 } SshRelayCtx;
 
@@ -3564,7 +3563,7 @@ static DWORD WINAPI ssh_relay_thread(LPVOID param)
     SOCKET hv = (SOCKET)asb_conn_socket_u64(ctx->hv);
 
     if (hv != INVALID_SOCKET) {
-        /* PC (AF_HYPERV): the connection exposes a real SOCKET, so relay both directions with a single dual-fd select(). */
+        /* Relay both directions with a single dual-fd select(). */
         fd_set rfds;
         struct timeval tv;
         for (;;) {
@@ -3589,30 +3588,7 @@ static DWORD WINAPI ssh_relay_thread(LPVOID param)
                 if (send(hv, buf, n, 0) != n) break;
             }
         }
-    } else {
-        /* ivshmem: the connection has no fd to select() on, so relay each direction separately —
-           poll the transport with a short timeout, non-blocking-check the TCP side. */
-        fd_set rfds;
-        struct timeval tv;
-        for (;;) {
-            int pr = asb_poll(ctx->hv, 5);
-            if (pr < 0) break;
-            if (pr > 0) {
-                n = asb_recv(ctx->hv, buf, SSH_RELAY_BUF);
-                if (n <= 0) break;
-                { int off = 0; while (off < n) { int s = send(ctx->tcp_sock, buf + off, n - off, 0);
-                    if (s <= 0) goto relay_done; off += s; } }
-            }
-            FD_ZERO(&rfds); FD_SET(ctx->tcp_sock, &rfds);
-            tv.tv_sec = 0; tv.tv_usec = 0;
-            if (select(0, &rfds, NULL, NULL, &tv) > 0) {
-                n = recv(ctx->tcp_sock, buf, SSH_RELAY_BUF, 0);
-                if (n <= 0) break;
-                if (asb_send(ctx->hv, buf, n) != n) break;
-            }
-        }
     }
-relay_done:
     asb_close(ctx->hv);
     closesocket(ctx->tcp_sock);
     free(ctx);
@@ -3681,8 +3657,7 @@ static DWORD WINAPI ssh_proxy_thread(LPVOID param)
         agent_log("SSH proxy: asb_listen(ASB_CH_SSH) failed.");
         return 1;
     }
-    agent_log("SSH proxy: listening on ssh channel (transport=%s)",
-              asb_transport_is_ivshmem() ? "ivshmem" : "hyperv");
+    agent_log("SSH proxy: listening on ssh channel (transport=hyperv)");
 
     while (g_ssh_proxy_running) {
         AsbConn *client = asb_accept(l, 1000);   /* 1s so we re-check g_ssh_proxy_running */
@@ -4326,10 +4301,6 @@ static DWORD WINAPI exec_listener_thread(LPVOID param)
     (void)param;
 
     if (asb_transport_init() != 0) return 1;
-    if (asb_transport_is_ivshmem()) {
-        agent_log("Command channel: not available on a Mac host (no region for channel %d).", ASB_EXEC_CHANNEL);
-        return 1;
-    }
     /* Keep trying for as long as the service runs: early in a boot (a warm
        restart above all) the socket provider may not take the bind yet. */
     while (WaitForSingleObject(g_stop_event, 0) != WAIT_OBJECT_0) {

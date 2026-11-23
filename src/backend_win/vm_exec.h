@@ -58,12 +58,10 @@ typedef struct {
 
 ASB_API void asb_guest_target(UINT64 vm_id, AsbGuestTarget *target);
 
-/* Run command in the guest as SYSTEM (Windows) or root (Linux). flags:
-   ASB_EXEC_SHELL runs it through cmd.exe /c or /bin/sh -c; without it the
-   command line is started as it is (Windows guests; Linux guests always use
-   the shell). ASB_EXEC_DESKTOP (Windows guests whose agent announces
-   "desktop" in asb_guest_ping) starts it in the signed-in user's desktop
-   session. cwd may be NULL. max_output limits stdout and stderr separately. */
+/* Run command in the guest as SYSTEM. flags: ASB_EXEC_SHELL runs it
+   through cmd.exe /c; without it the command line is started as it is.
+   ASB_EXEC_DESKTOP (guests whose agent announces "desktop" in
+   asb_guest_ping) starts it in the signed-in user's desktop session. cwd may be NULL. max_output limits stdout and stderr separately. */
 #define ASB_EXEC_SHELL    0x1u
 #define ASB_EXEC_DESKTOP  0x2u
 #define ASB_EXEC_AS_USER  0x4u   /* as the signed-in user (agents that announce "user") */
@@ -82,7 +80,7 @@ ASB_API int asb_guest_write_file(const AsbGuestTarget *vm, const char *guest_pat
 ASB_API int asb_guest_read_file(const AsbGuestTarget *vm, const char *guest_path_utf8,
                                 HANDLE file, UINT64 limit, AsbGuestResult *r);
 
-/* "windows" or "linux" (and the agent's extras) in r->message when the
+/* "windows" (and the agent's extras) in r->message when the
    guest's command channel answers. One attempt, no waiting: use it to probe. */
 ASB_API int asb_guest_ping(const AsbGuestTarget *vm, AsbGuestResult *r);
 

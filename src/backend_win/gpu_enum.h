@@ -57,15 +57,6 @@ BOOL gpu_append_amd_gl_vk_driver_shares(const GpuList *gpu_list, GpuDriverShareL
 BOOL gpu_append_nvidia_drs_share(const GpuList *gpu_list, GpuDriverShareList *list);
 BOOL gpu_append_nvidia_graphics_shim_share(const GpuList *gpu_list, GpuDriverShareList *list);
 
-/* Append the host's lxss\lib directory as a synthetic Plan9 share entry
-   (name "AppSandbox.HostLxssLib") to a share list. Linux guests need
-   this — Microsoft's WSL installer stages NVIDIA's Linux userspace .so
-   files there and a Linux VM with GPU-PV mounts it at /usr/lib/wsl/lib.
-   Windows guests don't, so callers should gate on os_type. Returns TRUE
-   if the share was added, FALSE if the directory doesn't exist or the
-   list is full. */
-BOOL gpu_append_lxsslib_share(GpuDriverShareList *list);
-
 /* Append a synthetic Plan9 share (name "AppSandbox.GlLayers") exposing the
    host directory that holds the D3D mapping layers (OpenGLOn12/dxil/OpenCLOn12/
    clon12compiler/vulkan_dzn + dzn_icd.json) and the OpenGL ICD shim. The

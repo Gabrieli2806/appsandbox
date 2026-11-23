@@ -1,17 +1,10 @@
 #include "asb_events.h"
 #include <string.h>
 
-#ifdef _WIN32
 #include <windows.h>
 static SRWLOCK event_lock = SRWLOCK_INIT;
 #define LOCK() AcquireSRWLockExclusive(&event_lock)
 #define UNLOCK() ReleaseSRWLockExclusive(&event_lock)
-#else
-#include <pthread.h>
-static pthread_mutex_t event_lock = PTHREAD_MUTEX_INITIALIZER;
-#define LOCK() pthread_mutex_lock(&event_lock)
-#define UNLOCK() pthread_mutex_unlock(&event_lock)
-#endif
 
 typedef struct {
     unsigned id;

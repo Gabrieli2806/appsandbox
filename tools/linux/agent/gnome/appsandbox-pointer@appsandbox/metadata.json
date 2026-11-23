@@ -1,6 +1,0 @@
-{
-    "uuid": "appsandbox-pointer@appsandbox",
-    "name": "AppSandbox Pointer",
-    "description": "Synchronizes the viewer pointer with the guest desktop.",
-    "shell-version": ["50"]
-}

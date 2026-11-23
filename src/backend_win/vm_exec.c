@@ -168,9 +168,8 @@ static SOCKET channel_connect(const AsbGuestTarget *vm, unsigned channel, AsbGue
             set_message(r, ASB_GUEST_NO_CHANNEL,
                         "The guest agent in this VM is too old for commands and file copies. Update its guest "
                         "components: shut the VM down (shutdown_vm), then start it again - with \"Update guest "
-                        "components automatically\" on (Settings, the default) App Sandbox updates a Windows VM "
-                        "before it starts; otherwise use Update on the VM's page. Linux VMs created before this "
-                        "version need the appsandbox-agent rebuilt from the current sources.");
+                        "components automatically\" on (Settings, the default) App Sandbox updates the VM "
+                        "before it starts; otherwise use Update on the VM's page.");
         return INVALID_SOCKET;
     }
     nonblock = 0;

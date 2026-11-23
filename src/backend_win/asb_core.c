@@ -20,23 +20,6 @@
 #include "guest_tools.h"
 #include "asb_paths.h"
 
-/* Repository and ref the Ubuntu guest sources come from (see
-   Directory.Build.props). Given as bare tokens by the build, e.g.
-   ASB_SOURCE_REPO=owner/appsandbox, and turned into wide strings here. */
-#define ASB_STR_(x)    #x
-#define ASB_WIDEN_(s)  L ## s
-#define ASB_WIDEN(s)   ASB_WIDEN_(s)
-#define ASB_WSTR(x)    ASB_WIDEN(ASB_STR_(x))
-#ifdef ASB_SOURCE_REPO
-#define ASB_SOURCE_REPO_W ASB_WSTR(ASB_SOURCE_REPO)
-#else
-#define ASB_SOURCE_REPO_W L"jamesstringer90/appsandbox"
-#endif
-#ifdef ASB_SOURCE_REF
-#define ASB_SOURCE_REF_W ASB_WSTR(ASB_SOURCE_REF)
-#else
-#define ASB_SOURCE_REF_W L"main"
-#endif
 #include "vmms_cert.h"
 #include "vm_agent.h"
 #include "vm_ssh_proxy.h"
@@ -509,8 +492,7 @@ typedef struct _SOCKADDR_HV_PROBE {
     GUID ServiceId;
 } SOCKADDR_HV_PROBE;
 
-/* Frame channel: {A5B0CAFE-0002-4000-8000-000000000001} for Windows guests.
-   Linux guests resolve to the AF_VSOCK template GUID instead — see
+/* Frame channel: {A5B0CAFE-0002-4000-8000-000000000001}, see
    hcs_service_guid(os_type, 2, ...). */
 static const GUID IDD_FRAME_SERVICE_GUID =
     { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
@@ -1018,6 +1000,25 @@ static BOOL get_vm_disk_root(const wchar_t *disk_path, wchar_t *out)
     return wcslen(out) > 3;
 }
 
+/* Ubuntu guests (and the macOS host's guests) are no longer supported. A
+   record that still names one is opened as a manual-install VM ("Other"):
+   basic console, no agent, GPU, SSH or display driver, like the ones
+   asb_vm_create makes. */
+static void retire_unsupported_guest(VmInstance *vm)
+{
+    if (_wcsicmp(vm->os_type, L"Linux") != 0 && _wcsicmp(vm->os_type, L"macOS") != 0)
+        return;
+    asb_log(L"\"%s\": %s guests are no longer supported; the VM opens with the basic console (as \"Other\").",
+            vm->name, vm->os_type);
+    wcscpy_s(vm->os_type, ARRAYSIZE(vm->os_type), L"Other");
+    vm->gpu_mode = GPU_NONE;
+    vm->gpu_id[0] = L'\0';
+    vm->ssh_enabled = FALSE;
+    vm->ssh_deploy_key = FALSE;
+    vm->test_mode = FALSE;
+    vm->install_complete = TRUE;
+}
+
 static void load_vm_list(void)
 {
     wchar_t path[MAX_PATH];
@@ -1181,6 +1182,7 @@ static void load_vm_list(void)
             wchar_t snap_dir[MAX_PATH];
             VM_AT(i).handle = NULL;
             VM_AT(i).running = FALSE;
+            retire_unsupported_guest(&VM_AT(i));
             if (resolve_vm_gpu_selection(&VM_AT(i))) gpu_changed = TRUE;
             if (vm_load_state_json(VM_AT(i).vhdx_path))
                 VM_AT(i).install_complete = TRUE;
@@ -1613,12 +1615,7 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
 
     if (args->config.gpu_mode == GPU_DEFAULT) {
         gpu_get_driver_shares(&g_gpu_list, &args->config.gpu_shares);
-        /* For Linux guests, also expose the host's lxss\lib so the
-         * Linux agent mounts it at /usr/lib/wsl/lib alongside the
-         * per-GPU driver shares. Windows guests have no use for it. */
-        if (_wcsicmp(args->config.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&args->config.gpu_shares);
-        else if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
+        if (_wcsicmp(args->config.os_type, L"Windows") == 0) {
             gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &args->config.gpu_shares);
             gpu_append_nvidia_drs_share(&g_gpu_list, &args->config.gpu_shares);
             gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &args->config.gpu_shares);
@@ -1676,9 +1673,8 @@ static DWORD WINAPI start_vm_thread(LPVOID param)
         asb_vm_cleanup_network(vm);
     } else {
         asb_log(L"VM \"%s\" started.", vm->name);
-        /* Agent + IDD probe run for any OS: hcs_service_guid() resolves
-           per-OS to the correct HV-socket service GUID, and the in-VM
-           agent listens on AF_HYPERV (Windows) or AF_VSOCK (Linux). */
+        /* Agent + IDD probe: both return early for a manual-install VM,
+           which has no agent. */
         vm_agent_start(vm);
         idd_probe_start(vm);
         hcs_start_monitor(vm);
@@ -2162,1163 +2158,6 @@ done:
     return 0;
 }
 
-/* ---- Generate staging manifest for the Ubuntu direct-ISO->VHDX flow.
- *
- * 1. Calls stage_linux_agent_and_extras to populate <staging>/extras/
- *    with the full set of agent ELFs, kernel modules, DKMS source trees,
- *    systemd units, modprobe.d/modules-load.d, wsl-mesa, wsl-deps.
- *
- * 2. Walks <staging>/extras/ recursively and writes one tab-separated
- *    line per file to the manifest:
- *
- *        <host absolute path>\t/opt/appsandbox/<relative path>
- *
- *    iso-patch's stage_manifest_into_rootfs reads this and writes each
- *    file into the ext4 rootfs via ext4_writer_add_file.
- *
- *    Forward slashes used in the rootfs destination (Linux convention).
- *    Parent directories handled by iso-patch's ext4_mkdir_p.
- *
- * Returns the count of files staged, or -1 on error. */
-static int write_manifest_walk_dir(FILE *f,
-                                   const wchar_t *abs_dir,
-                                   const char *rootfs_rel_prefix)
-{
-    WIN32_FIND_DATAW fd;
-    wchar_t pattern[MAX_PATH];
-    int count = 0;
-    swprintf_s(pattern, MAX_PATH, L"%s\\*", abs_dir);
-    HANDLE h = FindFirstFileW(pattern, &fd);
-    if (h == INVALID_HANDLE_VALUE) return 0;
-    do {
-        if (fd.cFileName[0] == L'.' && (fd.cFileName[1] == L'\0' ||
-            (fd.cFileName[1] == L'.' && fd.cFileName[2] == L'\0'))) continue;
-        wchar_t abs_path[MAX_PATH];
-        swprintf_s(abs_path, MAX_PATH, L"%s\\%s", abs_dir, fd.cFileName);
-        /* Convert wide filename -> utf8 for the rootfs-side path. */
-        char fn_utf8[260];
-        WideCharToMultiByte(CP_UTF8, 0, fd.cFileName, -1,
-                            fn_utf8, sizeof(fn_utf8), NULL, NULL);
-        char rootfs_rel[1024];
-        snprintf(rootfs_rel, sizeof(rootfs_rel), "%s/%s",
-                 rootfs_rel_prefix, fn_utf8);
-        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            count += write_manifest_walk_dir(f, abs_path, rootfs_rel);
-        } else {
-            /* manifest line: <host path>\t<rootfs path>\n */
-            fwprintf(f, L"%s\t", abs_path);
-            /* Write rootfs path as wide for utf-8-bom-safe round-trip. */
-            wchar_t rootfs_wide[1024];
-            MultiByteToWideChar(CP_UTF8, 0, rootfs_rel, -1,
-                                rootfs_wide, 1024);
-            fwprintf(f, L"%s\n", rootfs_wide);
-            count++;
-        }
-    } while (FindNextFileW(h, &fd));
-    FindClose(h);
-    return count;
-}
-
-/* Write a small utf-8 file at <staging>\<basename>, and append a manifest
-   line mapping it into the rootfs at <rootfs_path>. Returns 1 on success,
-   0 on failure (and logs). Content is written WITHOUT a trailing newline
-   so the firstboot script can read it back unchanged. */
-static int stage_marker_file(FILE *manifest_f, const wchar_t *staging,
-                             const wchar_t *basename,
-                             const char *content, size_t content_len,
-                             const wchar_t *rootfs_path)
-{
-    wchar_t host[MAX_PATH];
-    swprintf_s(host, MAX_PATH, L"%s\\%s", staging, basename);
-    HANDLE h = CreateFileW(host, GENERIC_WRITE, 0, NULL,
-                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) {
-        asb_log(L"WARN: could not create marker on host: %s", basename);
-        return 0;
-    }
-    if (content_len > 0) {
-        DWORD wr = 0;
-        if (!WriteFile(h, content, (DWORD)content_len, &wr, NULL) || wr != content_len) {
-            CloseHandle(h);
-            asb_log(L"Error: could not write marker on host: %s", basename);
-            return 0;
-        }
-    }
-    CloseHandle(h);
-    return fwprintf(manifest_f, L"%s\t%s\n", host, rootfs_path) >= 0;
-}
-
-/* ====================================================================
- * Host locale / keyboard / timezone detection + Windows->Linux mapping
- *
- * At VM-create time we read the *current user's* Windows regional
- * settings and translate them to the Ubuntu guest's equivalents, which
- * firstboot applies (replacing the old hardcoded en_US / us / New_York).
- *
- * Language is GATED: Ubuntu's ISO only ships pre-installed UI
- * translations for 8 languages (de, en, es, fr, it, pt, ru, zh). If the
- * host language isn't one of those, the locale falls back to en_US.UTF-8
- * so the guest never lands on a half-translated desktop. Keyboard and
- * timezone are NOT gated — every XKB layout and IANA zone is present in
- * the squashfs offline, so they always match the host.
- * ==================================================================== */
-
-/* Map a BCP-47 tag (e.g. "en-GB", "zh-Hans-CN", "ja-JP") to a Linux
- * locale string ("en_GB.UTF-8"). Returns the en_US.UTF-8 fallback when
- * the primary language subtag is not one of the 8 preinstalled langs. */
-static void win_locale_to_linux(const wchar_t *bcp47, char *out, size_t out_sz)
-{
-    static const wchar_t *supported[] = {
-        L"de", L"en", L"es", L"fr", L"it", L"pt", L"ru", L"zh"
-    };
-    /* Default region per language when the host tag carries no region. */
-    static const struct { const wchar_t *lang; const char *loc; } defloc[] = {
-        { L"de", "de_DE" }, { L"en", "en_US" }, { L"es", "es_ES" },
-        { L"fr", "fr_FR" }, { L"it", "it_IT" }, { L"pt", "pt_PT" },
-        { L"ru", "ru_RU" }, { L"zh", "zh_CN" },
-    };
-
-    strcpy_s(out, out_sz, "en_US.UTF-8");
-    if (!bcp47 || !bcp47[0]) return;
-
-    /* Split into up to 4 subtags. */
-    wchar_t buf[64];
-    wcsncpy_s(buf, 64, bcp47, _TRUNCATE);
-    wchar_t lang[16] = L"", script[16] = L"", region[16] = L"";
-    {
-        wchar_t *ctx = NULL;
-        wchar_t *tok = wcstok_s(buf, L"-", &ctx);
-        if (tok) { wcsncpy_s(lang, 16, tok, _TRUNCATE); _wcslwr_s(lang, 16); }
-        while ((tok = wcstok_s(NULL, L"-", &ctx)) != NULL) {
-            size_t l = wcslen(tok);
-            if (l == 4) { wcsncpy_s(script, 16, tok, _TRUNCATE); }       /* script */
-            else if (l == 2 || l == 3) { wcsncpy_s(region, 16, tok, _TRUNCATE);
-                                         _wcsupr_s(region, 16); }        /* region */
-        }
-    }
-    if (!lang[0]) return;
-
-    /* Gate on the 8 supported languages. */
-    int ok = 0;
-    for (int i = 0; i < (int)(sizeof(supported)/sizeof(supported[0])); i++)
-        if (_wcsicmp(lang, supported[i]) == 0) { ok = 1; break; }
-    if (!ok) return;  /* keep en_US.UTF-8 fallback */
-
-    /* Chinese needs script->region resolution (zh_CN vs zh_TW etc.). */
-    if (_wcsicmp(lang, L"zh") == 0) {
-        const char *loc = "zh_CN";
-        if (region[0]) {
-            if      (!_wcsicmp(region, L"TW")) loc = "zh_TW";
-            else if (!_wcsicmp(region, L"HK")) loc = "zh_HK";
-            else if (!_wcsicmp(region, L"SG")) loc = "zh_SG";
-            else                               loc = "zh_CN";
-        } else if (script[0]) {
-            loc = (!_wcsicmp(script, L"Hant")) ? "zh_TW" : "zh_CN";
-        }
-        strcpy_s(out, out_sz, loc);
-        strcat_s(out, out_sz, ".UTF-8");
-        return;
-    }
-
-    if (region[0]) {
-        char lang_a[16], region_a[16];
-        WideCharToMultiByte(CP_UTF8, 0, lang, -1, lang_a, sizeof(lang_a), NULL, NULL);
-        WideCharToMultiByte(CP_UTF8, 0, region, -1, region_a, sizeof(region_a), NULL, NULL);
-        snprintf(out, out_sz, "%s_%s.UTF-8", lang_a, region_a);
-    } else {
-        for (int i = 0; i < (int)(sizeof(defloc)/sizeof(defloc[0])); i++)
-            if (_wcsicmp(lang, defloc[i].lang) == 0) {
-                snprintf(out, out_sz, "%s.UTF-8", defloc[i].loc);
-                break;
-            }
-    }
-}
-
-/* Map a Windows keyboard input-language id (LOWORD of an HKL) to an XKB
- * layout. Never gated — all layouts ship in xkb-data. Fallback "us". */
-static void langid_to_xkb(WORD langid, char *out, size_t out_sz)
-{
-    static const struct { WORD id; const char *xkb; } map[] = {
-        { 0x0409, "us" }, { 0x0809, "gb" }, { 0x0c09, "us" }, /* en-AU->us */
-        { 0x0407, "de" }, { 0x0c07, "at" }, { 0x0807, "ch" },
-        { 0x040c, "fr" }, { 0x0c0c, "ca" }, { 0x080c, "be" }, { 0x100c, "ch" },
-        { 0x0410, "it" }, { 0x0810, "ch" },
-        { 0x040a, "es" }, { 0x080a, "latam" }, { 0x0c0a, "es" },
-        { 0x0416, "br" }, { 0x0816, "pt" },
-        { 0x0411, "jp" }, { 0x0412, "kr" },
-        { 0x0804, "cn" }, { 0x0404, "tw" }, { 0x0c04, "cn" }, { 0x1404, "cn" },
-        { 0x0419, "ru" }, { 0x0415, "pl" },
-        { 0x0413, "nl" }, { 0x0813, "be" },
-        { 0x041d, "se" }, { 0x0414, "no" }, { 0x0406, "dk" }, { 0x040b, "fi" },
-        { 0x0405, "cz" }, { 0x040e, "hu" }, { 0x041f, "tr" },
-        { 0x0401, "ara" }, { 0x040d, "il" }, { 0x041e, "th" },
-        { 0x0422, "ua" }, { 0x0418, "ro" }, { 0x0408, "gr" },
-        { 0x0402, "bg" }, { 0x041a, "hr" }, { 0x041b, "sk" }, { 0x0424, "si" },
-        { 0x0425, "ee" }, { 0x0426, "lv" }, { 0x0427, "lt" },
-    };
-    strcpy_s(out, out_sz, "us");
-    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
-        if (map[i].id == langid) { strcpy_s(out, out_sz, map[i].xkb); return; }
-    /* Fall back on the primary language id (low 10 bits) for unlisted
-     * sublang variants. */
-    WORD prim = (WORD)(langid & 0x3ff);
-    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
-        if ((WORD)(map[i].id & 0x3ff) == prim) { strcpy_s(out, out_sz, map[i].xkb); return; }
-}
-
-static void host_keyboard_to_linux(DWORD klid, WORD language,
-                                   char *layout, size_t layout_sz,
-                                   char *variant, size_t variant_sz,
-                                   char *input_method, size_t input_method_sz)
-{
-    static const struct { DWORD klid; const char *layout, *variant; } variants[] = {
-        { 0x00010409, "us", "dvorak" }, { 0x00020409, "us", "intl" },
-        { 0x00000452, "gb", "extd" }, { 0x0000100c, "ch", "fr" },
-        { 0x00001009, "ca", "" }, { 0x00000c0c, "ca", "fr-legacy" },
-        { 0x00011009, "ca", "multix" }, { 0x0001041f, "tr", "f" },
-        { 0x00010419, "ru", "typewriter" }, { 0x00010405, "cz", "qwerty" },
-        { 0x00010415, "pl", "qwertz" }, { 0x00010410, "it", "ibm" },
-    };
-    langid_to_xkb((WORD)klid, layout, layout_sz);
-    variant[0] = input_method[0] = '\0';
-    for (int i = 0; i < ARRAYSIZE(variants); i++) {
-        if (variants[i].klid == klid) {
-            strcpy_s(layout, layout_sz, variants[i].layout);
-            strcpy_s(variant, variant_sz, variants[i].variant);
-            break;
-        }
-    }
-    switch (PRIMARYLANGID(language)) {
-    case LANG_CHINESE:
-        strcpy_s(layout, layout_sz, "us");
-        strcpy_s(input_method, input_method_sz,
-                 language == 0x0804 || language == 0x1004 ? "libpinyin" : "chewing");
-        break;
-    case LANG_JAPANESE: {
-        DWORD thread = GetWindowThreadProcessId(GetForegroundWindow(), NULL);
-        HKL keyboard = GetKeyboardLayout(thread);
-        /* Japanese IME supports both JIS and US physical keyboards. */
-        strcpy_s(layout, layout_sz,
-                 MapVirtualKeyExW(0x1a, MAPVK_VSC_TO_VK_EX, keyboard) == VK_OEM_3 ? "jp" : "us");
-        strcpy_s(input_method, input_method_sz, "mozc-jp");
-        break;
-    }
-    case LANG_KOREAN:
-        strcpy_s(layout, layout_sz, "kr");
-        strcpy_s(variant, variant_sz, "kr104");
-        strcpy_s(input_method, input_method_sz, "hangul");
-        break;
-    }
-}
-
-/* Map a Windows time-zone key name to an IANA zone. Never gated — all
- * zones ship in tzdata. Fallback "Etc/UTC". Subset of CLDR windowsZones
- * covering the common zones; unknown keys fall back to UTC. */
-static void win_tz_to_iana(const wchar_t *keyname, char *out, size_t out_sz)
-{
-    static const struct { const wchar_t *win; const char *iana; } map[] = {
-        { L"Dateline Standard Time",        "Etc/GMT+12" },
-        { L"Hawaiian Standard Time",        "Pacific/Honolulu" },
-        { L"Alaskan Standard Time",         "America/Anchorage" },
-        { L"Pacific Standard Time",         "America/Los_Angeles" },
-        { L"US Mountain Standard Time",     "America/Phoenix" },
-        { L"Mountain Standard Time",        "America/Denver" },
-        { L"Central Standard Time",         "America/Chicago" },
-        { L"Canada Central Standard Time",  "America/Regina" },
-        { L"Central America Standard Time", "America/Guatemala" },
-        { L"Eastern Standard Time",         "America/New_York" },
-        { L"US Eastern Standard Time",      "America/Indiana/Indianapolis" },
-        { L"Atlantic Standard Time",        "America/Halifax" },
-        { L"SA Pacific Standard Time",      "America/Bogota" },
-        { L"SA Eastern Standard Time",      "America/Cayenne" },
-        { L"E. South America Standard Time","America/Sao_Paulo" },
-        { L"Argentina Standard Time",       "America/Buenos_Aires" },
-        { L"Greenwich Standard Time",       "Atlantic/Reykjavik" },
-        { L"GMT Standard Time",             "Europe/London" },
-        { L"W. Europe Standard Time",       "Europe/Berlin" },
-        { L"Central Europe Standard Time",  "Europe/Budapest" },
-        { L"Romance Standard Time",         "Europe/Paris" },
-        { L"Central European Standard Time","Europe/Warsaw" },
-        { L"W. Central Africa Standard Time","Africa/Lagos" },
-        { L"FLE Standard Time",             "Europe/Kiev" },
-        { L"GTB Standard Time",             "Europe/Bucharest" },
-        { L"E. Europe Standard Time",       "Europe/Chisinau" },
-        { L"Russian Standard Time",         "Europe/Moscow" },
-        { L"Turkey Standard Time",          "Europe/Istanbul" },
-        { L"Israel Standard Time",          "Asia/Jerusalem" },
-        { L"Egypt Standard Time",           "Africa/Cairo" },
-        { L"South Africa Standard Time",    "Africa/Johannesburg" },
-        { L"Arabian Standard Time",         "Asia/Dubai" },
-        { L"Arab Standard Time",            "Asia/Riyadh" },
-        { L"Iran Standard Time",            "Asia/Tehran" },
-        { L"Pakistan Standard Time",        "Asia/Karachi" },
-        { L"India Standard Time",           "Asia/Kolkata" },
-        { L"Bangladesh Standard Time",      "Asia/Dhaka" },
-        { L"SE Asia Standard Time",         "Asia/Bangkok" },
-        { L"China Standard Time",           "Asia/Shanghai" },
-        { L"Singapore Standard Time",       "Asia/Singapore" },
-        { L"Taipei Standard Time",          "Asia/Taipei" },
-        { L"Tokyo Standard Time",           "Asia/Tokyo" },
-        { L"Korea Standard Time",           "Asia/Seoul" },
-        { L"W. Australia Standard Time",    "Australia/Perth" },
-        { L"AUS Central Standard Time",     "Australia/Darwin" },
-        { L"AUS Eastern Standard Time",     "Australia/Sydney" },
-        { L"E. Australia Standard Time",    "Australia/Brisbane" },
-        { L"New Zealand Standard Time",     "Pacific/Auckland" },
-        { L"UTC",                           "Etc/UTC" },
-    };
-    strcpy_s(out, out_sz, "Etc/UTC");
-    if (!keyname || !keyname[0]) return;
-    for (int i = 0; i < (int)(sizeof(map)/sizeof(map[0])); i++)
-        if (_wcsicmp(keyname, map[i].win) == 0) {
-            strcpy_s(out, out_sz, map[i].iana); return;
-        }
-}
-
-/* Read the current user's locale, keyboard layout, and timezone from the
- * Windows host and translate to Linux equivalents. Best-effort: any
- * failure leaves the corresponding output at its safe default. */
-static void detect_host_locale_settings(char *locale, size_t locale_sz,
-                                        char *xkb, size_t xkb_sz,
-                                        char *variant, size_t variant_sz,
-                                        char *input_method, size_t input_method_sz,
-                                        char *tz, size_t tz_sz)
-{
-    /* Locale (gated). */
-    {
-        wchar_t name[LOCALE_NAME_MAX_LENGTH] = L"";
-        if (GetUserDefaultLocaleName(name, LOCALE_NAME_MAX_LENGTH) > 0)
-            win_locale_to_linux(name, locale, locale_sz);
-        else
-            strcpy_s(locale, locale_sz, "en_US.UTF-8");
-        asb_log(L"Host locale: %s -> %hs", name[0] ? name : L"(none)", locale);
-    }
-    /* Keyboard (not gated). */
-    {
-        DWORD klid;
-        WORD langid;
-        wchar_t input_locale[128];
-        get_host_keyboard_settings(input_locale, ARRAYSIZE(input_locale), &klid, &langid);
-        host_keyboard_to_linux(klid, langid, xkb, xkb_sz,
-                                variant, variant_sz, input_method, input_method_sz);
-        asb_log(L"Host keyboard: %s -> %hs %hs %hs", input_locale, xkb, variant, input_method);
-    }
-    /* Timezone (not gated). */
-    {
-        DYNAMIC_TIME_ZONE_INFORMATION dtzi;
-        DWORD r = GetDynamicTimeZoneInformation(&dtzi);
-        if (r != TIME_ZONE_ID_INVALID && dtzi.TimeZoneKeyName[0])
-            win_tz_to_iana(dtzi.TimeZoneKeyName, tz, tz_sz);
-        else
-            strcpy_s(tz, tz_sz, "Etc/UTC");
-        asb_log(L"Host timezone: %s -> %hs",
-                (r != TIME_ZONE_ID_INVALID) ? dtzi.TimeZoneKeyName : L"(invalid)", tz);
-    }
-}
-
-static int generate_vhdx_manifest_ubuntu(const wchar_t *manifest_path,
-                                         const wchar_t *staging,
-                                         const wchar_t *res_dir,
-                                         BOOL ssh_enabled,
-                                         const wchar_t *admin_user,
-                                         const char *admin_pw_hash,
-                                         const char *host_locale,
-                                         const char *host_xkb,
-                                         const char *host_variant,
-                                         const char *host_input_method,
-                                         const char *host_tz,
-                                         const wchar_t *vm_name)
-{
-    wchar_t extras[MAX_PATH];
-    if (!admin_user || !admin_user[0] || !admin_pw_hash || !admin_pw_hash[0]) {
-        asb_log(L"Error: Linux username and password hash are required.");
-        return -1;
-    }
-    CreateDirectoryW(staging, NULL);
-    /* Populate staging\extras\ with the full agent + module + units tree. */
-    stage_linux_agent_and_extras(staging, res_dir, ssh_enabled);
-
-    swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
-    if (GetFileAttributesW(extras) == INVALID_FILE_ATTRIBUTES) {
-        asb_log(L"Linux extras dir was not created: %s", extras);
-        return -1;
-    }
-
-    FILE *f = NULL;
-    if (_wfopen_s(&f, manifest_path, L"w, ccs=UTF-8") != 0 || !f) {
-        asb_log(L"Failed to open Linux manifest for write: %s", manifest_path);
-        return -1;
-    }
-    /* Walk extras\ -> /opt/appsandbox/ */
-    int n = write_manifest_walk_dir(f, extras, "/opt/appsandbox");
-
-    /* Both account markers are required; do not build a guest that would use
-       firstboot's placeholder credentials because either marker is missing. */
-    {
-        char user_utf8[128];
-        if (!WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, admin_user, -1,
-                                 user_utf8, sizeof(user_utf8), NULL, NULL) ||
-            !stage_marker_file(f, staging, L"admin-user.marker",
-                                user_utf8, strlen(user_utf8),
-                                L"/etc/appsandbox-admin-user") ||
-            !stage_marker_file(f, staging, L"admin-hash.marker",
-                                admin_pw_hash, strlen(admin_pw_hash),
-                                L"/etc/appsandbox-admin-hash")) {
-            asb_log(L"Error: failed to stage Linux account credentials.");
-            fclose(f);
-            return -1;
-        }
-        n += 2;
-        asb_log(L"Linux admin: staged user=%s + $6$ hash marker", admin_user);
-    }
-
-    if (ssh_enabled) {
-        /* Zero-byte marker the firstboot keys on to install + enable
-         * openssh-server. */
-        n += stage_marker_file(f, staging, L"ssh-enabled.marker",
-                               NULL, 0, L"/etc/appsandbox-ssh-enabled");
-        asb_log(L"ssh_enabled: staged /etc/appsandbox-ssh-enabled marker");
-    }
-
-    /* Host-derived locale / keyboard / timezone. firstboot STEP 3 + 4
-     * read these; absent markers fall back to en_US.UTF-8 / us / Etc/UTC. */
-    if (host_locale && host_locale[0])
-        n += stage_marker_file(f, staging, L"locale.marker",
-                               host_locale, strlen(host_locale),
-                               L"/etc/appsandbox-locale");
-    if (host_xkb && host_xkb[0])
-        n += stage_marker_file(f, staging, L"keyboard.marker",
-                               host_xkb, strlen(host_xkb),
-                               L"/etc/appsandbox-keyboard");
-    if (host_variant && host_variant[0])
-        n += stage_marker_file(f, staging, L"keyboard-variant.marker",
-                               host_variant, strlen(host_variant),
-                               L"/etc/appsandbox-keyboard-variant");
-    if (host_input_method && host_input_method[0])
-        n += stage_marker_file(f, staging, L"input-method.marker",
-                               host_input_method, strlen(host_input_method),
-                               L"/etc/appsandbox-input-method");
-    if (host_tz && host_tz[0])
-        n += stage_marker_file(f, staging, L"timezone.marker",
-                               host_tz, strlen(host_tz),
-                               L"/etc/appsandbox-timezone");
-    asb_log(L"Host regional markers staged: locale=%hs keyboard=%hs tz=%hs",
-            host_locale ? host_locale : "(none)",
-            host_xkb ? host_xkb : "(none)",
-            host_tz ? host_tz : "(none)");
-
-    /* Hostname from the AppSandbox VM name (mirrors the Windows
-     * ComputerName path). The web UI already validates the name to a
-     * legal lowercase RFC-1123 hostname, so we write it verbatim;
-     * firstboot STEP 2 reads it and falls back to "ubuntu" if absent. */
-    if (vm_name && vm_name[0]) {
-        char host_utf8[256];
-        WideCharToMultiByte(CP_UTF8, 0, vm_name, -1,
-                            host_utf8, sizeof(host_utf8), NULL, NULL);
-        n += stage_marker_file(f, staging, L"hostname.marker",
-                               host_utf8, strlen(host_utf8),
-                               L"/etc/appsandbox-hostname");
-        asb_log(L"Linux hostname: staged /etc/appsandbox-hostname = %s", vm_name);
-    }
-
-    {
-        BOOL written = !ferror(f);
-        if (fclose(f) != 0) written = FALSE;
-        if (!written) return -1;
-    }
-    asb_log(L"Linux staging manifest written: %s (%d file(s))", manifest_path, n);
-    return n;
-}
-
-/* ---- Detect the Ubuntu release codename + kernel version from an ISO.
- *
- * Mounts the ISO read-only via VirtDisk, reads:
- *   - the only subdir under <iso>:\dists\        -> codename (e.g. "resolute")
- *   - <iso>:\pool\main\l\linux\linux-image-*-generic_*.deb
- *     -> kernel version (e.g. "7.0.0-14-generic") parsed from filename
- *
- * Returns 0 on success and fills the two output buffers; non-zero on
- * any error (caller logs + skips the build-deps prefetch).
- *
- * Output buffers should be at least 64 wchars each. */
-static int detect_iso_kernel(const wchar_t *iso_path,
-                             wchar_t *codename_out, size_t codename_cap,
-                             wchar_t *kver_out, size_t kver_cap,
-                             HANDLE *iso_out, wchar_t *drive_out)
-{
-    HANDLE iso_handle = INVALID_HANDLE_VALUE;
-    DWORD cdrom_before, cdrom_after, newly;
-    wchar_t iso_drive = 0;
-    int rc = -1;
-
-    codename_out[0] = 0;
-    kver_out[0]     = 0;
-    *iso_out = INVALID_HANDLE_VALUE;
-    *drive_out = 0;
-
-    /* Snapshot current CD-ROM drive letters before mount. */
-    cdrom_before = 0;
-    for (int i = 0; i < 26; i++) {
-        wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", (wchar_t)(L'A' + i));
-        if (GetDriveTypeW(root) == DRIVE_CDROM) cdrom_before |= (1u << i);
-    }
-
-    /* Mount the ISO via VirtDisk. */
-    {
-        VIRTUAL_STORAGE_TYPE st;
-        OPEN_VIRTUAL_DISK_PARAMETERS op;
-        ZeroMemory(&st, sizeof(st));
-        st.DeviceId = VIRTUAL_STORAGE_TYPE_DEVICE_ISO;
-        ZeroMemory(&op, sizeof(op));
-        op.Version = OPEN_VIRTUAL_DISK_VERSION_1;
-
-        if (OpenVirtualDisk(&st, iso_path,
-                            VIRTUAL_DISK_ACCESS_READ,
-                            OPEN_VIRTUAL_DISK_FLAG_NONE,
-                            &op, &iso_handle) != ERROR_SUCCESS) {
-            asb_log(L"detect_iso_kernel: OpenVirtualDisk failed (%lu)",
-                    GetLastError());
-            return -1;
-        }
-        if (AttachVirtualDisk(iso_handle, NULL,
-                              ATTACH_VIRTUAL_DISK_FLAG_READ_ONLY,
-                              0, NULL, NULL) != ERROR_SUCCESS) {
-            asb_log(L"detect_iso_kernel: AttachVirtualDisk failed (%lu)",
-                    GetLastError());
-            CloseHandle(iso_handle);
-            return -1;
-        }
-    }
-
-    /* Wait for the drive letter (≤10 s). */
-    for (int i = 0; i < 20; i++) {
-        cdrom_after = 0;
-        for (int b = 0; b < 26; b++) {
-            wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", (wchar_t)(L'A' + b));
-            if (GetDriveTypeW(root) == DRIVE_CDROM) cdrom_after |= (1u << b);
-        }
-        newly = cdrom_after & ~cdrom_before;
-        if (newly) {
-            for (int b = 0; b < 26; b++) {
-                if (newly & (1u << b)) { iso_drive = (wchar_t)(L'A' + b); break; }
-            }
-            break;
-        }
-        Sleep(500);
-    }
-    if (!iso_drive) {
-        asb_log(L"detect_iso_kernel: ISO mounted but no drive letter");
-        goto cleanup;
-    }
-
-    /* Wait for the filesystem to become accessible (the drive letter
-     * appears before the volume's FS is ready to serve directory
-     * enumeration — without this wait, FindFirstFileW on <drive>:\dists\
-     * returns ERROR_PATH_NOT_FOUND even though the path exists). Same
-     * pattern as ubuntu_vhdx.c's iso mount: poll GetVolumeInformationW
-     * until it succeeds. Up to ~15 s. */
-    {
-        wchar_t root[4]; swprintf_s(root, 4, L"%c:\\", iso_drive);
-        wchar_t vol_label[64];
-        int ready = 0;
-        for (int i = 0; i < 30; i++) {
-            if (GetVolumeInformationW(root, vol_label, 64, NULL, NULL, NULL, NULL, 0)) {
-                ready = 1; break;
-            }
-            Sleep(500);
-        }
-        if (!ready) {
-            asb_log(L"detect_iso_kernel: %c:\\ never became accessible", iso_drive);
-            goto cleanup;
-        }
-    }
-
-    /* 1. Codename: first non-dotfile subdir under <iso>:\dists\ */
-    {
-        wchar_t spec[MAX_PATH];
-        swprintf_s(spec, MAX_PATH, L"%c:\\dists\\*", iso_drive);
-        WIN32_FIND_DATAW fd;
-        HANDLE fh = FindFirstFileW(spec, &fd);
-        if (fh == INVALID_HANDLE_VALUE) {
-            asb_log(L"detect_iso_kernel: %c:\\dists\\ not found", iso_drive);
-            goto cleanup;
-        }
-        do {
-            if (!(fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)) continue;
-            if (fd.cFileName[0] == L'.') continue;
-            wcsncpy_s(codename_out, codename_cap, fd.cFileName, _TRUNCATE);
-            break;
-        } while (FindNextFileW(fh, &fd));
-        FindClose(fh);
-        if (!codename_out[0]) {
-            asb_log(L"detect_iso_kernel: no release subdir under dists/");
-            goto cleanup;
-        }
-    }
-
-    /* 2. Kernel version from linux-headers-<X.Y.Z-generic>_*_amd64.deb
-     *    in pool/main/l/linux/. We use linux-headers- not linux-image-
-     *    because the image .deb lives under pool/main/l/linux-signed/
-     *    on signed-kernel Ubuntu releases, but the headers (which we
-     *    need anyway for DKMS builds) are in pool/main/l/linux/ on all
-     *    release flavors. The kver substring is identical.
-     *
-     *    Filename pattern (literal example):
-     *      linux-headers-7.0.0-14-generic_7.0.0-14.14_amd64.deb
-     *
-     *    FindFirstFileW doesn't reliably handle multi-`*` patterns on
-     *    ISO 9660; glob with single wildcard and filter for "-generic_". */
-    {
-        wchar_t spec[MAX_PATH];
-        swprintf_s(spec, MAX_PATH,
-            L"%c:\\pool\\main\\l\\linux\\linux-headers-*.deb", iso_drive);
-        WIN32_FIND_DATAW fd;
-        HANDLE fh = FindFirstFileW(spec, &fd);
-        if (fh == INVALID_HANDLE_VALUE) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*.deb in pool/main/l/linux");
-            goto cleanup;
-        }
-        int found = 0;
-        do {
-            /* Skip the meta-package "linux-headers-X.Y.Z_<ver>_all.deb"
-             * (no "-generic_"). We want the per-flavor headers. */
-            if (!wcsstr(fd.cFileName, L"-generic_")) continue;
-            const wchar_t *p = wcsstr(fd.cFileName, L"linux-headers-");
-            if (!p) continue;
-            p += wcslen(L"linux-headers-");
-            const wchar_t *u = wcschr(p, L'_');
-            if (!u) continue;
-            size_t n = (size_t)(u - p);
-            if (n == 0 || n >= kver_cap) continue;
-            wcsncpy_s(kver_out, kver_cap, p, n);
-            kver_out[n] = 0;
-            found = 1;
-            break;
-        } while (FindNextFileW(fh, &fd));
-        FindClose(fh);
-        if (!found) {
-            asb_log(L"detect_iso_kernel: no linux-headers-*-generic_*.deb found");
-            goto cleanup;
-        }
-    }
-
-    asb_log(L"detect_iso_kernel: codename=%s kver=%s", codename_out, kver_out);
-    *iso_out = iso_handle;
-    *drive_out = iso_drive;
-    iso_handle = INVALID_HANDLE_VALUE;
-    rc = 0;
-
-cleanup:
-    if (iso_handle != INVALID_HANDLE_VALUE) {
-        DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-        CloseHandle(iso_handle);
-    }
-    return rc;
-}
-
-/* ---- Spawn iso-patch.exe with one of the --prefetch-* modes and
- * block. No cache layer: each call writes directly into <out_dir>
- * which is a subdir of the per-VM staging extras dir.
- *
- * args: extra argv tail (no quotes — caller is responsible for safe paths).
- * Returns 0 on success; -1 on any failure. Logs progress to asb_log. */
-static int spawn_iso_patch_prefetch(const wchar_t *args)
-{
-    wchar_t exe_dir[MAX_PATH];
-    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
-    { wchar_t *s = wcsrchr(exe_dir, L'\\'); if (s) *s = L'\0'; }
-
-    wchar_t cmdline[2048];
-    swprintf_s(cmdline, 2048,
-        L"\"%s\\iso-patch.exe\" %s", exe_dir, args);
-
-    STARTUPINFOW si = { sizeof(si) };
-    PROCESS_INFORMATION pi = { 0 };
-    si.dwFlags = STARTF_USESHOWWINDOW;
-    si.wShowWindow = SW_HIDE;
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        asb_log(L"prefetch: CreateProcess failed (%lu) for: %s",
-                GetLastError(), cmdline);
-        return -1;
-    }
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    DWORD ec = 1;
-    GetExitCodeProcess(pi.hProcess, &ec);
-    CloseHandle(pi.hThread);
-    CloseHandle(pi.hProcess);
-    return ec == 0 ? 0 : -1;
-}
-
-/* ---- Run iso-patch.exe --ubuntu-to-vhdx and stream its progress. ----
- *
- * Parallel helper for the Linux flow. Spawns iso-patch.exe, parses
- * STATUS:/PROGRESS:/ERROR:/DONE: stdout lines, updates the per-VM
- * progress callback. Same shape as the iso-patch invocation block
- * inside vhdx_create_thread, but for the Ubuntu mode (no LANG: handling).
- */
-static HRESULT run_iso_patch_ubuntu(const wchar_t *iso_path,
-                                     const wchar_t *vhdx_path,
-                                     ULONG hdd_gb,
-                                     const wchar_t *manifest_path,
-                                     UINT64 vm_unique_id,
-                                     wchar_t *error_msg, size_t error_msg_cap)
-{
-    wchar_t exe_dir[MAX_PATH], cmdline[2048];
-    wchar_t *slash;
-    STARTUPINFOW si;
-    PROCESS_INFORMATION pi;
-    HANDLE hReadPipe = INVALID_HANDLE_VALUE, hWritePipe = INVALID_HANDLE_VALUE;
-    SECURITY_ATTRIBUTES sa;
-    BYTE line_buf[4096];
-    int pos = 0;
-    DWORD bytes_read = 0, exit_code = 0;
-    HRESULT result = E_FAIL;
-
-    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
-    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
-
-    if (manifest_path && manifest_path[0]) {
-        swprintf_s(cmdline, 2048,
-            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu --stage \"%s\"",
-            exe_dir, iso_path, vhdx_path, hdd_gb, manifest_path);
-    } else {
-        swprintf_s(cmdline, 2048,
-            L"\"%s\\iso-patch.exe\" --ubuntu-to-vhdx \"%s\" --output \"%s\" --size-gb %lu",
-            exe_dir, iso_path, vhdx_path, hdd_gb);
-    }
-
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = NULL;
-    sa.bInheritHandle = TRUE;
-    if (!CreatePipe(&hReadPipe, &hWritePipe, &sa, 0)) {
-        if (error_msg) swprintf_s(error_msg, error_msg_cap, L"CreatePipe failed (%lu)", GetLastError());
-        return HRESULT_FROM_WIN32(GetLastError());
-    }
-    SetHandleInformation(hReadPipe, HANDLE_FLAG_INHERIT, 0);
-
-    ZeroMemory(&si, sizeof(si));
-    si.cb = sizeof(si);
-    si.dwFlags = STARTF_USESTDHANDLES;
-    si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
-    si.hStdOutput = hWritePipe;
-    si.hStdError = hWritePipe;
-    ZeroMemory(&pi, sizeof(pi));
-
-    if (!CreateProcessW(NULL, cmdline, NULL, NULL, TRUE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi)) {
-        DWORD err = GetLastError();
-        if (error_msg) swprintf_s(error_msg, error_msg_cap, L"Failed to launch iso-patch.exe (%lu)", err);
-        CloseHandle(hReadPipe);
-        CloseHandle(hWritePipe);
-        return HRESULT_FROM_WIN32(err);
-    }
-    CloseHandle(hWritePipe);
-    hWritePipe = INVALID_HANDLE_VALUE;
-
-    {
-        char *cbuf = (char *)line_buf;
-        int cbuf_size = (int)sizeof(line_buf);
-        while (ReadFile(hReadPipe, cbuf + pos, (DWORD)(cbuf_size - pos - 1), &bytes_read, NULL) && bytes_read > 0) {
-            int end = pos + (int)bytes_read;
-            int start = 0;
-            cbuf[end] = '\0';
-            for (int ci = start; ci < end; ci++) {
-                if (cbuf[ci] == '\n' || cbuf[ci] == '\r') {
-                    cbuf[ci] = '\0';
-                    if (ci > start) {
-                        char *line = cbuf + start;
-                        if (strncmp(line, "PROGRESS:", 9) == 0) {
-                            int pct = atoi(line + 9);
-                            /* Match the Windows path exactly: staging flag
-                               flips only on the literal "Staging" substring,
-                               so genuine staging phases set it (e.g.
-                               "Staging grub modules") and ext4/squashfs
-                               progress lines do not. */
-                            BOOL is_staging = (strstr(line + 9, "Staging") != NULL);
-                            VmInstance *pvm;
-                            EnterCriticalSection(&g_cs);
-                            pvm = asb_find_vm_by_id(vm_unique_id);
-                            if (pvm) {
-                                pvm->vhdx_progress = pct;
-                                pvm->vhdx_staging = is_staging;
-                            }
-                            LeaveCriticalSection(&g_cs);
-                            if (pvm)
-                                notify_progress(vm_handle(pvm), pct, is_staging, g_progress_ud);
-                        } else if (strncmp(line, "ERROR:", 6) == 0) {
-                            asb_log(L"iso-patch: ERROR: %S", line + 6);
-                            if (error_msg && error_msg[0] == L'\0')
-                                MultiByteToWideChar(CP_ACP, 0, line + 6, -1, error_msg, (int)error_msg_cap);
-                            result = E_FAIL;
-                        } else if (strncmp(line, "DONE:", 5) == 0) {
-                            result = S_OK;
-                        } else if (strncmp(line, "STATUS:", 7) == 0) {
-                            /* Unlike the Windows --to-vhdx path there is no
-                               in-guest installer log to fall back on, so the
-                               iso-patch status lines (source squashfs, detected
-                               kernel, ingest totals, ...) are the only host-side
-                               record of how the Linux disk was built. */
-                            asb_log(L"iso-patch: %S", line + 7);
-                        }
-                    }
-                    start = ci + 1;
-                    if (start < end && (cbuf[start] == '\n' || cbuf[start] == '\r')) start++;
-                }
-            }
-            if (start < end) { memmove(cbuf, cbuf + start, end - start); pos = end - start; }
-            else pos = 0;
-        }
-    }
-
-    CloseHandle(hReadPipe);
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    GetExitCodeProcess(pi.hProcess, &exit_code);
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-
-    if (exit_code != 0 && result != S_OK) {
-        if (error_msg && error_msg[0] == L'\0')
-            swprintf_s(error_msg, error_msg_cap, L"iso-patch.exe exited with code %lu", exit_code);
-        result = E_FAIL;
-    }
-    return result;
-}
-
-/* ---- Background Linux create thread (direct ISO -> VHDX) ----
- *
- * Spawns iso-patch.exe --ubuntu-to-vhdx, which builds a fully-installed
- * ext4 rootfs + signed shim/grub ESP directly from the user-picked
- * Ubuntu Desktop ISO. Host-side install (squashfs -> ext4), no in-guest
- * installer and no user interaction.
- *
- * First-boot configuration (hostname, user, network, OOBE skip,
- * grub-install/update-grub) runs from a one-shot systemd unit planted
- * into the rootfs at build time.
- */
-typedef struct {
-    VmConfig    config;
-    UINT64      vm_unique_id;
-    wchar_t     vhdx_dir[MAX_PATH];
-    wchar_t     endpoint_guid[64];
-    GUID        network_id;
-    GUID        endpoint_id;
-    BOOL        has_network;
-    int         requested_network_mode; /* what the user chose; a failed attach must not replace it */
-    wchar_t     net_adapter[256];
-    HRESULT     result;
-    wchar_t     error_msg[512];
-    VmInstance *vm_inst;
-    BOOL        vhdx_created;
-    char        host_locale[64];
-    char        host_xkb[32];
-    char        host_variant[32];
-    char        host_input_method[64];
-    char        host_tz[64];
-} LinuxCreateArgs;
-
-static DWORD WINAPI linux_create_thread(LPVOID param)
-{
-    LinuxCreateArgs *args = (LinuxCreateArgs *)param;
-    HRESULT hr;
-    wchar_t exe_dir[MAX_PATH], res_dir[MAX_PATH];
-    wchar_t staging[MAX_PATH], manifest[MAX_PATH];
-    wchar_t *slash;
-
-    /* ---- 1. Build the VHDX directly from the Ubuntu ISO via iso-patch.
-       Host-side install (squashfs -> ext4), no in-guest installer. The
-       first-boot service planted inside the rootfs handles per-VM
-       configuration. ---- */
-    asb_log(L"Building Linux VHDX from %s (size=%lu GB)...",
-            args->config.image_path, args->config.hdd_gb);
-    DeleteFileW(args->config.vhdx_path);
-    /* resources_iso_path is unused for the direct-ISO flow but the field
-       still exists in the config; clear it so hcs_vm doesn't try to attach. */
-    args->config.resources_iso_path[0] = L'\0';
-
-    /* (Detection + prefetch happen below, after we've decided on the
-       staging dir, since the prefetches write directly into it.) */
-
-    /* ---- 1a. Set up staging dir + run 3 prefetches that populate it
-       directly (no host cache). Order doesn't matter functionally;
-       sequential for simpler logging. Failures are non-fatal — VM
-       still builds; firstboot STEP 17 verification will flag any
-       missing artifacts in the rootfs. ---- */
-    swprintf_s(staging, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir);
-    CreateDirectoryW(staging, NULL);
-    swprintf_s(manifest, MAX_PATH, L"%s\\manifest.txt", staging);
-
-    {
-        wchar_t extras[MAX_PATH], args_buf[2048];
-        swprintf_s(extras, MAX_PATH, L"%s\\extras", staging);
-        CreateDirectoryW(extras, NULL);
-
-        /* Prefetch 1: Linux sources from GitHub. Writes agent-src/,
-           asb_drm-src/, dxgkrnl-src/, systemd/, modprobe.d-asb_drm.conf,
-           50-appsandbox-gpu, org.gnome.Shell-no-gpu.conf, appsandbox-gpu,
-           wsl-mesa.tar.zst directly into <staging>/extras/. */
-        asb_log(L"Prefetch 1/3: downloading Linux sources from GitHub (%s @ %s)...",
-                ASB_SOURCE_REPO_W, ASB_SOURCE_REF_W);
-        swprintf_s(args_buf, 2048,
-            L"--prefetch-repo --repo \"%s\" --branch \"%s\" --out-dir \"%s\"",
-            ASB_SOURCE_REPO_W, ASB_SOURCE_REF_W, extras);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-repo failed (agent + DKMS build will fail)");
-
-        /* Prefetch 2: apt build-deps closure from archive.ubuntu.com.
-           Needs (codename, kernel) detected from the ISO. */
-        asb_log(L"Prefetch 2/3: apt build-deps closure...");
-        wchar_t codename[64] = L"", kver[64] = L"";
-        HANDLE iso_handle = INVALID_HANDLE_VALUE;
-        wchar_t iso_drive = 0;
-        if (detect_iso_kernel(args->config.image_path,
-                              codename, ARRAYSIZE(codename),
-                              kver,     ARRAYSIZE(kver),
-                              &iso_handle, &iso_drive) == 0) {
-            wchar_t apt_out[MAX_PATH];
-            swprintf_s(apt_out, MAX_PATH, L"%s\\local-apt-extras", extras);
-            swprintf_s(args_buf, 2048,
-                L"--prefetch-build-deps --codename \"%s\" --kernel \"%s\" "
-                L"--out-dir \"%s\" --iso-root \"%c:\"",
-                codename, kver, apt_out, iso_drive);
-            if (spawn_iso_patch_prefetch(args_buf) != 0)
-                asb_log(L"WARN: prefetch-build-deps failed");
-            DetachVirtualDisk(iso_handle, DETACH_VIRTUAL_DISK_FLAG_NONE, 0);
-            CloseHandle(iso_handle);
-        } else {
-            asb_log(L"WARN: could not detect ISO kernel — skipping build-deps");
-        }
-
-        /* Prefetch 3: wsl-deps proprietary .so libs from Microsoft NuGet. */
-        asb_log(L"Prefetch 3/3: wsl-deps .so libs...");
-        wchar_t wsl_out[MAX_PATH];
-        swprintf_s(wsl_out, MAX_PATH, L"%s\\wsl-deps", extras);
-        swprintf_s(args_buf, 2048,
-            L"--prefetch-wsl-deps --out-dir \"%s\"", wsl_out);
-        if (spawn_iso_patch_prefetch(args_buf) != 0)
-            asb_log(L"WARN: prefetch-wsl-deps failed");
-    }
-
-    GetModuleFileNameW(g_dll_module, exe_dir, MAX_PATH);
-    slash = wcsrchr(exe_dir, L'\\'); if (slash) *slash = L'\0';
-    swprintf_s(res_dir, MAX_PATH, L"%s\\resources", exe_dir);
-    if (GetFileAttributesW(res_dir) == INVALID_FILE_ATTRIBUTES)
-        wcscpy_s(res_dir, MAX_PATH, exe_dir);
-
-    /* Hash the modal-supplied admin password into glibc $6$ format so the
-       firstboot can drop it straight into /etc/shadow via `usermod -p`.
-       Plaintext is wiped immediately after — same pattern as the Windows
-       autounattend path. */
-    char admin_pw_hash[256] = {0};
-    if (!args->config.admin_pass[0] ||
-        !unix_password_hash(args->config.admin_pass, admin_pw_hash, sizeof(admin_pw_hash))) {
-        SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
-        SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
-        args->result = E_FAIL;
-        wcscpy_s(args->error_msg, ARRAYSIZE(args->error_msg),
-                  L"Failed to hash the Linux password.");
-        goto done;
-    }
-    SecureZeroMemory(args->config.admin_pass, sizeof(args->config.admin_pass));
-
-    int n_staged = generate_vhdx_manifest_ubuntu(manifest, staging, res_dir,
-                                                  args->config.ssh_enabled,
-                                                  args->config.admin_user,
-                                                  admin_pw_hash,
-                                                  args->host_locale, args->host_xkb,
-                                                  args->host_variant, args->host_input_method,
-                                                  args->host_tz,
-                                                  args->config.name);
-    SecureZeroMemory(admin_pw_hash, sizeof(admin_pw_hash));
-    if (n_staged < 0) {
-        args->result = E_FAIL;
-        swprintf_s(args->error_msg, 512, L"Failed to generate Linux staging manifest");
-        goto done;
-    }
-
-    hr = run_iso_patch_ubuntu(args->config.image_path, args->config.vhdx_path,
-                              args->config.hdd_gb,
-                              n_staged > 0 ? manifest : NULL,
-                              args->vm_unique_id, args->error_msg, 512);
-    if (FAILED(hr)) {
-        args->result = hr;
-        if (args->error_msg[0] == L'\0')
-            swprintf_s(args->error_msg, 512,
-                       L"Failed to build Linux VHDX from ISO (0x%08X)", hr);
-        goto done;
-    }
-    args->vhdx_created = TRUE;
-
-    /* The Ubuntu ISO has its own bootable EFI files; if we leave image_path
-       set, hcs_vm.c attaches it at SCSI slot 1 alongside the installed
-       VHDX, and Hyper-V's UEFI firmware sometimes picks the ISO's
-       /EFI/BOOT/BOOTX64.EFI instead of ours. Detach the ISO from the
-       runtime VM — the installed VHDX is fully self-bootable. */
-    args->config.image_path[0] = L'\0';
-
-    /* ---- 2. NAT IP allocation. The chosen static /24 address is baked
-       into the HCN endpoint policy below and pushed to the guest at
-       runtime by the agent (set_ip -> static netplan); the guest never
-       DHCPs in NAT mode. ---- */
-    VmInstance *network_vm = asb_find_vm_by_id(args->vm_unique_id);
-    if (args->config.network_mode == NET_NAT && network_vm) {
-        if (allocate_nat_ip(network_vm)) {
-            asb_log(L"Allocated NAT IP %S for new VM.", network_vm->nat_ip);
-            save_vm_list();
-        }
-    }
-
-    /* ---- 5. Network + endpoint (same as vhdx_create_thread:1114). ---- */
-    if (args->config.network_mode != NET_NONE) {
-        char *nat_ip = network_vm ? network_vm->nat_ip : NULL;
-        switch (args->config.network_mode) {
-        case NET_NAT:      hr = hcn_create_nat_network(&args->network_id); break;
-        case NET_INTERNAL: hr = hcn_create_internal_network(&args->network_id); break;
-        case NET_EXTERNAL: hr = hcn_create_external_network(&args->network_id, args->net_adapter); break;
-        default:           hr = E_INVALIDARG; break;
-        }
-        if (SUCCEEDED(hr)) {
-            BOOL is_nat = (args->config.network_mode == NET_NAT);
-            size_t ip_size = network_vm ? sizeof(network_vm->nat_ip) : 0;
-            hr = try_endpoint_with_retry(&args->network_id, &args->endpoint_id,
-                                          args->endpoint_guid, 64,
-                                          nat_ip, ip_size, is_nat,
-                                          args->config.mac_address);
-            if (SUCCEEDED(hr)) {
-                args->has_network = TRUE;
-                if (is_nat) save_vm_list();
-            }
-        }
-        if (FAILED(hr)) {
-            asb_log(L"Warning: network unavailable (0x%08X); \"%s\" starts without it this time.",
-                    hr, args->config.name);
-            args->requested_network_mode = args->config.network_mode;
-            args->config.network_mode = NET_NONE;
-        }
-    }
-
-    /* ---- 6. HCS create + start (same as vhdx_create_thread:1145). ---- */
-    {
-        VmInstance temp_inst;
-        ZeroMemory(&temp_inst, sizeof(temp_inst));
-
-        hr = (args->endpoint_guid[0] != L'\0')
-            ? hcs_create_vm_with_endpoint(&args->config, args->endpoint_guid, &temp_inst)
-            : hcs_create_vm(&args->config, &temp_inst);
-        if (FAILED(hr)) {
-            args->result = hr;
-            swprintf_s(args->error_msg, 512, L"Failed to create HCS VM (0x%08X)", hr);
-            if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
-                args->endpoint_guid[0] = L'\0';
-            }
-            goto done;
-        }
-
-        hr = hcs_start_vm(&temp_inst);
-        if (FAILED(hr)) {
-            args->result = hr;
-            swprintf_s(args->error_msg, 512, L"Failed to start VM (0x%08X)", hr);
-            hcs_close_vm(&temp_inst);
-            if (args->has_network) {
-                hcn_delete_endpoint(&args->endpoint_id);
-                args->has_network = FALSE;
-                args->endpoint_guid[0] = L'\0';
-            }
-            goto done;
-        }
-
-        {
-            VmInstance *heap_inst = (VmInstance *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(VmInstance));
-            if (heap_inst) memcpy(heap_inst, &temp_inst, sizeof(VmInstance));
-            args->vm_inst = heap_inst;
-        }
-
-        args->result = S_OK;
-    }
-
-done:
-    /* Clean up staging dir (sources, packages and the account markers). */
-    {
-        wchar_t staging_dir[MAX_PATH];
-        if (swprintf_s(staging_dir, MAX_PATH, L"%s\\_vhdx_staging", args->vhdx_dir) > 0)
-            remove_dir_recursive(staging_dir);
-    }
-    {
-        VmInstance *inst;
-        int idx;
-
-        /* Unregistering waits for running HCS callbacks, which can take g_cs
-           (save_vm_list): never do it while holding the lock. */
-        if (args->vm_inst) hcs_unregister_vm_callback(args->vm_inst);
-        EnterCriticalSection(&g_cs);
-        inst = asb_find_vm_by_id(args->vm_unique_id);
-        idx = vm_index_of(vm_handle(inst));
-        if (inst) {
-            inst->building_vhdx = FALSE;
-            wcscpy_s(inst->mac_address, ARRAYSIZE(inst->mac_address), args->config.mac_address);
-
-            if (SUCCEEDED(args->result)) {
-                VmInstance *heap_inst = args->vm_inst;
-                if (heap_inst) {
-                    inst->handle = heap_inst->handle;
-                    inst->runtime_id = heap_inst->runtime_id;
-                    inst->running = TRUE;
-                    inst->gpu_mode = heap_inst->gpu_mode;
-                    wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), heap_inst->gpu_id);
-                    update_vm_gpu_name(inst);
-                    /* A failed attach is for this boot only: keep the saved choice. */
-                    inst->network_mode = args->requested_network_mode
-                        ? args->requested_network_mode : heap_inst->network_mode;
-                    inst->network_id = args->network_id;
-                    inst->endpoint_id = args->endpoint_id;
-                    HeapFree(GetProcessHeap(), 0, heap_inst);
-                    args->vm_inst = NULL;
-                    hcs_register_vm_callback(inst);
-                }
-                LeaveCriticalSection(&g_cs);
-
-                hcs_start_monitor(inst);
-                vm_agent_start(inst);
-                idd_probe_start(inst);
-                asb_log(L"VM \"%s\" created and started.", inst->name);
-                save_vm_list();
-            } else if (args->vhdx_created) {
-                LeaveCriticalSection(&g_cs);
-                asb_log(L"VM \"%s\" created but failed to start: %s", inst->name, args->error_msg);
-                asb_log(L"You can adjust settings and start it manually.");
-                if (args->result == (HRESULT)0x800705AF)
-                    asb_alert(L"The host doesn't have enough resources to start this VM.");
-                else
-                    asb_alert(L"Failed to start VM, check its configuration.");
-                save_vm_list();
-            } else {
-                asb_log(L"Error creating VM \"%s\": %s", inst->name, args->error_msg);
-                remove_vm_record(idx);
-                inst = NULL;
-                LeaveCriticalSection(&g_cs);
-                remove_dir_recursive(args->vhdx_dir);
-                save_vm_list();
-                notify_removed(idx, g_removed_ud);
-            }
-
-            if (inst) notify_state(vm_handle(inst), inst->running, g_state_ud);
-        } else {
-            /* VM was deleted while building: don't leak the started HCS
-               handle copy, and don't write into a stale slot. */
-            LeaveCriticalSection(&g_cs);
-            if (args->vm_inst) {
-                hcs_close_vm(args->vm_inst);
-                HeapFree(GetProcessHeap(), 0, args->vm_inst);
-                args->vm_inst = NULL;
-            }
-        }
-    }
-
-    HeapFree(GetProcessHeap(), 0, args);
-    return 0;
-}
-
 /* ================================================================
  * Public API Implementation
  * ================================================================ */
@@ -3611,9 +2450,9 @@ ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
     const wchar_t *username, const wchar_t *vm_name, BOOL is_template)
 {
     size_t length, i;
-    BOOL is_linux = os_type && _wcsicmp(os_type, L"Linux") == 0;
     BOOL only_dots_spaces = TRUE;
 
+    (void)os_type;   /* every guest with an account is Windows */
     username = trimmed_username(username, &length);
     if (!length) return L"Username is required.";
     for (i = 0; i < length; i++) {
@@ -3624,38 +2463,6 @@ ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
         } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
             return L"Username contains invalid Unicode.";
         }
-    }
-    if (is_linux) {
-        /* Canonical Subiquity 26.04 reserved-usernames. */
-        static const wchar_t *reserved[] = {
-            L"root", L"daemon", L"bin", L"sys", L"sync", L"games", L"man", L"lp",
-            L"mail", L"news", L"uucp", L"proxy", L"www-data", L"backup", L"list",
-            L"irc", L"gnats", L"nobody", L"adm", L"tty", L"disk", L"kmem", L"dialout",
-            L"fax", L"voice", L"cdrom", L"floppy", L"tape", L"sudo", L"audio", L"dip",
-            L"operator", L"src", L"shadow", L"utmp", L"video", L"sasl", L"plugdev",
-            L"staff", L"users", L"nogroup", L"netplan", L"ftn", L"mysql", L"tac-plus",
-            L"alias", L"qmail", L"qmaild", L"qmails", L"qmailr", L"qmailq", L"qmaill",
-            L"qmailp", L"asterisk", L"vpopmail", L"vchkpw", L"slurm", L"hacluster",
-            L"haclient", L"grsec-tpe", L"grsec-sock-all", L"grsec-sock-clt",
-            L"grsec-sock-srv", L"grsec-proc", L"ceph", L"opensrf", L"libvirt-qemu",
-            L"admin", L"Debian-exim", L"bind", L"crontab", L"cupsys", L"dcc", L"dhcp",
-            L"dictd", L"dnsmasq", L"dovecot", L"fetchmail", L"firebird", L"ftp", L"fuse",
-            L"gdm", L"haldaemon", L"hplilp", L"identd", L"input", L"jwhois", L"klog",
-            L"kvm", L"lpadmin", L"maas", L"messagebus", L"mythtv", L"netdev", L"powerdev",
-            L"radvd", L"render", L"saned", L"sbuild", L"scanner", L"sgx", L"slocate",
-            L"ssh", L"sshd", L"ssl-cert", L"sslwrap", L"statd", L"syslog", L"telnetd", L"tftpd"
-        };
-        if (length > 32) return L"Username cannot exceed 32 characters (Linux limit).";
-        for (i = 0; i < length; i++) {
-            wchar_t ch = username[i];
-            if (!((ch >= L'a' && ch <= L'z') || ch == L'_' ||
-                  (i && ((ch >= L'0' && ch <= L'9') || ch == L'-'))))
-                return L"Linux username: lowercase letters, digits, _ and - only; start with a letter or _.";
-        }
-        for (i = 0; i < ARRAYSIZE(reserved); i++)
-            if (wcslen(reserved[i]) == length && wcsncmp(username, reserved[i], length) == 0)
-                return L"Username is a reserved name.";
-        return NULL;
     }
     if (length > 20) return L"Username cannot exceed 20 characters.";
     for (i = 0; i < length; i++) {
@@ -3685,9 +2492,9 @@ ASB_API const wchar_t *asb_validate_username(const wchar_t *os_type,
 ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
     const wchar_t *password)
 {
-    size_t units = 0, code_points = 0, utf8_bytes = 0;
-    BOOL is_linux = os_type && _wcsicmp(os_type, L"Linux") == 0;
+    size_t units = 0;
 
+    (void)os_type;   /* every guest with an account is Windows */
     if (!password || !password[0]) return L"Password is required.";
     while (password[units]) {
         unsigned ch = password[units++];
@@ -3696,22 +2503,12 @@ ASB_API const wchar_t *asb_validate_password(const wchar_t *os_type,
             if (low < 0xDC00 || low > 0xDFFF)
                 return L"Password contains invalid Unicode.";
             units++;
-            utf8_bytes += 4;
         } else if (ch >= 0xDC00 && ch <= 0xDFFF) {
             return L"Password contains invalid Unicode.";
-        } else {
-            utf8_bytes += ch < 0x80 ? 1 : ch < 0x800 ? 2 : 3;
         }
-        code_points++;
     }
-    if (is_linux) {
-        if (code_points < 6)
-            return L"Password must be at least 6 characters (Ubuntu minimum).";
-        if (utf8_bytes > 255)
-            return L"Password is too long (max 255 bytes).";
-    } else if (units > 127) {
+    if (units > 127)
         return L"Password is too long (max 127 characters for Windows).";
-    }
     return NULL;
 }
 
@@ -3753,9 +2550,16 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
             }
         }
     }
+    if (!effective_os || (_wcsicmp(effective_os, L"Windows") != 0 &&
+                          _wcsicmp(effective_os, L"Other") != 0)) {
+        asb_log(L"Error: OS type \"%s\" is not supported. Use \"Windows\", or \"Other\" for a manual install.",
+                effective_os ? effective_os : L"");
+        asb_alert(L"This OS type is not supported. Choose Windows, or Other to install an OS by hand from its ISO.");
+        return E_INVALIDARG;
+    }
     /* "Other" = manual install: the user installs any OS from its ISO by
        hand, so there is no account to create. */
-    BOOL manual = effective_os && _wcsicmp(effective_os, L"Other") == 0;
+    BOOL manual = _wcsicmp(effective_os, L"Other") == 0;
     if (!manual) {
         const wchar_t *error = asb_validate_username(effective_os, config->username,
                                                     config->name, config->is_template);
@@ -3772,7 +2576,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
 
     /* Copy config strings into local VmConfig */
     wcscpy_s(cfg.name, 256, config->name);
-    if (effective_os) wcscpy_s(cfg.os_type, 32, effective_os);
+    wcscpy_s(cfg.os_type, 32, effective_os);
     if (config->image_path) wcscpy_s(cfg.image_path, MAX_PATH, config->image_path);
     if (!manual) {
         size_t user_length;
@@ -3804,14 +2608,6 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     if (cfg.ram_mb == 0) cfg.ram_mb = 4096;
     if (cfg.cpu_cores == 0) cfg.cpu_cores = 4;
 
-    /* Linux defaults: respect the UI's gpu_mode (GPU-PV works via
-       DKMS-built dxgkrnl + asb_drm). Force test_mode=TRUE so the
-       unsigned out-of-tree .ko's load — Secure Boot would otherwise
-       reject them, and we don't ship a MOK enrollment flow. */
-    if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
-        cfg.test_mode = TRUE;
-    }
-
     /* Manual install: no guest agent, so no GPU driver copy, SSH or
        App Sandbox display driver. Secure Boot stays off (most non-Windows
        installers are not signed for it). The ISO is required. */
@@ -3841,22 +2637,6 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
         if (error) {
             asb_log(L"Error: %s", error);
             asb_alert(error);
-            return E_INVALIDARG;
-        }
-    }
-
-    /* Linux v1: require an ISO. Templates aren't supported for Linux yet. */
-    if (_wcsicmp(cfg.os_type, L"Linux") == 0) {
-        if (is_template_create) {
-            asb_log(L"Error: Linux templates are not supported.");
-            return E_INVALIDARG;
-        }
-        if (from_template) {
-            asb_log(L"Error: Linux cannot be created from a template.");
-            return E_INVALIDARG;
-        }
-        if (cfg.image_path[0] == L'\0') {
-            asb_log(L"Error: Linux requires an ISO path.");
             return E_INVALIDARG;
         }
     }
@@ -3959,12 +2739,7 @@ ASB_API HRESULT asb_vm_create_with_id(const AsbVmConfig *config, AsbVmId *create
     /* GPU driver shares */
     if (cfg.gpu_mode == GPU_DEFAULT && !is_template_create) {
         gpu_get_driver_shares(&g_gpu_list, &cfg.gpu_shares);
-        /* Linux guests additionally consume %SystemRoot%\System32\lxss\lib
-         * (NVIDIA's WSL-staged Linux userspace .so files), mounted at
-         * /usr/lib/wsl/lib by the agent on first connect. */
-        if (_wcsicmp(cfg.os_type, L"Linux") == 0)
-            gpu_append_lxsslib_share(&cfg.gpu_shares);
-        else if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
+        if (_wcsicmp(cfg.os_type, L"Windows") == 0) {
             gpu_append_amd_gl_vk_driver_shares(&g_gpu_list, &cfg.gpu_shares);
             gpu_append_nvidia_drs_share(&g_gpu_list, &cfg.gpu_shares);
             gpu_append_nvidia_graphics_shim_share(&g_gpu_list, &cfg.gpu_shares);
@@ -4081,88 +2856,6 @@ build_failed:
         }
     }
 
-    /* ---- Linux creation path (parallel to use_vhdx_first) ----
-     *
-     * Linux VMs build a bootable VHDX directly from the user-picked Ubuntu
-     * Desktop ISO. The build (squashfs -> ext4 + host-side prefetches) is
-     * slow, so the whole flow runs on a worker thread (linux_create_thread);
-     * the UI thread returns immediately. */
-    {
-        /* image_path is the Ubuntu Desktop installer ISO the user picked;
-           the VHDX is built from it on the host. admin_pass flows through
-           to the guest's firstboot as a $6$ hash (see linux_create_thread). */
-        BOOL use_linux_cloud = (!from_template && !is_template_create &&
-                                _wcsicmp(cfg.os_type, L"Linux") == 0 &&
-                                cfg.image_path[0] != L'\0');
-
-        if (use_linux_cloud) {
-            LinuxCreateArgs *args;
-
-            wcscpy_s(inst->name, 256, cfg.name);
-            wcscpy_s(inst->os_type, 32, cfg.os_type);
-            wcscpy_s(inst->vhdx_path, MAX_PATH, cfg.vhdx_path);
-            /* image_path isn't used by Linux but copy it through anyway so
-               vms.cfg round-trips cleanly (UI sends it as the version tag). */
-            wcscpy_s(inst->image_path, MAX_PATH, cfg.image_path);
-            inst->ram_mb = cfg.ram_mb;
-            inst->hdd_gb = cfg.hdd_gb;
-            inst->cpu_cores = cfg.cpu_cores;
-            inst->gpu_mode = cfg.gpu_mode;
-            wcscpy_s(inst->gpu_id, ARRAYSIZE(inst->gpu_id), cfg.gpu_id);
-            update_vm_gpu_name(inst);
-            inst->network_mode = cfg.network_mode;
-            inst->is_template = FALSE;
-            inst->test_mode = cfg.test_mode;
-            wcscpy_s(inst->admin_user, 128, cfg.admin_user);
-            inst->ssh_enabled = cfg.ssh_enabled;
-            inst->ssh_deploy_key = cfg.ssh_deploy_key;
-            if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
-            inst->building_vhdx = TRUE;
-            inst->vhdx_progress = 0;
-            memcpy(&inst->gpu_shares, &cfg.gpu_shares, sizeof(GpuDriverShareList));
-
-            { wchar_t sd[MAX_PATH]; swprintf_s(sd, MAX_PATH, L"%s\\snapshots", vhdx_dir);
-              snapshot_init(&RECORD_OF(inst)->snapshots, sd); }
-            if (append_vm_record(inst) < 0) {
-                remove_dir_recursive(vhdx_dir);
-                hr = E_FAIL;
-                goto release_claim;
-            }
-
-            vm_save_state_json(cfg.vhdx_path, FALSE);
-            save_vm_list();
-
-            args = (LinuxCreateArgs *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, sizeof(LinuxCreateArgs));
-            if (!args) {
-                asb_log(L"Error: Out of memory for Linux create args.");
-                SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
-                remove_vm(inst);
-                if (created_id) *created_id = 0;
-                remove_dir_recursive(vhdx_dir);
-                save_vm_list();
-                return E_OUTOFMEMORY;
-            }
-            memcpy(&args->config, &cfg, sizeof(VmConfig));
-            args->vm_unique_id = inst->unique_id;
-            wcscpy_s(args->vhdx_dir, MAX_PATH, vhdx_dir);
-            wcscpy_s(args->net_adapter, 256, inst->net_adapter);
-
-            detect_host_locale_settings(args->host_locale, sizeof(args->host_locale),
-                                        args->host_xkb, sizeof(args->host_xkb),
-                                        args->host_variant, sizeof(args->host_variant),
-                                        args->host_input_method, sizeof(args->host_input_method),
-                                        args->host_tz, sizeof(args->host_tz));
-
-            asb_log(L"Building Linux VM \"%s\" (direct ISO->VHDX, ~3 minutes)...", cfg.name);
-            CloseHandle(CreateThread(NULL, 0, linux_create_thread, args, 0, NULL));
-
-            SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
-
-            notify_state(vm_handle(inst), FALSE, g_state_ud);
-            return S_OK;
-        }
-    }
-
     /* Populate name early so log lines (e.g. NAT IP allocation) identify the VM. */
     wcscpy_s(inst->name, 256, cfg.name);
 
@@ -4203,9 +2896,6 @@ build_failed:
                 if (SUCCEEDED(hr)) wcscpy_s(cfg.resources_iso_path, MAX_PATH, res_iso);
                 else asb_log(L"Warning: Failed to create resources ISO (0x%08X).", hr);
             }
-            /* Linux: handled entirely in linux_create_thread via the
-               use_linux_cloud branch above. No synchronous Linux path
-               here. */
         }
     }
     SecureZeroMemory(cfg.admin_pass, sizeof(cfg.admin_pass));
@@ -4269,8 +2959,8 @@ build_failed:
     update_vm_gpu_name(inst);
     wcscpy_s(inst->resources_iso_path, MAX_PATH, cfg.resources_iso_path);
     /* hcs_create_vm copies ssh_enabled onto the instance but not the deploy
-       fields, so the from-template path sets them here (the ISO and Linux
-       paths set them inline on their own instance copies). */
+       fields, so the from-template path sets them here (the ISO path sets
+       them inline on its own instance copy). */
     inst->ssh_deploy_key = cfg.ssh_deploy_key;
     if (cfg.ssh_deploy_key) wcscpy_s(inst->ssh_pubkey, 512, ssh_pubkey);
 
@@ -4413,9 +3103,9 @@ ASB_API HRESULT asb_vm_start(AsbVm vm, int snap_idx, int branch_idx,
         }
     }
 
-    /* Installer ISO: Windows and Ubuntu VMs need it only until the guest
-       agent reports the installation complete (their disk is built from it
-       on the host), so it is not attached after that, and the user may
+    /* Installer ISO: a Windows VM needs it only until the guest agent
+       reports the installation complete (its disk is built from it on the
+       host), so it is not attached after that, and the user may
        delete it. A manual-install VM ("Other") keeps it until the user
        removes it (asb_vm_eject_iso). Templates keep theirs for the template
        record. */
@@ -5681,8 +4371,8 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
     wcscpy_s(inst->name, ARRAYSIZE(inst->name), name);
     wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), L"Windows");
     if (manifest[0] && json_value_w(manifest, L"osType", value, ARRAYSIZE(value)) &&
-        (_wcsicmp(value, L"Windows") == 0 || _wcsicmp(value, L"Linux") == 0))
-        wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), _wcsicmp(value, L"Linux") == 0 ? L"Linux" : L"Windows");
+        (_wcsicmp(value, L"Linux") == 0 || _wcsicmp(value, L"macOS") == 0))
+        wcscpy_s(inst->os_type, ARRAYSIZE(inst->os_type), value);
     inst->ram_mb = 8192;
     inst->cpu_cores = 4;
     inst->gpu_mode = 1;
@@ -5707,6 +4397,7 @@ ASB_API HRESULT asb_vm_import(const wchar_t *source)
         if (json_value_w(manifest, L"sshEnabled", value, ARRAYSIZE(value))) inst->ssh_enabled = _wtoi(value) != 0;
         if (json_value_w(manifest, L"testMode", value, ARRAYSIZE(value))) inst->test_mode = _wtoi(value) != 0;
     }
+    retire_unsupported_guest(inst);
     if (inst->ram_mb < 2048) inst->ram_mb = 2048;
     inst->ram_mb -= inst->ram_mb % 2;
     if (inst->cpu_cores < 1) inst->cpu_cores = 1;

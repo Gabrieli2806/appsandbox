@@ -72,8 +72,7 @@ typedef struct _SOCKADDR_HV {
 } SOCKADDR_HV;
 
 /* These three are superseded by hcs_service_guid(os_type, port, ...) — kept
-   for grep. Windows VMs reach byte-identical GUIDs via the helper; Linux
-   VMs reach vsock-template GUIDs. */
+   for grep. The helper returns byte-identical GUIDs. */
 static const GUID FRAME_SERVICE_GUID =
     { 0xa5b0cafe, 0x0002, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -364,11 +363,10 @@ struct VmDisplayIdd {
 
     /* Display mode (persisted in display_settings.json). res_choice is an
        index into g_res_presets or RES_ADAPTIVE. Mode changes are only sent to
-       Windows guests (the Linux guest has its own display path). */
+       Windows guests. */
     int            res_choice;
     UINT           refresh_hz;
     BOOL           mode_supported;
-    BOOL           guest_linux;      /* Linux guest: the display daemon applies modes itself */
     /* Guest driver generation on the current frame connection: -1 unknown,
        0 older (no hello before the first frame), >= 2 from its hello. */
     volatile LONG  guest_driver;
@@ -1510,15 +1508,10 @@ static void idd_apply_display_mode(VmDisplayIdd *d, BOOL force)
         vdd_ok = send(d->frame_socket, (const char *)&req, (int)sizeof(req), 0) == (int)sizeof(req);
     ReleaseSRWLockExclusive(&d->frame_send_lock);
 
-    /* Windows guests switch in the session through the input helper; on
-       Linux the display daemon that received the request does it. */
-    if (d->guest_linux) {
-        input_ok = TRUE;
-    } else {
-        AcquireSRWLockExclusive(&d->input_lock);
-        input_ok = send_input_locked(d, INPUT_SET_DISPLAY, w, h, hz);
-        ReleaseSRWLockExclusive(&d->input_lock);
-    }
+    /* The guest switches in the session through the input helper. */
+    AcquireSRWLockExclusive(&d->input_lock);
+    input_ok = send_input_locked(d, INPUT_SET_DISPLAY, w, h, hz);
+    ReleaseSRWLockExclusive(&d->input_lock);
 
     if (vdd_ok && input_ok) {
         d->req_width = w;
@@ -1584,16 +1577,13 @@ static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
         swprintf_s(label, 32, L"%u Hz", g_refresh_rates[i]);
         AppendMenuW(sub, MF_STRING, IDM_HZ_BASE + i * 0x10, label);
     }
-    /* Linux guests do not encode video yet. */
-    if (!d->guest_linux) {
-        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(sub, MF_STRING, IDM_STREAM_QUALITY, L"Quality mode (exact pixels)");
-        AppendMenuW(sub, MF_STRING, IDM_STREAM_PERF, L"Performance mode (GPU video, games)");
-        AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
-        AppendMenuW(sub, MF_STRING, IDM_CODEC_AUTO, L"Codec: Auto");
-        AppendMenuW(sub, MF_STRING, IDM_CODEC_H264, L"Codec: H.264");
-        AppendMenuW(sub, MF_STRING, IDM_CODEC_HEVC, L"Codec: HEVC (H.265)");
-    }
+    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sub, MF_STRING, IDM_STREAM_QUALITY, L"Quality mode (exact pixels)");
+    AppendMenuW(sub, MF_STRING, IDM_STREAM_PERF, L"Performance mode (GPU video, games)");
+    AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(sub, MF_STRING, IDM_CODEC_AUTO, L"Codec: Auto");
+    AppendMenuW(sub, MF_STRING, IDM_CODEC_H264, L"Codec: H.264");
+    AppendMenuW(sub, MF_STRING, IDM_CODEC_HEVC, L"Codec: HEVC (H.265)");
     AppendMenuW(sysmenu, MF_POPUP, (UINT_PTR)sub, L"Display");
 }
 
@@ -3755,9 +3745,9 @@ static HCURSOR create_cursor_from_bitmap(UINT width, UINT height,
            the top byte is alpha — Windows treats it as 24-bit RGB +
            padding and, with an all-zero AND mask, renders EVERY pixel
            opaque. For cursors whose transparent regions are stored as
-           (0,0,0,0) (e.g. ours from Linux), that paints a black square
-           around the cursor. Windows-VDD cursors happen not to trigger
-           this because their transparent regions have non-zero RGB.
+           (0,0,0,0), that paints a black square around the cursor.
+           Windows-VDD cursors usually do not trigger this because their
+           transparent regions have non-zero RGB.
 
            Fix: build the AND mask from the alpha channel — bit set
            (1) = transparent, bit cleared (0) = opaque. Threshold low
@@ -4159,9 +4149,8 @@ static DWORD WINAPI idd_recv_thread_proc(LPVOID param)
             if (d->mode_supported && ++d->frames_since_connect >= HELLO_FRAME_GRACE &&
                 InterlockedCompareExchange(&d->guest_driver, 0, -1) == -1) {
                 idd_log(d, L"Guest display is older than this App Sandbox: it stays at "
-                           L"1920x1080 and ignores resolution changes.%s",
-                        d->guest_linux ? L" Create a new Ubuntu VM to get the new display components."
-                                       : L" Update the VM's guest components (or create a new VM).");
+                           L"1920x1080 and ignores resolution changes."
+                           L" Update the VM's guest components (or create a new VM).");
                 if (d->main_hwnd) PostMessageW(d->main_hwnd, WM_APP + 32, 0, 0);
             }
 
@@ -5332,8 +5321,7 @@ VmDisplayIdd *vm_display_idd_create(VmInstance *vm, HINSTANCE hInstance, HWND ma
     d->bitrate_mbps = idd_display_settings_bitrate(vm->vhdx_path);
     d->clip_share_host_to_guest = h2g;
     d->clip_share_guest_to_host = g2h;
-    d->guest_linux = (_wcsicmp(vm->os_type, L"Linux") == 0);
-    d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0) || d->guest_linux;
+    d->mode_supported = (_wcsicmp(vm->os_type, L"Windows") == 0);
     d->frame_socket = INVALID_SOCKET;
     InitializeSRWLock(&d->frame_send_lock);
     d->guest_driver = -1;

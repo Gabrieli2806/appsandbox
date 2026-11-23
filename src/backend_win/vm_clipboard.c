@@ -44,7 +44,7 @@ typedef struct {
 #pragma pack(pop)
 
 /* Both superseded by hcs_service_guid(os_type, 5|6, ...) — kept for grep.
-   Windows VMs reach byte-identical GUIDs via the helper. */
+   The helper returns byte-identical GUIDs. */
 static const GUID CLIPBOARD_SERVICE_GUID =
     { 0xa5b0cafe, 0x0005, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
@@ -333,8 +333,8 @@ static const char *const clip_guest_named_formats[] = {
 
 /* Host format id for a format the guest announced, or 0 to drop it.
    name: the registered name the guest sent, or NULL when it sent none (a
-   predefined CF_* id, or - from a Linux guest - a registered id the host
-   itself announced earlier, such as its "HTML Format"). */
+   predefined CF_* id, or a registered id the host itself announced
+   earlier, such as its "HTML Format"). */
 static UINT clip_guest_format_to_local(UINT32 fmt_id, const char *name)
 {
     char host_name[256];

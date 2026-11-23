@@ -30,7 +30,7 @@ typedef void *HCS_OPERATION;
 /* Configuration for creating a new VM */
 typedef struct {
     wchar_t name[256];
-    wchar_t os_type[32];          /* L"Windows" or L"Linux" */
+    wchar_t os_type[32];          /* L"Windows" or L"Other" (manual install) */
     wchar_t image_path[MAX_PATH]; /* ISO path */
     wchar_t vhdx_path[MAX_PATH];  /* will be created if doesn't exist */
     DWORD   ram_mb;
@@ -201,13 +201,10 @@ HRESULT hcs_create_vm_with_endpoint(const VmConfig *config, const wchar_t *endpo
 BOOL hcs_build_vm_json(const VmConfig *config, const wchar_t *endpoint_guid,
                        wchar_t *json_out, size_t json_out_chars);
 
-/* Compute the AppSandbox service GUID for a guest OS and port.
-     Windows guests get a5b0cafe-<port>-4000-8000-000000000001.
-     Non-Windows guests (Linux) get <port>-FACB-11E6-BD58-64006A7986D3
-       (the vsock-template GUID — Linux AF_VSOCK clients on port N reach
-        the host service registered with that GUID).
-   Both forms are listed in the HCS ServiceTable for the appropriate
-   guest; the host's socket code picks the right one via this helper. */
+/* Compute the AppSandbox service GUID for a port:
+   a5b0cafe-<port>-4000-8000-000000000001. os_type is not used (every
+   guest gets the same GUIDs). These are the GUIDs listed in the HCS
+   ServiceTable; the host's socket code gets them from this helper. */
 ASB_API void hcs_service_guid(const wchar_t *os_type, unsigned port, GUID *out);
 
 /* Same as hcs_service_guid, formatted as the GUID string the HCS JSON

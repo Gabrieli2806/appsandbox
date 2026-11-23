@@ -28,7 +28,7 @@ typedef struct _SOCKADDR_HV {
 } SOCKADDR_HV;
 
 /* Superseded by hcs_service_guid(os_type, 7, ...) — kept for grep.
-   Windows VMs reach the byte-identical GUID via the helper. */
+   The helper returns the byte-identical GUID. */
 static const GUID SSH_SERVICE_GUID =
     { 0xa5b0cafe, 0x0007, 0x4000, { 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01 } };
 
