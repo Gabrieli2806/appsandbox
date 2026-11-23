@@ -1737,7 +1737,7 @@ static VOID VddModeTimerCallback(WDFTIMER Timer)
 
     if (!ctx || !ctx->hMonitor || !ctx->hAdapter) {
         VddLog("ModeReplug: no monitor yet, the new list applies at the next arrival");
-        InterlockedExchange(&ctx->modeStage, 0);
+        if (ctx) InterlockedExchange(&ctx->modeStage, 0);
         return;
     }
 
