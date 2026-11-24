@@ -308,6 +308,7 @@ struct VmDisplayIdd {
     HWND          toolbar_hwnd;
     HWND          toolbar_tip;        /* tooltips for its icon buttons */
     BOOL          toolbar_pinned;
+    BOOL          toolbar_expanded;   /* every option shown, not the compact bar */
     BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting"
                                          (debounced copy of !frame_connected) */
     int           toolbar_hot;        /* item under the pointer, -1 none */
@@ -1652,8 +1653,21 @@ static void idd_update_title(VmDisplayIdd *d, BOOL force)
 
 enum {
     TB_NAME, TB_DISPLAY, TB_FPS, TB_SEP, TB_CLIP, TB_AUDIO, TB_KEYS,
-    TB_FULL, TB_PIN, TB_MORE, TB_COUNT
+    TB_FULL, TB_PIN, TB_MORE, TB_EXPAND, TB_COUNT
 };
+
+/* Compact (the default): the frame rate, fullscreen, pin and the button
+   that shows everything. Expanded: every item. */
+static BOOL tb_visible(VmDisplayIdd *d, int item)
+{
+    if (d->toolbar_expanded) return TRUE;
+    switch (item) {
+    case TB_FPS: case TB_SEP: case TB_FULL: case TB_PIN: case TB_EXPAND:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
 
 #define TB_TRIGGER_PX   6      /* pointer this close to the top edge shows it */
 #define TB_MARGIN_PX    10     /* gap between the window top and the toolbar */
@@ -1700,6 +1714,7 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
     case TB_FULL:    wcscpy_s(text, cap, d->borderless_fullscreen ? L"\xE73F" : L"\xE740"); break;
     case TB_PIN:     wcscpy_s(text, cap, d->toolbar_pinned ? L"\xE77A" : L"\xE718"); *on = d->toolbar_pinned; break;
     case TB_MORE:    wcscpy_s(text, cap, L"\xE712"); break;
+    case TB_EXPAND:  wcscpy_s(text, cap, d->toolbar_expanded ? L"\xE76B" : L"\xE76C"); break;  /* ChevronLeft / Right */
     default: break;
     }
 }
@@ -1717,6 +1732,7 @@ static const wchar_t *tb_tooltip(VmDisplayIdd *d, int item)
     case TB_FULL:    return L"Borderless fullscreen (F11)";
     case TB_PIN:     return d->toolbar_pinned ? L"Let the toolbar hide" : L"Keep the toolbar visible";
     case TB_MORE:    return L"More options";
+    case TB_EXPAND:  return d->toolbar_expanded ? L"Show fewer options" : L"Show all options";
     default:         return NULL;
     }
 }
@@ -1796,14 +1812,27 @@ static SIZE tb_layout(VmDisplayIdd *d)
     int pad = tb_scale(d, 4), h = tb_scale(d, 48);
     int x = pad, item;
     SIZE out;
+    if (!dpi) dpi = 96;
     for (item = 0; item < TB_COUNT; item++) {
         wchar_t text[96];
         BOOL icon, on;
         int kind, w;
+        if (!tb_visible(d, item)) {
+            SetRectEmpty(&d->toolbar_items[item]);
+            continue;
+        }
         tb_item(d, item, text, ARRAYSIZE(text), &icon, &on);
         kind = tb_kind(item, icon);
-        w = tbp_item_width(kind, text, item == TB_NAME ? TB_GLYPH_VM : NULL, dpi ? dpi : 96);
-        if (item == TB_FPS && w < tb_scale(d, 96)) w = tb_scale(d, 96);
+        w = tbp_item_width(kind, text, item == TB_NAME ? TB_GLYPH_VM : NULL, dpi);
+        if (item == TB_FPS) {
+            /* As wide as the widest frame rate, so the bar keeps its size
+               while the number changes. */
+            wchar_t widest[48];
+            int ww;
+            swprintf_s(widest, ARRAYSIZE(widest), L"888 FPS %lc H.264", (wint_t)0x00B7);
+            ww = tbp_item_width(TBP_STATUS, widest, NULL, dpi);
+            if (w < ww) w = ww;
+        }
         SetRect(&d->toolbar_items[item], x, pad, x + w, h - pad);
         x += w + (kind == TBP_BUTTON ? tb_scale(d, 2) : 0);
     }
@@ -1906,13 +1935,15 @@ static void tb_paint(VmDisplayIdd *d, HWND hwnd)
     TbpItem items[TB_COUNT];
     wchar_t texts[TB_COUNT][96];
     UINT dpi = GetDpiForWindow(hwnd);
-    int item;
+    int item, n = 0;
 
     GetClientRect(hwnd, &rc);
     tb_layout(d);
     for (item = 0; item < TB_COUNT; item++) {
         BOOL icon, on;
-        TbpItem *it = &items[item];
+        TbpItem *it;
+        if (!tb_visible(d, item)) continue;
+        it = &items[n++];
         tb_item(d, item, texts[item], ARRAYSIZE(texts[item]), &icon, &on);
         ZeroMemory(it, sizeof(*it));
         it->rc = d->toolbar_items[item];
@@ -1925,7 +1956,7 @@ static void tb_paint(VmDisplayIdd *d, HWND hwnd)
         if (item == TB_FPS)   /* green while frames arrive, amber while waiting */
             it->dot = d->status_shown ? 0xFCE100 : 0x6CCB5F;
     }
-    if (!tbp_paint(dc, rc.right, rc.bottom, dpi ? dpi : 96, items, TB_COUNT,
+    if (!tbp_paint(dc, rc.right, rc.bottom, dpi ? dpi : 96, items, n,
                    !d->toolbar_backdrop, tbp_accent_color())) {
         HBRUSH bg = CreateSolidBrush(RGB(0x2C, 0x2C, 0x2C));
         FillRect(dc, &rc, bg);
@@ -1988,6 +2019,10 @@ static void tb_click(VmDisplayIdd *d, int item)
     case TB_KEYS:  PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_XMIT_HOTKEYS, 0); break;
     case TB_FULL:  PostMessageW(d->hwnd, WM_SYSCOMMAND, IDM_BORDERLESS_FULLSCREEN, 0); break;
     case TB_PIN:   d->toolbar_pinned = !d->toolbar_pinned; break;
+    case TB_EXPAND:
+        d->toolbar_expanded = !d->toolbar_expanded;
+        d->toolbar_hot = -1;
+        break;
     case TB_MORE:  tb_menu(d, GetSystemMenu(d->hwnd, FALSE), item); break;
     default: break;
     }
@@ -2044,11 +2079,13 @@ static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         }
         return 0;
     case WM_LBUTTONUP:
-        if (GetCapture() == hwnd) ReleaseCapture();
         if (d) {
+            /* Read before ReleaseCapture: it sends WM_CAPTURECHANGED, which
+               clears the pressed item. */
             int item = tb_hit(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
             int pressed = d->toolbar_pressed;
             d->toolbar_pressed = -1;
+            if (GetCapture() == hwnd) ReleaseCapture();
             InvalidateRect(hwnd, NULL, FALSE);
             if (item >= 0 && item == pressed) tb_click(d, item);
         }
