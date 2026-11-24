@@ -200,6 +200,9 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClCompile Include="src\backend_win\vm_video_decode.cpp">
       <CompileAs>CompileAsCpp</CompileAs>
     </ClCompile>
+    <ClCompile Include="src\backend_win\vm_toolbar_paint.cpp">
+      <CompileAs>CompileAsCpp</CompileAs>
+    </ClCompile>
     <ClCompile Include="src\app_win\ui_bridge.c" />
     <ClCompile Include="src\app_win\headless.c" />
     <ClCompile Include="src\app_win\mcp.c" />
@@ -218,6 +221,7 @@ xcopy /Y /I "$(SolutionDir)tools\win-mesa-gl\prebuilt\x64\*.dll" "$(OutDir)resou
     <ClInclude Include="src\backend_win\snapshot.h" />
     <ClInclude Include="src\backend_win\vm_display.h" />
     <ClInclude Include="src\backend_win\vm_display_idd.h" />
+    <ClInclude Include="src\backend_win\vm_toolbar_paint.h" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\app_win\appsandbox.rc" />

@@ -15,6 +15,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <dwmapi.h>
+#include <uxtheme.h>
 
 #define COBJMACROS
 #include <initguid.h>
@@ -36,6 +37,7 @@
 #include "vm_display_idd.h"
 #include "vm_video_decode.h"
 #include "vm_display_d3d12.h"
+#include "vm_toolbar_paint.h"
 #include "../core/asb_display_protocol.h"
 #include "asb_core.h"
 #include "../core/protocol.h"
@@ -50,6 +52,7 @@
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "d3dcompiler.lib")
 #pragma comment(lib, "dwmapi.lib")
+#pragma comment(lib, "uxtheme.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "imm32.lib")
 #pragma comment(lib, "comctl32.lib")
@@ -308,6 +311,8 @@ struct VmDisplayIdd {
     BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting"
                                          (debounced copy of !frame_connected) */
     int           toolbar_hot;        /* item under the pointer, -1 none */
+    int           toolbar_pressed;    /* item the mouse button went down on, -1 none */
+    BOOL          toolbar_backdrop;   /* the system acrylic shows behind it */
     RECT          toolbar_items[12];  /* client rects of the items, for hit tests */
     int           toolbar_count;
     LONG_PTR      windowed_style;
@@ -1652,7 +1657,7 @@ enum {
 
 #define TB_TRIGGER_PX   6      /* pointer this close to the top edge shows it */
 #define TB_MARGIN_PX    10     /* gap between the window top and the toolbar */
-#define TB_ACCENT       RGB(0x4E, 0xA6, 0xF5)
+#define TB_GLYPH_VM     L"\xE7F4"   /* TVMonitor, before the VM name */
 
 static int tb_scale(VmDisplayIdd *d, int px)
 {
@@ -1660,36 +1665,8 @@ static int tb_scale(VmDisplayIdd *d, int px)
     return MulDiv(px, dpi ? (int)dpi : 96, 96);
 }
 
-static HFONT tb_font(VmDisplayIdd *d, BOOL icons, int pt)
-{
-    LOGFONTW lf;
-    ZeroMemory(&lf, sizeof(lf));
-    lf.lfHeight = -tb_scale(d, pt);
-    lf.lfWeight = icons ? FW_NORMAL : FW_SEMIBOLD;
-    lf.lfQuality = CLEARTYPE_QUALITY;
-    lf.lfCharSet = DEFAULT_CHARSET;
-    wcscpy_s(lf.lfFaceName, LF_FACESIZE, icons ? L"Segoe Fluent Icons" : L"Segoe UI");
-    {
-        HFONT f = CreateFontIndirectW(&lf);
-        if (icons && f) {
-            /* Windows 10 has Segoe MDL2 Assets with the same code points. */
-            HDC dc = GetDC(NULL);
-            wchar_t face[LF_FACESIZE] = L"";
-            HGDIOBJ old = SelectObject(dc, f);
-            GetTextFaceW(dc, LF_FACESIZE, face);
-            SelectObject(dc, old);
-            ReleaseDC(NULL, dc);
-            if (_wcsicmp(face, L"Segoe Fluent Icons") != 0) {
-                DeleteObject(f);
-                wcscpy_s(lf.lfFaceName, LF_FACESIZE, L"Segoe MDL2 Assets");
-                f = CreateFontIndirectW(&lf);
-            }
-        }
-        return f;
-    }
-}
-
-/* Text or glyph for one item, and whether it is a "toggled on" state. */
+/* Text or glyph for one item, and whether it is a checked toggle (drawn
+   with the accent fill, like a WinUI AppBarToggleButton). */
 static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *icon, BOOL *on)
 {
     *icon = TRUE;
@@ -1698,11 +1675,15 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
     switch (item) {
     case TB_NAME:    *icon = FALSE; wcscpy_s(text, cap, d->vm_name); break;
     case TB_DISPLAY:
+        /* "Adaptive, 1920 x 1080, 144 Hz" with middle dots and a multiplication
+           sign (the chevron is drawn by the painter). */
         *icon = FALSE;
         if (d->res_choice == RES_ADAPTIVE)
-            swprintf_s(text, cap, L"Adaptive %ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
+            swprintf_s(text, cap, L"Adaptive %lc %u %lc %u %lc %u Hz", (wint_t)0x00B7,
+                       d->frame_width, (wint_t)0x00D7, d->frame_height, (wint_t)0x00B7, d->refresh_hz);
         else
-            swprintf_s(text, cap, L"%ux%u \u00B7 %u Hz \u25BE", d->frame_width, d->frame_height, d->refresh_hz);
+            swprintf_s(text, cap, L"%u %lc %u %lc %u Hz",
+                       d->frame_width, (wint_t)0x00D7, d->frame_height, (wint_t)0x00B7, d->refresh_hz);
         break;
     case TB_FPS:
         *icon = FALSE;
@@ -1740,6 +1721,32 @@ static const wchar_t *tb_tooltip(VmDisplayIdd *d, int item)
     }
 }
 
+/* Menus of this window (title-bar menu, the toolbar's Display and More
+   menus) and its tooltips in the dark theme when Windows uses dark mode, as
+   WinUI's menus do. uxtheme's SetPreferredAppMode (ordinal 135, "allow
+   dark") and AllowDarkModeForWindow (133) are not documented but have been
+   stable since Windows 10 1903; without them the menus stay light. */
+static void idd_dark_menus(HWND hwnd)
+{
+    typedef int  (WINAPI *SetPreferredAppModeFn)(int);
+    typedef BOOL (WINAPI *AllowDarkModeForWindowFn)(HWND, BOOL);
+    typedef void (WINAPI *FlushMenuThemesFn)(void);
+    static volatile LONG s_app_mode;
+    HMODULE ux = LoadLibraryExW(L"uxtheme.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
+    if (!ux) return;
+    if (InterlockedExchange(&s_app_mode, 1) == 0) {
+        SetPreferredAppModeFn set_mode = (SetPreferredAppModeFn)GetProcAddress(ux, MAKEINTRESOURCEA(135));
+        FlushMenuThemesFn flush = (FlushMenuThemesFn)GetProcAddress(ux, MAKEINTRESOURCEA(136));
+        if (set_mode) set_mode(1 /* AllowDark */);
+        if (flush) flush();
+    }
+    {
+        AllowDarkModeForWindowFn allow = (AllowDarkModeForWindowFn)GetProcAddress(ux, MAKEINTRESOURCEA(133));
+        if (allow && hwnd) allow(hwnd, TRUE);
+    }
+    FreeLibrary(ux);
+}
+
 /* Tooltips for the icon buttons: one tool per item (id = item), text asked
    for when shown (TTN_GETDISPINFO) so toggles read their current state.
    tb_position keeps the tool rectangles on the buttons. */
@@ -1754,6 +1761,8 @@ static void tb_add_tooltips(VmDisplayIdd *d)
                                      CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
                                      d->toolbar_hwnd, NULL, d->hInstance, NULL);
     if (!d->toolbar_tip) return;
+    idd_dark_menus(d->toolbar_tip);
+    SetWindowTheme(d->toolbar_tip, L"DarkMode_Explorer", NULL);   /* dark tooltips */
     for (item = 0; item < TB_COUNT; item++) {
         if (!tb_tooltip(d, item)) continue;
         ZeroMemory(&ti, sizeof(ti));
@@ -1767,35 +1776,38 @@ static void tb_add_tooltips(VmDisplayIdd *d)
     SendMessageW(d->toolbar_tip, TTM_SETMAXTIPWIDTH, 0, tb_scale(d, 360));
 }
 
-/* Measure items and size the window; positions are kept for hit tests. */
-static SIZE tb_layout(VmDisplayIdd *d, HDC dc)
+/* The painter's kind for an item. */
+static int tb_kind(int item, BOOL icon)
 {
-    HFONT text_font = tb_font(d, FALSE, 13), icon_font = tb_font(d, TRUE, 15);
-    int pad = tb_scale(d, 6), btn = tb_scale(d, 36), h = tb_scale(d, 44);
+    switch (item) {
+    case TB_NAME:    return TBP_LABEL;
+    case TB_FPS:     return TBP_STATUS;
+    case TB_DISPLAY: return TBP_DROPDOWN;
+    case TB_SEP:     return TBP_SEPARATOR;
+    default:         return icon ? TBP_BUTTON : TBP_LABEL;
+    }
+}
+
+/* Measure items and size the window (WinUI compact command bar: 40 x 40
+   buttons in a 48 px bar); positions are kept for hit tests. */
+static SIZE tb_layout(VmDisplayIdd *d)
+{
+    UINT dpi = d->hwnd ? GetDpiForWindow(d->hwnd) : 96;
+    int pad = tb_scale(d, 4), h = tb_scale(d, 48);
     int x = pad, item;
     SIZE out;
     for (item = 0; item < TB_COUNT; item++) {
         wchar_t text[96];
         BOOL icon, on;
-        int w;
+        int kind, w;
         tb_item(d, item, text, ARRAYSIZE(text), &icon, &on);
-        if (item == TB_SEP) {
-            w = tb_scale(d, 9);
-        } else if (icon) {
-            w = btn;
-        } else {
-            SIZE ts = { 0, 0 };
-            SelectObject(dc, text_font);
-            GetTextExtentPoint32W(dc, text, (int)wcslen(text), &ts);
-            w = ts.cx + tb_scale(d, item == TB_NAME ? 22 : 20);
-            if (item == TB_FPS && w < tb_scale(d, 70)) w = tb_scale(d, 70);
-        }
+        kind = tb_kind(item, icon);
+        w = tbp_item_width(kind, text, item == TB_NAME ? TB_GLYPH_VM : NULL, dpi ? dpi : 96);
+        if (item == TB_FPS && w < tb_scale(d, 96)) w = tb_scale(d, 96);
         SetRect(&d->toolbar_items[item], x, pad, x + w, h - pad);
-        x += w + (item == TB_SEP ? 0 : tb_scale(d, 2));
+        x += w + (kind == TBP_BUTTON ? tb_scale(d, 2) : 0);
     }
     d->toolbar_count = TB_COUNT;
-    DeleteObject(text_font);
-    DeleteObject(icon_font);
     out.cx = x + pad;
     out.cy = h;
     return out;
@@ -1805,12 +1817,9 @@ static void tb_position(VmDisplayIdd *d)
 {
     RECT rc;
     POINT top;
-    HDC dc;
     SIZE sz;
     if (!d->toolbar_hwnd || !d->render_hwnd) return;
-    dc = GetDC(d->toolbar_hwnd);
-    sz = tb_layout(d, dc);
-    ReleaseDC(d->toolbar_hwnd, dc);
+    sz = tb_layout(d);
     if (d->toolbar_tip) {
         /* Keep the tooltip areas on the buttons (their widths change). */
         TTTOOLINFOW ti;
@@ -1888,80 +1897,40 @@ static void tb_on_timer(VmDisplayIdd *d)
     tb_hide(d);
 }
 
+/* Draw it like a WinUI command bar on acrylic (vm_toolbar_paint.cpp). */
 static void tb_paint(VmDisplayIdd *d, HWND hwnd)
 {
     PAINTSTRUCT ps;
     RECT rc;
-    HDC dc = BeginPaint(hwnd, &ps), mem;
-    HBITMAP bmp;
-    HFONT text_font, icon_font, small_font;
+    HDC dc = BeginPaint(hwnd, &ps);
+    TbpItem items[TB_COUNT];
+    wchar_t texts[TB_COUNT][96];
+    UINT dpi = GetDpiForWindow(hwnd);
     int item;
 
     GetClientRect(hwnd, &rc);
-    mem = CreateCompatibleDC(dc);
-    bmp = CreateCompatibleBitmap(dc, rc.right, rc.bottom);
-    SelectObject(mem, bmp);
-    tb_layout(d, mem);
-    text_font = tb_font(d, FALSE, 13);
-    small_font = tb_font(d, FALSE, 12);
-    icon_font = tb_font(d, TRUE, 15);
-
-    {
-        HBRUSH bg = CreateSolidBrush(RGB(0x14, 0x17, 0x1D));
-        HPEN border = CreatePen(PS_SOLID, 1, RGB(0x2E, 0x34, 0x41));
-        HGDIOBJ ob = SelectObject(mem, bg), op = SelectObject(mem, border);
-        FillRect(mem, &rc, bg);
-        RoundRect(mem, 0, 0, rc.right, rc.bottom, tb_scale(d, 14), tb_scale(d, 14));
-        SelectObject(mem, ob);
-        SelectObject(mem, op);
-        DeleteObject(bg);
-        DeleteObject(border);
-    }
-    SetBkMode(mem, TRANSPARENT);
-
+    tb_layout(d);
     for (item = 0; item < TB_COUNT; item++) {
-        RECT r = d->toolbar_items[item];
-        wchar_t text[96];
         BOOL icon, on;
-        COLORREF fg = RGB(0xE8, 0xEA, 0xF0);
-        tb_item(d, item, text, ARRAYSIZE(text), &icon, &on);
-
-        if (item == TB_SEP) {
-            HPEN pen = CreatePen(PS_SOLID, 1, RGB(0x2E, 0x34, 0x41));
-            HGDIOBJ op = SelectObject(mem, pen);
-            int cx = (r.left + r.right) / 2;
-            MoveToEx(mem, cx, r.top + tb_scale(d, 6), NULL);
-            LineTo(mem, cx, r.bottom - tb_scale(d, 6));
-            SelectObject(mem, op);
-            DeleteObject(pen);
-            continue;
-        }
-        if (item != TB_NAME && item != TB_FPS) {
-            COLORREF fill = (item == d->toolbar_hot) ? RGB(0x2A, 0x30, 0x3D)
-                          : (on && icon) ? RGB(0x1C, 0x2A, 0x3A)
-                          : (item == TB_DISPLAY) ? RGB(0x1F, 0x24, 0x30) : RGB(0x14, 0x17, 0x1D);
-            HBRUSH b = CreateSolidBrush(fill);
-            HPEN np = (HPEN)GetStockObject(NULL_PEN);
-            HGDIOBJ ob = SelectObject(mem, b), op = SelectObject(mem, np);
-            RoundRect(mem, r.left, r.top, r.right + 1, r.bottom + 1, tb_scale(d, 10), tb_scale(d, 10));
-            SelectObject(mem, ob);
-            SelectObject(mem, op);
-            DeleteObject(b);
-        }
-        if (on && icon) fg = TB_ACCENT;
-        if (item == TB_FPS) fg = !d->status_shown ? RGB(0x5F, 0xD9, 0x93) : RGB(0xA7, 0xB0, 0xC0);
-        if (item == TB_NAME) fg = RGB(0xE8, 0xEA, 0xF0);
-        SetTextColor(mem, fg);
-        SelectObject(mem, icon ? icon_font : (item == TB_FPS ? small_font : text_font));
-        DrawTextW(mem, text, -1, &r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+        TbpItem *it = &items[item];
+        tb_item(d, item, texts[item], ARRAYSIZE(texts[item]), &icon, &on);
+        ZeroMemory(it, sizeof(*it));
+        it->rc = d->toolbar_items[item];
+        it->kind = tb_kind(item, icon);
+        it->text = texts[item];
+        it->glyph = item == TB_NAME ? TB_GLYPH_VM : NULL;
+        it->on = on;
+        it->hot = item == d->toolbar_hot;
+        it->pressed = item == d->toolbar_pressed && item == d->toolbar_hot;
+        if (item == TB_FPS)   /* green while frames arrive, amber while waiting */
+            it->dot = d->status_shown ? 0xFCE100 : 0x6CCB5F;
     }
-
-    BitBlt(dc, 0, 0, rc.right, rc.bottom, mem, 0, 0, SRCCOPY);
-    DeleteObject(text_font);
-    DeleteObject(small_font);
-    DeleteObject(icon_font);
-    DeleteObject(bmp);
-    DeleteDC(mem);
+    if (!tbp_paint(dc, rc.right, rc.bottom, dpi ? dpi : 96, items, TB_COUNT,
+                   !d->toolbar_backdrop, tbp_accent_color())) {
+        HBRUSH bg = CreateSolidBrush(RGB(0x2C, 0x2C, 0x2C));
+        FillRect(dc, &rc, bg);
+        DeleteObject(bg);
+    }
     EndPaint(hwnd, &ps);
 }
 
@@ -2036,6 +2005,17 @@ static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         break;
     case WM_MOUSEACTIVATE:
         return MA_NOACTIVATE;
+    case WM_NCCALCSIZE:
+        /* The caption style is only there for the system backdrop: no frame,
+           the client area is the whole window. */
+        if (wp) return 0;
+        break;
+    case WM_NCHITTEST:
+        return HTCLIENT;
+    case WM_NCACTIVATE:
+        /* Never activated, but drawn as active: an inactive window shows the
+           backdrop's plain fallback colour instead of the acrylic. */
+        return DefWindowProcW(hwnd, msg, TRUE, lp);
     case WM_ERASEBKGND:
         return 1;
     case WM_PAINT:
@@ -2054,17 +2034,27 @@ static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         }
         return 0;
     case WM_MOUSELEAVE:
-        if (d) { d->toolbar_hot = -1; InvalidateRect(hwnd, NULL, FALSE); }
+        if (d && GetCapture() != hwnd) { d->toolbar_hot = -1; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_LBUTTONDOWN:
         SetCapture(hwnd);
+        if (d) {
+            d->toolbar_pressed = tb_hit(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
+            InvalidateRect(hwnd, NULL, FALSE);
+        }
         return 0;
     case WM_LBUTTONUP:
         if (GetCapture() == hwnd) ReleaseCapture();
         if (d) {
             int item = tb_hit(d, (int)(short)LOWORD(lp), (int)(short)HIWORD(lp));
-            if (item >= 0) tb_click(d, item);
+            int pressed = d->toolbar_pressed;
+            d->toolbar_pressed = -1;
+            InvalidateRect(hwnd, NULL, FALSE);
+            if (item >= 0 && item == pressed) tb_click(d, item);
         }
+        return 0;
+    case WM_CAPTURECHANGED:
+        if (d && d->toolbar_pressed >= 0) { d->toolbar_pressed = -1; InvalidateRect(hwnd, NULL, FALSE); }
         return 0;
     case WM_APP + 1:
         if (d) {
@@ -4382,12 +4372,13 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
 
     ensure_idd_class(d->hInstance);
 
-    swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
+    swprintf_s(title, 300, L"%s", d->vm_name);
 
     /* Outer window size so the client area matches the chosen resolution
        (1920x1080 in adaptive mode; the guest then follows the window). */
     {
-        DWORD style   = WS_OVERLAPPEDWINDOW | WS_VISIBLE | WS_CLIPCHILDREN;
+        /* Shown once the title bar is themed (no white flash). */
+        DWORD style   = WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN;
         DWORD exstyle = 0;
         RECT wr = { 0, 0, 1920, 1080 };
         if (d->res_choice >= 0 && d->res_choice < (int)ARRAYSIZE(g_res_presets)) {
@@ -4409,10 +4400,14 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
         return 1;
     }
 
-    /* Dark mode title bar to match AppSandbox main window */
+    /* WinUI look: dark title bar with the Mica backdrop (Windows 11 22H2+;
+       older versions keep the plain dark title bar), dark menus. */
     {
         BOOL dark = TRUE;
+        DWORD backdrop = 2; /* DWMSBT_MAINWINDOW (Mica) */
         DwmSetWindowAttribute(d->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        DwmSetWindowAttribute(d->hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */, &backdrop, sizeof(backdrop));
+        idd_dark_menus(d->hwnd);
     }
 
     /* Add options to the system menu (right-click title bar) */
@@ -4460,14 +4455,25 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     /* Floating toolbar: shown for a few seconds now so it is discovered,
        then whenever the pointer touches the top edge. */
     d->toolbar_hot = -1;
+    d->toolbar_pressed = -1;
+    /* WS_CAPTION (its frame removed in WM_NCCALCSIZE): Windows draws the
+       acrylic backdrop only behind windows with a caption style. */
     d->toolbar_hwnd = CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, IDD_TOOLBAR_CLASS, L"",
-        WS_POPUP, 0, 0, 10, 10, d->hwnd, NULL, d->hInstance, d);
+        WS_POPUP | WS_CAPTION, 0, 0, 10, 10, d->hwnd, NULL, d->hInstance, d);
     if (d->toolbar_hwnd) {
         DWORD corner = 2; /* DWMWCP_ROUND */
+        DWORD backdrop = 3; /* DWMSBT_TRANSIENTWINDOW: acrylic, as WinUI flyouts */
+        MARGINS whole = { -1, -1, -1, -1 };
         BOOL dark = TRUE;
         DwmSetWindowAttribute(d->toolbar_hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof(corner));
         DwmSetWindowAttribute(d->toolbar_hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+        d->toolbar_backdrop =
+            SUCCEEDED(DwmSetWindowAttribute(d->toolbar_hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */,
+                                            &backdrop, sizeof(backdrop))) &&
+            SUCCEEDED(DwmExtendFrameIntoClientArea(d->toolbar_hwnd, &whole));
+        SetWindowPos(d->toolbar_hwnd, NULL, 0, 0, 0, 0,
+                     SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
         tb_add_tooltips(d);
         tb_show(d, 4000);
     }
@@ -4510,6 +4516,10 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
                                FIXED_PITCH | FF_MODERN, L"Consolas");
             if (font && d->log_list_hwnd)
                 SendMessageW(d->log_list_hwnd, WM_SETFONT, (WPARAM)font, TRUE);
+            if (d->log_list_hwnd) {
+                idd_dark_menus(d->log_list_hwnd);
+                SetWindowTheme(d->log_list_hwnd, L"DarkMode_Explorer", NULL);   /* dark scroll bar */
+            }
         }
         idd_log(d, L"IDD display started.");
     }
@@ -4657,17 +4667,12 @@ static LRESULT CALLBACK idd_wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         }
         if (d && (wp & 0xFFF0) == IDM_AUDIO_MUTE) {
             HMENU sysmenu = GetSystemMenu(hwnd, FALSE);
-            wchar_t title[300];
             d->audio_muted = !d->audio_muted;
             if (sysmenu) {
                 CheckMenuItem(sysmenu, IDM_AUDIO_MUTE,
                               MF_BYCOMMAND | (d->audio_muted ? MF_CHECKED : MF_UNCHECKED));
             }
-            if (d->audio_muted)
-                swprintf_s(title, 300, L"\U0001F507 %s - IDD Display", d->vm_name);
-            else
-                swprintf_s(title, 300, L"%s - IDD Display", d->vm_name);
-            SetWindowTextW(hwnd, title);
+            idd_update_title(d, TRUE);
             idd_log(d, d->audio_muted ? L"Audio muted." : L"Audio unmuted.");
             return 0;
         }

@@ -25,7 +25,7 @@ paths for them back.
 | `AppSandboxCore.vcxproj` | `appsandbox_core.dll`: VM orchestration (C, `ASB_BUILDING_DLL`) |
 | `app/AppSandbox/` | `AppSandbox.exe`: the WinUI 3 shell (C#, .NET 10, Windows App SDK, self-contained) and its MSIX. Not in the solution: built with `dotnet build` (section 3). `Program.cs` (entry, UI thread), `MainWindow` (navigation, tray icon, notices, closing), `Services/` (`HostBridge` = P/Invoke to the host, `AppState` = what the host said, `VmActions`, `Dialogs`, `UiSettings`, `TrayIcon`), `Models/`, `Views/` (pages, dialogs, `TrayMenuWindow`, `McpSettingsCard`) |
 | `src/app_win/` | `host.c` / `host.h` (the DLL's entry points: instance lock, command line, `--headless`, start), `ui.c` (JSON commands from the shell, display windows, VM operations that wait, exit sequence), `ui_bridge.c` (messages to the shell, JSON helpers), `headless.c` (HTTP API), `mcp.c` (MCP server for AI agents, section 9) |
-| `src/backend_win/` | `asb_core.c` (orchestrator, `vms.cfg`), `hcs_vm.c` (HCS JSON, GPU-PV, Plan9 shares, hvsocket service table), `hcn_network.c`, `gpu_enum.c`, `disk_util.c` (new-VM staging), `guest_tools.c` (offline guest update), `snapshot.c`, `vm_agent.c` (agent channel), `vm_exec.c` (guest command channel: run a command, copy files), `asb_display.c` (frame reader without a window, used by the MCP screenshot), `vm_display_idd.c` (viewer window), `vm_video_decode.cpp` (H.264/HEVC decode), `vm_clipboard.c`, `vm_ssh_proxy.c`, `prereq.c` |
+| `src/backend_win/` | `asb_core.c` (orchestrator, `vms.cfg`), `hcs_vm.c` (HCS JSON, GPU-PV, Plan9 shares, hvsocket service table), `hcn_network.c`, `gpu_enum.c`, `disk_util.c` (new-VM staging), `guest_tools.c` (offline guest update), `snapshot.c`, `vm_agent.c` (agent channel), `vm_exec.c` (guest command channel: run a command, copy files), `asb_display.c` (frame reader without a window, used by the MCP screenshot), `vm_display_idd.c` (viewer window), `vm_toolbar_paint.cpp` (its toolbar), `vm_video_decode.cpp` (H.264/HEVC decode), `vm_clipboard.c`, `vm_ssh_proxy.c`, `prereq.c` |
 | `src/core/` | Shared by host and guest: `protocol.h` (input packets), `asb_display_protocol.h`, `asb_exec_protocol.h` (guest command channel), `asb_events.*`, `asb_types.h`, `asb_vm_id.h` |
 | `tools/agent/` | Windows guest: `agent.c` (service `AppSandboxAgent`), `appsandbox-input.c` (SendInput + ViGEm gamepads), `appsandbox-displays.c`, clipboard, audio, `p9copy.c` |
 | `tools/vdd/` | IddCx display driver (UMDF2, C++17): `vdd.cpp`, `vdd.h` (wire protocol), `vdd_encoder.cpp` (NVENC / Media Foundation), `ThirdParty/` (UMDF headers, `nvEncodeAPI.h` MIT) |
@@ -166,6 +166,14 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
   queue), window thread (D3D11 flip-model swap chain, decode via
   `vm_video_decode.cpp`, adaptive backdrop shader, floating toolbar, Display
   menu), gamepad thread (XInput → `INPUT_GAMEPAD`).
+- VM window look (WinUI): dark title bar with Mica, dark menus and tooltips
+  (`idd_dark_menus`, uxtheme ordinals). The floating toolbar is a WinUI
+  command bar on acrylic: a `WS_POPUP | WS_CAPTION` window whose frame is
+  removed in `WM_NCCALCSIZE` (DWM draws `DWMSBT_TRANSIENTWINDOW` only
+  behind caption-style windows), kept drawn as active through
+  `WM_NCACTIVATE`, painted by `vm_toolbar_paint.cpp` (Direct2D/DirectWrite,
+  premultiplied alpha over the backdrop, WinUI dark-theme colour tokens,
+  accent from the system palette). Without the backdrop it paints opaque.
 - Per-VM settings: `display_settings.json` beside the VHDX (`resolution`,
   `refreshHz`, `streamMode`, `codec`, `bitrateMbps`, clipboard/hotkey flags).
 - Global settings: `[Settings]` in `%ProgramData%\AppSandbox\vms.cfg`
