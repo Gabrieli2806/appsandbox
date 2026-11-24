@@ -1695,9 +1695,9 @@ static void tb_item(VmDisplayIdd *d, int item, wchar_t *text, size_t cap, BOOL *
                            ? (d->video_codec == VM_VIDEO_CODEC_HEVC ? L" \u00B7 HEVC" : L" \u00B7 H.264") : L"");
         break;
     case TB_CLIP:    wcscpy_s(text, cap, L"\xE77F"); *on = d->clip_share_host_to_guest && d->clip_share_guest_to_host; break;
-    case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); *on = !d->audio_muted; break;
+    case TB_AUDIO:   wcscpy_s(text, cap, d->audio_muted ? L"\xE74F" : L"\xE767"); break;   /* the glyph shows the state */
     case TB_KEYS:    wcscpy_s(text, cap, L"\xE765"); *on = d->transmit_hotkeys; break;
-    case TB_FULL:    wcscpy_s(text, cap, d->borderless_fullscreen ? L"\xE73F" : L"\xE740"); *on = d->borderless_fullscreen; break;
+    case TB_FULL:    wcscpy_s(text, cap, d->borderless_fullscreen ? L"\xE73F" : L"\xE740"); break;
     case TB_PIN:     wcscpy_s(text, cap, d->toolbar_pinned ? L"\xE77A" : L"\xE718"); *on = d->toolbar_pinned; break;
     case TB_MORE:    wcscpy_s(text, cap, L"\xE712"); break;
     default: break;
