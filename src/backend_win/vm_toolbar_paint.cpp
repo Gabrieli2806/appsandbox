@@ -143,45 +143,78 @@ static void draw_text(ID2D1RenderTarget *rt, IDWriteTextFormat *f, const wchar_t
     rt->DrawText(text, (UINT32)wcslen(text), f, r, brush, D2D1_DRAW_TEXT_OPTIONS_CLIP);
 }
 
-extern "C" BOOL tbp_paint(HDC dc, int w, int h, UINT dpi, const TbpItem *items, int count,
-                          BOOL solid, UINT32 accent)
+/* A 32-bit premultiplied bitmap the size of the window with a Direct2D
+   target on it; canvas_end copies it to the window (alpha included, which
+   is what lets the backdrop show through). */
+struct Canvas {
+    HDC                   mem;
+    HBITMAP               bmp;
+    HGDIOBJ               old;
+    ID2D1DCRenderTarget  *rt;
+    ID2D1SolidColorBrush *brush;
+};
+
+static BOOL canvas_begin(Canvas *c, HDC dc, int w, int h)
 {
-    HDC mem = nullptr;
-    HBITMAP bmp = nullptr;
-    HGDIOBJ old = nullptr;
-    void *bits = nullptr;
-    ID2D1DCRenderTarget *rt = nullptr;
-    ID2D1SolidColorBrush *brush = nullptr;
-    IDWriteTextFormat *f_label = nullptr, *f_text = nullptr, *f_small = nullptr;
-    IDWriteTextFormat *f_glyph = nullptr, *f_chevron = nullptr, *f_glyph_lead = nullptr;
     BITMAPINFO bi = {};
     RECT bind = { 0, 0, w, h };
-    BOOL ok = FALSE;
-    float radius = px(TBP_RADIUS_DIP, dpi), pad = px(TBP_PAD_DIP, dpi), gap = px(TBP_GAP_DIP, dpi);
-    int i;
-
+    void *bits = nullptr;
+    ZeroMemory(c, sizeof(*c));
     if (w <= 0 || h <= 0 || !ready()) return FALSE;
-
     bi.bmiHeader.biSize = sizeof(bi.bmiHeader);
     bi.bmiHeader.biWidth = w;
     bi.bmiHeader.biHeight = -h;
     bi.bmiHeader.biPlanes = 1;
     bi.bmiHeader.biBitCount = 32;
     bi.bmiHeader.biCompression = BI_RGB;
-    mem = CreateCompatibleDC(dc);
-    bmp = mem ? CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
-    if (!bmp) goto done;
-    old = SelectObject(mem, bmp);
-
+    c->mem = CreateCompatibleDC(dc);
+    c->bmp = c->mem ? CreateDIBSection(c->mem, &bi, DIB_RGB_COLORS, &bits, nullptr, 0) : nullptr;
+    if (!c->bmp) return FALSE;
+    c->old = SelectObject(c->mem, c->bmp);
     {
         D2D1_RENDER_TARGET_PROPERTIES p = D2D1::RenderTargetProperties(
             D2D1_RENDER_TARGET_TYPE_DEFAULT,
             D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
             96.0f, 96.0f);
-        if (FAILED(g_d2d->CreateDCRenderTarget(&p, &rt)) || FAILED(rt->BindDC(mem, &bind)))
-            goto done;
+        if (FAILED(g_d2d->CreateDCRenderTarget(&p, &c->rt)) || FAILED(c->rt->BindDC(c->mem, &bind)))
+            return FALSE;
     }
-    if (FAILED(rt->CreateSolidColorBrush(rgba(0xFFFFFF, 1.0f), &brush))) goto done;
+    if (FAILED(c->rt->CreateSolidColorBrush(rgba(0xFFFFFF, 1.0f), &c->brush))) return FALSE;
+    c->rt->BeginDraw();
+    c->rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
+    return TRUE;
+}
+
+/* Finish drawing (when draw is TRUE), copy to dc and free everything. */
+static BOOL canvas_end(Canvas *c, HDC dc, int w, int h, BOOL draw)
+{
+    BOOL ok = FALSE;
+    if (draw && c->rt && SUCCEEDED(c->rt->EndDraw()))
+        ok = BitBlt(dc, 0, 0, w, h, c->mem, 0, 0, SRCCOPY);
+    SAFE_RELEASE(c->brush);
+    SAFE_RELEASE(c->rt);
+    if (c->old) SelectObject(c->mem, c->old);
+    if (c->bmp) DeleteObject(c->bmp);
+    if (c->mem) DeleteDC(c->mem);
+    ZeroMemory(c, sizeof(*c));
+    return ok;
+}
+
+extern "C" BOOL tbp_paint(HDC dc, int w, int h, UINT dpi, const TbpItem *items, int count,
+                          BOOL solid, UINT32 accent)
+{
+    Canvas cv;
+    ID2D1DCRenderTarget *rt;
+    ID2D1SolidColorBrush *brush;
+    IDWriteTextFormat *f_label = nullptr, *f_text = nullptr, *f_small = nullptr;
+    IDWriteTextFormat *f_glyph = nullptr, *f_chevron = nullptr, *f_glyph_lead = nullptr;
+    BOOL ok = FALSE;
+    float radius = px(TBP_RADIUS_DIP, dpi), pad = px(TBP_PAD_DIP, dpi), gap = px(TBP_GAP_DIP, dpi);
+    int i;
+
+    if (!canvas_begin(&cv, dc, w, h)) { canvas_end(&cv, dc, w, h, FALSE); return FALSE; }
+    rt = cv.rt;
+    brush = cv.brush;
 
     f_label = make_format(FALSE, px(TBP_TEXT_DIP, dpi), DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING);
     f_text = make_format(FALSE, px(TBP_TEXT_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
@@ -190,8 +223,6 @@ extern "C" BOOL tbp_paint(HDC dc, int w, int h, UINT dpi, const TbpItem *items, 
     f_glyph_lead = make_format(TRUE, px(TBP_GLYPH_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
     f_chevron = make_format(TRUE, px(TBP_CHEVRON_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
 
-    rt->BeginDraw();
-    rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_GRAYSCALE);
     /* Over the system acrylic: a tint layer like WinUI's acrylic brushes
        (dark #2C2C2C, high luminosity opacity) so text stays readable over
        any picture. Without the backdrop: the flyout fallback colour. */
@@ -270,21 +301,142 @@ extern "C" BOOL tbp_paint(HDC dc, int w, int h, UINT dpi, const TbpItem *items, 
         }
     }
 
-    if (SUCCEEDED(rt->EndDraw()))
-        ok = BitBlt(dc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
-
-done:
+    ok = canvas_end(&cv, dc, w, h, TRUE);
     SAFE_RELEASE(f_label);
     SAFE_RELEASE(f_text);
     SAFE_RELEASE(f_small);
     SAFE_RELEASE(f_glyph);
     SAFE_RELEASE(f_glyph_lead);
     SAFE_RELEASE(f_chevron);
-    SAFE_RELEASE(brush);
-    SAFE_RELEASE(rt);
-    if (old) SelectObject(mem, old);
-    if (bmp) DeleteObject(bmp);
-    if (mem) DeleteDC(mem);
+    return ok;
+}
+
+/* ---- Menu flyout: WinUI MenuFlyout metrics (DIPs) ---- */
+#define TBP_MENU_ROW_DIP      36.0f   /* 32 px item + 2 px margin above and below */
+#define TBP_MENU_SEP_DIP       9.0f
+#define TBP_MENU_PAD_DIP       2.0f   /* presenter padding above / below */
+#define TBP_MENU_INSET_DIP     4.0f   /* item margin left and right */
+#define TBP_MENU_TEXT_PAD_DIP 12.0f
+#define TBP_MENU_COL_DIP      28.0f   /* a 16 px glyph and 12 px of space */
+#define TBP_MENU_ACCEL_GAP    24.0f
+#define TBP_MENU_MIN_DIP     200.0f
+
+extern "C" int tbp_menu_row_height(int kind, UINT dpi)
+{
+    return (int)ceilf(px(kind == TBP_ROW_SEPARATOR ? TBP_MENU_SEP_DIP : TBP_MENU_ROW_DIP, dpi));
+}
+
+extern "C" int tbp_menu_padding(UINT dpi)
+{
+    return (int)ceilf(px(TBP_MENU_PAD_DIP, dpi));
+}
+
+extern "C" int tbp_menu_width(const TbpMenuRow *rows, int count, BOOL check_col, BOOL icon_col, UINT dpi)
+{
+    IDWriteTextFormat *f;
+    float text_w = 0.0f, accel_w = 0.0f, w;
+    BOOL any_sub = FALSE;
+    int i;
+    if (!ready()) return (int)ceilf(px(TBP_MENU_MIN_DIP, dpi));
+    f = make_format(FALSE, px(TBP_TEXT_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
+    for (i = 0; i < count; i++) {
+        float t;
+        if (rows[i].kind != TBP_ROW_ITEM) continue;
+        t = text_width(f, rows[i].text);
+        if (t > text_w) text_w = t;
+        t = text_width(f, rows[i].accel);
+        if (t > accel_w) accel_w = t;
+        if (rows[i].submenu) any_sub = TRUE;
+    }
+    SAFE_RELEASE(f);
+    w = 2.0f * px(TBP_MENU_INSET_DIP + TBP_MENU_TEXT_PAD_DIP, dpi) + text_w;
+    if (check_col) w += px(TBP_MENU_COL_DIP, dpi);
+    if (icon_col) w += px(TBP_MENU_COL_DIP, dpi);
+    if (accel_w > 0.0f) w += px(TBP_MENU_ACCEL_GAP, dpi) + accel_w;
+    if (any_sub) w += px(TBP_MENU_ACCEL_GAP, dpi) + px(TBP_CHEVRON_DIP, dpi);
+    if (w < px(TBP_MENU_MIN_DIP, dpi)) w = px(TBP_MENU_MIN_DIP, dpi);
+    return (int)ceilf(w);
+}
+
+extern "C" BOOL tbp_paint_menu(HDC dc, int w, int h, UINT dpi, const TbpMenuRow *rows, int count,
+                               BOOL check_col, BOOL icon_col, BOOL solid)
+{
+    Canvas cv;
+    ID2D1DCRenderTarget *rt;
+    ID2D1SolidColorBrush *brush;
+    IDWriteTextFormat *f_text = nullptr, *f_accel = nullptr, *f_glyph = nullptr, *f_chevron = nullptr;
+    float inset = px(TBP_MENU_INSET_DIP, dpi), tpad = px(TBP_MENU_TEXT_PAD_DIP, dpi);
+    float col = px(TBP_MENU_COL_DIP, dpi), glyph = px(TBP_GLYPH_DIP, dpi);
+    float radius = px(TBP_RADIUS_DIP, dpi), vmargin = px(2.0f, dpi);
+    BOOL ok;
+    int i;
+
+    if (!canvas_begin(&cv, dc, w, h)) { canvas_end(&cv, dc, w, h, FALSE); return FALSE; }
+    rt = cv.rt;
+    brush = cv.brush;
+    f_text = make_format(FALSE, px(TBP_TEXT_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_LEADING);
+    f_accel = make_format(FALSE, px(TBP_TEXT_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING);
+    f_glyph = make_format(TRUE, px(TBP_GLYPH_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+    f_chevron = make_format(TRUE, px(TBP_CHEVRON_DIP, dpi), DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER);
+
+    /* AcrylicBackgroundFillColorDefault is nearly opaque: menus read like
+       solid surfaces with a hint of what is behind. */
+    rt->Clear(solid ? rgba(0x2C2C2C, 1.0f) : rgba(0x2C2C2C, 0.86f));
+
+    for (i = 0; i < count; i++) {
+        const TbpMenuRow *r = &rows[i];
+        D2D1_RECT_F rf = rectf(r->rc);
+        float x;
+        float fg_a = r->enabled ? 1.0f : 0.3628f;   /* TextFillColorPrimary / Disabled */
+
+        if (r->kind == TBP_ROW_SEPARATOR) {
+            float y = floorf((rf.top + rf.bottom) / 2.0f) + 0.5f;
+            brush->SetColor(rgba(0xFFFFFF, 0.0837f));   /* DividerStrokeColorDefault */
+            rt->DrawLine(D2D1::Point2F(rf.left, y), D2D1::Point2F(rf.right, y), brush, 1.0f);
+            continue;
+        }
+        if (r->hot && r->enabled) {
+            D2D1_RECT_F hb = D2D1::RectF(rf.left + inset, rf.top + vmargin, rf.right - inset, rf.bottom - vmargin);
+            brush->SetColor(rgba(0xFFFFFF, 0.0605f));   /* SubtleFillColorSecondary */
+            rt->FillRoundedRectangle(D2D1::RoundedRect(hb, radius, radius), brush);
+        }
+        x = rf.left + inset + tpad;
+        if (check_col) {
+            if (r->checked) {
+                brush->SetColor(rgba(0xFFFFFF, fg_a));
+                draw_text(rt, f_glyph, L"\xE73E", D2D1::RectF(x, rf.top, x + glyph, rf.bottom), brush);   /* CheckMark */
+            }
+            x += col;
+        }
+        if (icon_col) {
+            if (r->glyph && r->glyph[0]) {
+                brush->SetColor(rgba(0xFFFFFF, fg_a));
+                draw_text(rt, f_glyph, r->glyph, D2D1::RectF(x, rf.top, x + glyph, rf.bottom), brush);
+            }
+            x += col;
+        }
+        {
+            float right = rf.right - inset - tpad;
+            if (r->submenu) {
+                brush->SetColor(rgba(0xFFFFFF, r->enabled ? 0.786f : 0.3628f));
+                draw_text(rt, f_chevron, L"\xE76C",   /* ChevronRight */
+                          D2D1::RectF(right - px(TBP_CHEVRON_DIP, dpi), rf.top, right, rf.bottom), brush);
+                right -= px(TBP_CHEVRON_DIP, dpi) + px(TBP_GAP_DIP, dpi);
+            }
+            if (r->accel && r->accel[0]) {
+                brush->SetColor(rgba(0xFFFFFF, r->enabled ? 0.786f : 0.3628f));   /* TextFillColorSecondary */
+                draw_text(rt, f_accel, r->accel, D2D1::RectF(x, rf.top, right, rf.bottom), brush);
+            }
+            brush->SetColor(rgba(0xFFFFFF, fg_a));
+            draw_text(rt, f_text, r->text, D2D1::RectF(x, rf.top, right, rf.bottom), brush);
+        }
+    }
+
+    ok = canvas_end(&cv, dc, w, h, TRUE);
+    SAFE_RELEASE(f_text);
+    SAFE_RELEASE(f_accel);
+    SAFE_RELEASE(f_glyph);
+    SAFE_RELEASE(f_chevron);
     return ok;
 }
 

@@ -309,6 +309,7 @@ struct VmDisplayIdd {
     HWND          toolbar_tip;        /* tooltips for its icon buttons */
     BOOL          toolbar_pinned;
     BOOL          toolbar_expanded;   /* every option shown, not the compact bar */
+    BOOL          flyout_open;        /* a toolbar menu is showing (fly_track) */
     BOOL          status_shown;       /* toolbar/title show "waiting"/"reconnecting"
                                          (debounced copy of !frame_connected) */
     int           toolbar_hot;        /* item under the pointer, -1 none */
@@ -490,7 +491,9 @@ static void idd_toggle_borderless_fullscreen(VmDisplayIdd *d, HWND hwnd);
 static const wchar_t *IDD_DISPLAY_CLASS = L"AppSandboxIddDisplay";
 static const wchar_t *IDD_RENDER_CLASS  = L"AppSandboxIddRender";
 static const wchar_t *IDD_TOOLBAR_CLASS = L"AppSandboxIddToolbar";
+static const wchar_t *IDD_FLYOUT_CLASS = L"AppSandboxIddFlyout";
 static LRESULT CALLBACK idd_toolbar_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
+static LRESULT CALLBACK idd_flyout_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
 static void tb_refresh(VmDisplayIdd *d);
 static void tb_show(VmDisplayIdd *d, UINT linger_ms);
 static void tb_hide(VmDisplayIdd *d);
@@ -677,7 +680,17 @@ static void ensure_idd_class(HINSTANCE hInst)
     wc.lpszClassName = IDD_LOG_CLASS;
     RegisterClassExW(&wc);
 
-    /* Floating toolbar — painted with GDI, never takes focus. */
+    /* Toolbar menus (fly_track): never take focus either. */
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize        = sizeof(wc);
+    wc.lpfnWndProc   = idd_flyout_proc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursorW(NULL, IDC_ARROW);
+    wc.hbrBackground = NULL;
+    wc.lpszClassName = IDD_FLYOUT_CLASS;
+    RegisterClassExW(&wc);
+
+    /* Floating toolbar — drawn by vm_toolbar_paint.cpp, never takes focus. */
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize        = sizeof(wc);
     wc.style         = CS_HREDRAW | CS_VREDRAW;
@@ -1574,7 +1587,7 @@ static void idd_add_display_menu(VmDisplayIdd *d, HMENU sysmenu)
     AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
     for (i = 0; i < (int)ARRAYSIZE(g_res_presets); i++) {
         wchar_t label[64];
-        swprintf_s(label, 64, L"%u x %u", g_res_presets[i].w, g_res_presets[i].h);
+        swprintf_s(label, 64, L"%u %lc %u", g_res_presets[i].w, (wint_t)0x00D7, g_res_presets[i].h);
         AppendMenuW(sub, MF_STRING, IDM_RES_BASE + i * 0x10, label);
     }
     AppendMenuW(sub, MF_SEPARATOR, 0, NULL);
@@ -1914,7 +1927,7 @@ static void tb_on_timer(VmDisplayIdd *d)
     if (!d->toolbar_hwnd || !IsWindowVisible(d->toolbar_hwnd)) { KillTimer(d->hwnd, IDT_TOOLBAR); return; }
     SetTimer(d->hwnd, IDT_TOOLBAR, 400, NULL);
     if (d->relative_mouse) { tb_hide(d); return; }
-    if (d->toolbar_pinned) return;
+    if (d->toolbar_pinned || d->flyout_open) return;
     /* Showing the status: keep it up while the viewer is in front. */
     if (d->status_shown && GetForegroundWindow() == d->hwnd) return;
     GetCursorPos(&pt);
@@ -1978,16 +1991,374 @@ static int tb_hit(VmDisplayIdd *d, int x, int y)
 
 /* Show a menu under an item and run the chosen command like the title-bar
    menu would. */
+/* ==================================================================
+ * Menu flyout
+ *
+ * The toolbar's menus drawn as WinUI MenuFlyouts (acrylic, rounded, icons,
+ * check marks, cascading submenus) instead of classic popup menus. The
+ * content is read from the window's HMENUs, so the title-bar menu and the
+ * flyouts always agree. fly_track is modal like TrackPopupMenu: it runs its
+ * own message loop on the window thread (frames keep rendering), holds the
+ * mouse capture, eats keyboard input for navigation and returns the chosen
+ * command, or 0.
+ * ================================================================== */
+
+static HMENU tb_display_submenu(VmDisplayIdd *d);
+
+#define FLY_MAX_ROWS    48
+#define FLY_MAX_LEVELS  3
+
+typedef struct {
+    HWND        hwnd;
+    HMENU       menu;
+    int         count;
+    TbpMenuRow  rows[FLY_MAX_ROWS];
+    UINT        ids[FLY_MAX_ROWS];
+    HMENU       subs[FLY_MAX_ROWS];
+    wchar_t     text[FLY_MAX_ROWS][80];
+    wchar_t     accel[FLY_MAX_ROWS][24];
+    BOOL        check_col, icon_col, backdrop;
+    int         hot;
+    int         w, h;
+    UINT        dpi;
+} FlyLevel;
+
+/* Icons for the commands this window adds to its menu. */
+static const wchar_t *fly_glyph(VmDisplayIdd *d, UINT id, HMENU sub)
+{
+    if (sub && sub == tb_display_submenu(d)) return L"\xE7F4";   /* TVMonitor */
+    switch (id) {
+    case IDM_AUDIO_MUTE:            return L"\xE74F";   /* Mute */
+    case IDM_XMIT_HOTKEYS:          return L"\xE765";   /* Keyboard */
+    case IDM_BORDERLESS_FULLSCREEN: return L"\xE740";   /* FullScreen */
+    case IDM_SHOW_LOG:              return L"\xE7C3";   /* Page */
+    case IDM_CLIP_H2G:              return L"\xE77F";   /* Paste */
+    case IDM_CLIP_G2H:              return L"\xE8C8";   /* Copy */
+    default:                        return NULL;
+    }
+}
+
+/* Rows from an HMENU: no window commands (the title bar has them), no
+   leading, doubled or trailing separators, "&" and "\t" handled. */
+static void fly_build(VmDisplayIdd *d, FlyLevel *lv, HMENU menu)
+{
+    int i, n = GetMenuItemCount(menu);
+    BOOL last_sep = TRUE;
+    lv->menu = menu;
+    lv->count = 0;
+    lv->check_col = lv->icon_col = FALSE;
+    lv->hot = -1;
+    for (i = 0; i < n && lv->count < FLY_MAX_ROWS; i++) {
+        MENUITEMINFOW mii;
+        wchar_t buf[128] = L"", *tab, *src, *dst;
+        TbpMenuRow *r = &lv->rows[lv->count];
+        ZeroMemory(&mii, sizeof(mii));
+        mii.cbSize = sizeof(mii);
+        mii.fMask = MIIM_FTYPE | MIIM_STATE | MIIM_ID | MIIM_SUBMENU | MIIM_STRING;
+        mii.dwTypeData = buf;
+        mii.cch = ARRAYSIZE(buf);
+        if (!GetMenuItemInfoW(menu, (UINT)i, TRUE, &mii)) continue;
+        ZeroMemory(r, sizeof(*r));
+        if (mii.fType & MFT_SEPARATOR) {
+            if (last_sep) continue;
+            r->kind = TBP_ROW_SEPARATOR;
+            lv->ids[lv->count] = 0;
+            lv->subs[lv->count] = NULL;
+            lv->count++;
+            last_sep = TRUE;
+            continue;
+        }
+        if (!mii.hSubMenu && mii.wID >= 0xF000) continue;
+        tab = wcschr(buf, L'\t');
+        lv->accel[lv->count][0] = 0;
+        if (tab) {
+            *tab = 0;
+            wcsncpy_s(lv->accel[lv->count], ARRAYSIZE(lv->accel[0]), tab + 1, _TRUNCATE);
+        }
+        for (src = buf, dst = lv->text[lv->count]; *src && dst < lv->text[lv->count] + ARRAYSIZE(lv->text[0]) - 1; src++)
+            if (*src != L'&' || src[1] == L'&') *dst++ = *src;
+        *dst = 0;
+        r->kind = TBP_ROW_ITEM;
+        r->text = lv->text[lv->count];
+        r->accel = lv->accel[lv->count][0] ? lv->accel[lv->count] : NULL;
+        r->glyph = fly_glyph(d, mii.wID, mii.hSubMenu);
+        r->checked = (mii.fState & MFS_CHECKED) != 0;
+        r->enabled = (mii.fState & MFS_DISABLED) == 0;
+        r->submenu = mii.hSubMenu != NULL;
+        if (r->checked) lv->check_col = TRUE;
+        if (r->glyph) lv->icon_col = TRUE;
+        lv->ids[lv->count] = mii.wID;
+        lv->subs[lv->count] = mii.hSubMenu;
+        lv->count++;
+        last_sep = FALSE;
+    }
+    if (lv->count && lv->rows[lv->count - 1].kind == TBP_ROW_SEPARATOR) lv->count--;
+    /* A menu of options with check marks keeps their column even when
+       nothing is checked, so the text does not jump. */
+    for (i = 0; i < lv->count; i++)
+        if (lv->rows[i].kind == TBP_ROW_ITEM && !lv->rows[i].submenu &&
+            (lv->ids[i] == IDM_AUDIO_MUTE || lv->ids[i] == IDM_XMIT_HOTKEYS ||
+             lv->ids[i] == IDM_CLIP_H2G || lv->ids[i] == IDM_CLIP_G2H ||
+             (lv->ids[i] >= IDM_RES_ADAPTIVE && lv->ids[i] <= IDM_CODEC_HEVC)))
+            lv->check_col = TRUE;
+}
+
+static void fly_layout(FlyLevel *lv)
+{
+    int i, y = tbp_menu_padding(lv->dpi);
+    lv->w = tbp_menu_width(lv->rows, lv->count, lv->check_col, lv->icon_col, lv->dpi);
+    for (i = 0; i < lv->count; i++) {
+        int rh = tbp_menu_row_height(lv->rows[i].kind, lv->dpi);
+        SetRect(&lv->rows[i].rc, 0, y, lv->w, y + rh);
+        y += rh;
+    }
+    lv->h = y + tbp_menu_padding(lv->dpi);
+}
+
+static LRESULT CALLBACK idd_flyout_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    FlyLevel *lv = (FlyLevel *)GetWindowLongPtrW(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_NCCREATE:
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, (LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
+        break;
+    case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
+    case WM_NCCALCSIZE:    if (wp) return 0; break;
+    case WM_NCHITTEST:     return HTCLIENT;
+    case WM_NCACTIVATE:    return DefWindowProcW(hwnd, msg, TRUE, lp);
+    case WM_ERASEBKGND:    return 1;
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (lv) {
+            int i;
+            for (i = 0; i < lv->count; i++) lv->rows[i].hot = (i == lv->hot);
+            if (!tbp_paint_menu(dc, lv->w, lv->h, lv->dpi, lv->rows, lv->count,
+                                lv->check_col, lv->icon_col, !lv->backdrop)) {
+                RECT rc = { 0, 0, lv->w, lv->h };
+                HBRUSH bg = CreateSolidBrush(RGB(0x2C, 0x2C, 0x2C));
+                FillRect(dc, &rc, bg);
+                DeleteObject(bg);
+            }
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* Show a level next to anchor (screen pixels): below it for the first
+   level (above if there is no room), beside it for a submenu. */
+static BOOL fly_show(VmDisplayIdd *d, FlyLevel *lv, HMENU menu, RECT anchor, BOOL submenu, BOOL align_right)
+{
+    MONITORINFO mi;
+    int x, y, gap;
+    DWORD corner = 2, backdrop = 3;
+    BOOL dark = TRUE;
+    MARGINS whole = { -1, -1, -1, -1 };
+
+    lv->dpi = GetDpiForWindow(d->hwnd);
+    if (!lv->dpi) lv->dpi = 96;
+    gap = MulDiv(4, (int)lv->dpi, 96);
+    fly_build(d, lv, menu);
+    if (!lv->count) return FALSE;
+    fly_layout(lv);
+
+    ZeroMemory(&mi, sizeof(mi));
+    mi.cbSize = sizeof(mi);
+    GetMonitorInfoW(MonitorFromRect(&anchor, MONITOR_DEFAULTTONEAREST), &mi);
+    if (submenu) {
+        x = anchor.right;
+        if (x + lv->w > mi.rcWork.right) x = anchor.left - lv->w;
+        y = anchor.top - tbp_menu_padding(lv->dpi);
+        if (y + lv->h > mi.rcWork.bottom) y = mi.rcWork.bottom - lv->h;
+    } else {
+        x = align_right ? anchor.right - lv->w : anchor.left;
+        y = anchor.bottom + gap;
+        if (y + lv->h > mi.rcWork.bottom && anchor.top - gap - lv->h >= mi.rcWork.top)
+            y = anchor.top - gap - lv->h;
+    }
+    if (x + lv->w > mi.rcWork.right) x = mi.rcWork.right - lv->w;
+    if (x < mi.rcWork.left) x = mi.rcWork.left;
+    if (y < mi.rcWork.top) y = mi.rcWork.top;
+
+    lv->hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, IDD_FLYOUT_CLASS, L"",
+                               WS_POPUP | WS_CAPTION, x, y, lv->w, lv->h, d->hwnd, NULL, d->hInstance, lv);
+    if (!lv->hwnd) return FALSE;
+    DwmSetWindowAttribute(lv->hwnd, 33 /* DWMWA_WINDOW_CORNER_PREFERENCE */, &corner, sizeof(corner));
+    DwmSetWindowAttribute(lv->hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark, sizeof(dark));
+    lv->backdrop = SUCCEEDED(DwmSetWindowAttribute(lv->hwnd, 38 /* DWMWA_SYSTEMBACKDROP_TYPE */,
+                                                   &backdrop, sizeof(backdrop))) &&
+                   SUCCEEDED(DwmExtendFrameIntoClientArea(lv->hwnd, &whole));
+    SetWindowPos(lv->hwnd, HWND_TOPMOST, x, y, lv->w, lv->h,
+                 SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    return TRUE;
+}
+
+static void fly_close_from(FlyLevel *levels, int *depth, int keep)
+{
+    while (*depth > keep) {
+        FlyLevel *lv = &levels[*depth - 1];
+        if (lv->hwnd && IsWindow(lv->hwnd)) DestroyWindow(lv->hwnd);
+        lv->hwnd = NULL;
+        (*depth)--;
+    }
+}
+
+static void fly_set_hot(FlyLevel *lv, int row)
+{
+    if (lv->hot == row) return;
+    lv->hot = row;
+    if (lv->hwnd) InvalidateRect(lv->hwnd, NULL, FALSE);
+}
+
+/* Next enabled item from row in direction dir (wraps). */
+static int fly_step(FlyLevel *lv, int row, int dir)
+{
+    int i, r = row;
+    for (i = 0; i < lv->count; i++) {
+        r = (r < 0) ? (dir > 0 ? 0 : lv->count - 1) : (r + dir + lv->count) % lv->count;
+        if (lv->rows[r].kind == TBP_ROW_ITEM && lv->rows[r].enabled) return r;
+    }
+    return row;
+}
+
+/* The level and row under a screen point; level -1 when outside. */
+static int fly_hit(FlyLevel *levels, int depth, POINT pt, int *row)
+{
+    int l, i;
+    *row = -1;
+    for (l = depth - 1; l >= 0; l--) {
+        RECT wr;
+        POINT cp = pt;
+        if (!levels[l].hwnd || !GetWindowRect(levels[l].hwnd, &wr) || !PtInRect(&wr, pt)) continue;
+        ScreenToClient(levels[l].hwnd, &cp);
+        for (i = 0; i < levels[l].count; i++)
+            if (levels[l].rows[i].kind == TBP_ROW_ITEM && PtInRect(&levels[l].rows[i].rc, cp)) { *row = i; break; }
+        return l;
+    }
+    return -1;
+}
+
+/* Open the submenu of levels[l].rows[row] as level l + 1. */
+static void fly_open_sub(VmDisplayIdd *d, FlyLevel *levels, int *depth, int l, int row)
+{
+    RECT a;
+    fly_close_from(levels, depth, l + 1);
+    if (l + 1 >= FLY_MAX_LEVELS || !levels[l].subs[row] || !levels[l].rows[row].enabled) return;
+    a = levels[l].rows[row].rc;
+    MapWindowPoints(levels[l].hwnd, NULL, (POINT *)&a, 2);
+    if (fly_show(d, &levels[l + 1], levels[l].subs[row], a, TRUE, FALSE)) (*depth)++;
+}
+
+static UINT fly_track(VmDisplayIdd *d, HMENU menu, RECT anchor, BOOL align_right)
+{
+    FlyLevel *levels = (FlyLevel *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY,
+                                             sizeof(FlyLevel) * FLY_MAX_LEVELS);
+    int depth = 0;
+    UINT result = 0;
+    BOOL done = FALSE;
+    BOOL was_front = GetForegroundWindow() == d->hwnd;
+    MSG m;
+
+    if (!levels) return 0;
+    if (fly_show(d, &levels[0], menu, anchor, FALSE, align_right)) depth = 1;
+    if (!depth) { HeapFree(GetProcessHeap(), 0, levels); return 0; }
+    d->flyout_open = TRUE;
+    SetCapture(levels[0].hwnd);
+
+    while (!done) {
+        /* Closed by another app taking over, the window going away, or the
+           capture being taken (Alt+Tab, a system dialog). */
+        if (GetCapture() != levels[0].hwnd || !IsWindow(d->hwnd) || d->stop ||
+            (was_front && GetForegroundWindow() != d->hwnd))
+            break;
+        if (!GetMessageW(&m, NULL, 0, 0)) {
+            PostQuitMessage((int)m.wParam);
+            break;
+        }
+        switch (m.message) {
+        case WM_MOUSEMOVE: {
+            int row, l = fly_hit(levels, depth, m.pt, &row);
+            if (l >= 0) {
+                if (row >= 0 && row != levels[l].hot) {
+                    fly_set_hot(&levels[l], row);
+                    if (levels[l].subs[row]) fly_open_sub(d, levels, &depth, l, row);
+                    else fly_close_from(levels, &depth, l + 1);
+                }
+            } else {
+                fly_set_hot(&levels[depth - 1], -1);   /* the deepest level has no submenu open */
+            }
+            break;
+        }
+        case WM_LBUTTONDOWN: case WM_RBUTTONDOWN: case WM_MBUTTONDOWN:
+        case WM_LBUTTONDBLCLK: case WM_RBUTTONDBLCLK: {
+            int row;
+            if (fly_hit(levels, depth, m.pt, &row) < 0) done = TRUE;   /* outside: close, eat the click */
+            break;
+        }
+        case WM_LBUTTONUP: case WM_RBUTTONUP: {
+            int row, l = fly_hit(levels, depth, m.pt, &row);
+            if (l >= 0 && row >= 0 && levels[l].rows[row].enabled) {
+                if (levels[l].subs[row]) fly_open_sub(d, levels, &depth, l, row);
+                else { result = levels[l].ids[row]; done = TRUE; }
+            }
+            break;
+        }
+        case WM_KEYDOWN: case WM_SYSKEYDOWN: {
+            FlyLevel *lv = &levels[depth - 1];
+            switch (m.wParam) {
+            case VK_ESCAPE: case VK_LEFT:
+                if (depth > 1) fly_close_from(levels, &depth, depth - 1);
+                else if (m.wParam == VK_ESCAPE) done = TRUE;
+                break;
+            case VK_UP:   fly_set_hot(lv, fly_step(lv, lv->hot, -1)); break;
+            case VK_DOWN: fly_set_hot(lv, fly_step(lv, lv->hot, 1)); break;
+            case VK_RIGHT: case VK_RETURN: case VK_SPACE:
+                if (lv->hot >= 0 && lv->subs[lv->hot]) {
+                    fly_open_sub(d, levels, &depth, depth - 1, lv->hot);
+                    if (depth > 1 && &levels[depth - 1] != lv)
+                        fly_set_hot(&levels[depth - 1], fly_step(&levels[depth - 1], -1, 1));
+                } else if (m.wParam != VK_RIGHT && lv->hot >= 0 && lv->rows[lv->hot].enabled) {
+                    result = lv->ids[lv->hot];
+                    done = TRUE;
+                }
+                break;
+            case VK_MENU: case VK_F10: case VK_LWIN: case VK_RWIN:
+                done = TRUE;
+                break;
+            default:
+                break;
+            }
+            break;
+        }
+        case WM_KEYUP: case WM_SYSKEYUP: case WM_CHAR: case WM_SYSCHAR:
+        case WM_MOUSEWHEEL: case WM_MOUSEHWHEEL:
+            break;   /* the menu has the keyboard and the wheel */
+        default:
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+            break;
+        }
+    }
+
+    if (depth && levels[0].hwnd && GetCapture() == levels[0].hwnd) ReleaseCapture();
+    fly_close_from(levels, &depth, 0);
+    d->flyout_open = FALSE;
+    HeapFree(GetProcessHeap(), 0, levels);
+    return result;
+}
+
 static void tb_menu(VmDisplayIdd *d, HMENU menu, int item)
 {
     RECT r = d->toolbar_items[item];
-    POINT pt = { r.left, r.bottom + tb_scale(d, 4) };
     UINT cmd;
     if (!menu) return;
-    ClientToScreen(d->toolbar_hwnd, &pt);
+    MapWindowPoints(d->toolbar_hwnd, NULL, (POINT *)&r, 2);
     SetForegroundWindow(d->hwnd);
-    cmd = (UINT)TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN | TPM_RIGHTBUTTON,
-                               pt.x, pt.y, 0, d->hwnd, NULL);
+    /* The More menu sits at the right end of the bar: align its right edge. */
+    cmd = fly_track(d, menu, r, item == TB_MORE);
     if (cmd) PostMessageW(d->hwnd, WM_SYSCOMMAND, cmd, 0);
 }
 
@@ -4451,17 +4822,21 @@ static DWORD WINAPI idd_window_thread_proc(LPVOID param)
     {
         HMENU sysmenu = GetSystemMenu(d->hwnd, FALSE);
         if (sysmenu) {
+            /* Also the toolbar's More flyout, which skips the window
+               commands above. */
+            AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
+            idd_add_display_menu(d, sysmenu);
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
             AppendMenuW(sysmenu, MF_STRING, IDM_AUDIO_MUTE, L"Mute audio");
-            AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Transmit Keyboard Hotkeys");
-            AppendMenuW(sysmenu, MF_STRING, IDM_BORDERLESS_FULLSCREEN, L"Toggle Borderless Fullscreen\tF11");
-            idd_add_display_menu(d, sysmenu);
-            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show Log");
+            AppendMenuW(sysmenu, MF_STRING, IDM_XMIT_HOTKEYS, L"Send Windows shortcuts to the VM");
+            AppendMenuW(sysmenu, MF_STRING, IDM_BORDERLESS_FULLSCREEN, L"Borderless fullscreen\tF11");
             CheckMenuItem(sysmenu, IDM_XMIT_HOTKEYS,
                           MF_BYCOMMAND | (d->transmit_hotkeys ? MF_CHECKED : MF_UNCHECKED));
             AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
-            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_H2G, L"Share Host Clipboard with Guest");
-            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_G2H, L"Share Guest Clipboard with Host");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_H2G, L"Share this PC's clipboard with the VM");
+            AppendMenuW(sysmenu, MF_STRING, IDM_CLIP_G2H, L"Share the VM's clipboard with this PC");
+            AppendMenuW(sysmenu, MF_SEPARATOR, 0, NULL);
+            AppendMenuW(sysmenu, MF_STRING, IDM_SHOW_LOG, L"Show log");
             CheckMenuItem(sysmenu, IDM_CLIP_H2G,
                           MF_BYCOMMAND | (d->clip_share_host_to_guest ? MF_CHECKED : MF_UNCHECKED));
             CheckMenuItem(sysmenu, IDM_CLIP_G2H,

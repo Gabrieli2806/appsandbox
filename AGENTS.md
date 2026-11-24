@@ -174,6 +174,13 @@ Input types 0–14: mouse, keys, keyboard/mouse version queries, `SET_DISPLAY`
   `WM_NCACTIVATE`, painted by `vm_toolbar_paint.cpp` (Direct2D/DirectWrite,
   premultiplied alpha over the backdrop, WinUI dark-theme colour tokens,
   accent from the system palette). Without the backdrop it paints opaque.
+  It starts compact (frame rate, fullscreen, pin, a chevron that shows every
+  option). Its Display and More menus are WinUI MenuFlyouts (`fly_track`):
+  read from the window's HMENUs (the More menu is the system menu without
+  the `SC_*` window commands), drawn by `tbp_paint_menu`, modal like
+  `TrackPopupMenu` (own message loop on the window thread, mouse capture,
+  keyboard navigation, cascading submenus). The title-bar menu itself stays
+  the native one (dark).
 - Per-VM settings: `display_settings.json` beside the VHDX (`resolution`,
   `refreshHz`, `streamMode`, `codec`, `bitrateMbps`, clipboard/hotkey flags).
 - Global settings: `[Settings]` in `%ProgramData%\AppSandbox\vms.cfg`

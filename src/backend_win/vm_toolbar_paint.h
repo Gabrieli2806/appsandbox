@@ -45,6 +45,35 @@ int tbp_item_width(int kind, const wchar_t *text, const wchar_t *glyph, UINT dpi
 BOOL tbp_paint(HDC dc, int w, int h, UINT dpi, const TbpItem *items, int count,
                BOOL solid, UINT32 accent);
 
+/* ---- Menu flyout (the toolbar's Display and More menus) ---- */
+
+typedef enum { TBP_ROW_ITEM, TBP_ROW_SEPARATOR } TbpRowKind;
+
+typedef struct {
+    RECT           rc;       /* the whole row, device pixels */
+    int            kind;     /* TbpRowKind */
+    const wchar_t *text;
+    const wchar_t *accel;    /* right-aligned key text ("F11"), or NULL */
+    const wchar_t *glyph;    /* icon, or NULL */
+    BOOL           checked;
+    BOOL           enabled;
+    BOOL           submenu;  /* draws a chevron */
+    BOOL           hot;
+} TbpMenuRow;
+
+/* Height of a row in device pixels. */
+int tbp_menu_row_height(int kind, UINT dpi);
+
+/* Vertical padding above the first and below the last row. */
+int tbp_menu_padding(UINT dpi);
+
+/* Width the flyout needs for these rows. check_col / icon_col reserve the
+   columns for check marks and icons (shared by every row, as in WinUI). */
+int tbp_menu_width(const TbpMenuRow *rows, int count, BOOL check_col, BOOL icon_col, UINT dpi);
+
+BOOL tbp_paint_menu(HDC dc, int w, int h, UINT dpi, const TbpMenuRow *rows, int count,
+                    BOOL check_col, BOOL icon_col, BOOL solid);
+
 /* The accent colour WinUI uses for filled controls on a dark surface
    (the system accent's "light 2" shade), as 0xRRGGBB. */
 UINT32 tbp_accent_color(void);
